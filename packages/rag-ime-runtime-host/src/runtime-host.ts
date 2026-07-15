@@ -1,0 +1,347 @@
+import { mkdir, realpath, stat } from "node:fs/promises";
+import { homedir } from "node:os";
+import { isAbsolute, join, relative, resolve, sep } from "node:path";
+import { type Api, getSupportedThinkingLevels, type Model, type ModelThinkingLevel } from "@earendil-works/pi-ai";
+import { ModelRuntime } from "@earendil-works/pi-coding-agent";
+import { PiProductSession } from "./pi-session.ts";
+import { ManagedPluginManager } from "./plugin-manager.ts";
+import {
+	PROTOCOL_NAME,
+	PROTOCOL_VERSION,
+	type RuntimeEventEnvelope,
+	RuntimeProtocolError,
+	type RuntimeRequest,
+} from "./protocol.ts";
+import { BoundedSessionPool } from "./session-pool.ts";
+
+const HOST_VERSION = "1.0.0";
+const SESSION_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,199}$/;
+const THINKING_LEVELS = new Set<ModelThinkingLevel>(["off", "minimal", "low", "medium", "high", "xhigh", "max"]);
+
+export interface RuntimeHostOptions {
+	agentDir: string;
+	sessionDir: string;
+	pluginsRoot: string;
+	pluginInbox: string;
+	maxSessions: number;
+	toolGatewayUrl?: string;
+	toolGatewayToken?: string;
+	pluginApprovalToken?: string;
+	allowedWorkspaceRoots?: string[];
+	modelRuntime?: ModelRuntime;
+	emitEvent(event: RuntimeEventEnvelope): void;
+}
+
+function requiredString(params: Record<string, unknown>, key: string, maximum = 4096): string {
+	const value = params[key];
+	if (typeof value !== "string" || value.trim().length === 0 || value.length > maximum) {
+		throw new RuntimeProtocolError("INVALID_PARAMS", `${key} must be a non-empty string`);
+	}
+	return value.trim();
+}
+
+function optionalString(params: Record<string, unknown>, key: string, maximum = 4096): string | undefined {
+	const value = params[key];
+	if (value === undefined || value === null || value === "") return undefined;
+	if (typeof value !== "string" || value.length > maximum) {
+		throw new RuntimeProtocolError("INVALID_PARAMS", `${key} must be a string`);
+	}
+	return value.trim() || undefined;
+}
+
+function requiredSessionId(params: Record<string, unknown>): string {
+	const sessionId = requiredString(params, "sessionId", 200);
+	if (!SESSION_ID_PATTERN.test(sessionId)) {
+		throw new RuntimeProtocolError("INVALID_PARAMS", "sessionId contains unsupported characters");
+	}
+	return sessionId;
+}
+
+function isInside(root: string, candidate: string): boolean {
+	const child = relative(root, candidate);
+	return child === "" || (!child.startsWith(`..${sep}`) && child !== ".." && !isAbsolute(child));
+}
+
+function publicModel(model: ReturnType<ModelRuntime["getModels"]>[number]): Record<string, unknown> {
+	return {
+		provider: model.provider,
+		id: model.id,
+		name: model.name,
+		api: model.api,
+		reasoning: model.reasoning,
+		thinkingLevels: getSupportedThinkingLevels(model),
+		input: [...model.input],
+		contextWindow: model.contextWindow,
+		maxTokens: model.maxTokens,
+	};
+}
+
+export class RagImeRuntimeHost {
+	readonly modelRuntime: ModelRuntime;
+	readonly sessions: BoundedSessionPool<PiProductSession>;
+	readonly plugins: ManagedPluginManager;
+	private readonly options: RuntimeHostOptions;
+	private readonly allowedWorkspaceRoots: string[];
+
+	private constructor(options: RuntimeHostOptions, modelRuntime: ModelRuntime) {
+		this.options = options;
+		this.modelRuntime = modelRuntime;
+		this.sessions = new BoundedSessionPool(options.maxSessions);
+		this.plugins = new ManagedPluginManager({
+			pluginsRoot: options.pluginsRoot,
+			inboxRoot: options.pluginInbox,
+			approvalToken: options.pluginApprovalToken,
+		});
+		this.allowedWorkspaceRoots = (options.allowedWorkspaceRoots ?? []).map((path) => resolve(path));
+	}
+
+	static async create(options: RuntimeHostOptions): Promise<RagImeRuntimeHost> {
+		await Promise.all([
+			mkdir(options.agentDir, { recursive: true, mode: 0o700 }),
+			mkdir(options.sessionDir, { recursive: true, mode: 0o700 }),
+			mkdir(options.pluginsRoot, { recursive: true, mode: 0o700 }),
+			mkdir(options.pluginInbox, { recursive: true, mode: 0o700 }),
+		]);
+		const modelRuntime =
+			options.modelRuntime ??
+			(await ModelRuntime.create({
+				authPath: join(options.agentDir, "auth.json"),
+				modelsPath: join(options.agentDir, "models.json"),
+			}));
+		const host = new RagImeRuntimeHost(options, modelRuntime);
+		await host.plugins.initialize();
+		return host;
+	}
+
+	async dispose(): Promise<void> {
+		await this.sessions.dispose();
+	}
+
+	private params(request: RuntimeRequest): Record<string, unknown> {
+		return request.params ?? {};
+	}
+
+	private session(params: Record<string, unknown>): PiProductSession {
+		const sessionId = requiredSessionId(params);
+		const session = this.sessions.get(sessionId);
+		if (!session) throw new RuntimeProtocolError("SESSION_NOT_FOUND", `Session is not open: ${sessionId}`);
+		return session;
+	}
+
+	private async workspace(value: unknown): Promise<string> {
+		if (typeof value !== "string" || !value.trim()) {
+			throw new RuntimeProtocolError("INVALID_PARAMS", "cwd must be a non-empty string");
+		}
+		let workspace: string;
+		try {
+			workspace = await realpath(resolve(value));
+		} catch {
+			throw new RuntimeProtocolError("WORKSPACE_NOT_FOUND", `Workspace does not exist: ${value}`);
+		}
+		if (!(await stat(workspace)).isDirectory()) {
+			throw new RuntimeProtocolError("INVALID_PARAMS", "cwd must refer to a directory");
+		}
+		if (this.allowedWorkspaceRoots.length && !this.allowedWorkspaceRoots.some((root) => isInside(root, workspace))) {
+			throw new RuntimeProtocolError("WORKSPACE_DENIED", "Workspace is outside the configured roots");
+		}
+		return workspace;
+	}
+
+	private async reloadPlugins(): Promise<void> {
+		await Promise.allSettled(this.sessions.list().map(async (session) => session.reloadPlugins()));
+	}
+
+	async handle(request: RuntimeRequest): Promise<unknown> {
+		const params = this.params(request);
+		switch (request.method) {
+			case "hello":
+				return {
+					protocol: PROTOCOL_NAME,
+					protocolVersion: PROTOCOL_VERSION,
+					hostVersion: HOST_VERSION,
+					piVersion: "0.80.7",
+					capabilities: {
+						multiSession: true,
+						maxSessions: this.sessions.maxSessions,
+						settledEvents: true,
+						dynamicTools: true,
+						sessionSnapshot: true,
+						managedPlugins: true,
+						pluginDrafts: true,
+					},
+				};
+			case "health":
+				return {
+					ok: true,
+					protocolVersion: PROTOCOL_VERSION,
+					openSessions: this.sessions.size,
+					maxSessions: this.sessions.maxSessions,
+					modelError: this.modelRuntime.getError() ?? "",
+				};
+			case "models.list": {
+				let models: Model<Api>[];
+				try {
+					models = [...(await this.modelRuntime.getAvailable())];
+				} catch {
+					models = [...this.modelRuntime.getAvailableSnapshot()];
+				}
+				models.sort((left, right) => `${left.provider}/${left.id}`.localeCompare(`${right.provider}/${right.id}`));
+				return { models: models.map(publicModel), error: this.modelRuntime.getError() ?? "" };
+			}
+			case "session.open": {
+				const sessionId = requiredSessionId(params);
+				const cwd = await this.workspace(params.cwd);
+				const provider = optionalString(params, "provider", 80);
+				const modelId = optionalString(params, "modelId", 200);
+				const thinking = optionalString(params, "thinkingLevel", 20);
+				if (thinking && !THINKING_LEVELS.has(thinking as ModelThinkingLevel)) {
+					throw new RuntimeProtocolError("INVALID_PARAMS", `Unsupported thinkingLevel: ${thinking}`);
+				}
+				const sessionFile = optionalString(params, "sessionFile", 4096);
+				if (sessionFile && !isInside(resolve(this.options.sessionDir), resolve(sessionFile))) {
+					throw new RuntimeProtocolError(
+						"SESSION_PATH_DENIED",
+						"sessionFile is outside the managed session directory",
+					);
+				}
+				const opened = await this.sessions.open(sessionId, async () =>
+					PiProductSession.create({
+						externalSessionId: sessionId,
+						cwd,
+						sessionDir: this.options.sessionDir,
+						sessionFile,
+						agentDir: this.options.agentDir,
+						activePluginDir: this.plugins.activeDir,
+						modelRuntime: this.modelRuntime,
+						provider,
+						modelId,
+						thinkingLevel: thinking as ModelThinkingLevel | undefined,
+						toolManifest: params.toolManifest ?? [],
+						toolGatewayUrl: this.options.toolGatewayUrl,
+						toolGatewayToken: this.options.toolGatewayToken,
+						systemPrompt: optionalString(params, "systemPrompt", 64_000),
+						emitEvent: this.options.emitEvent,
+					}),
+				);
+				return { snapshot: opened.session.snapshot(), evictedSessionId: opened.evictedSessionId };
+			}
+			case "session.snapshot":
+				return this.session(params).snapshot();
+			case "session.prompt":
+				return this.session(params).prompt({
+					message: requiredString(params, "message", 1_000_000),
+					clientMessageId: optionalString(params, "clientMessageId", 128),
+					images: Array.isArray(params.images) ? (params.images as never) : undefined,
+				});
+			case "session.abort":
+				await this.session(params).abort();
+				return { aborted: true };
+			case "session.compact":
+				return this.session(params).compact(optionalString(params, "instructions", 4000));
+			case "session.model.set":
+				return this.session(params).setModel(
+					requiredString(params, "provider", 80),
+					requiredString(params, "modelId", 200),
+				);
+			case "session.thinking.set": {
+				const level = requiredString(params, "level", 20);
+				if (!THINKING_LEVELS.has(level as ModelThinkingLevel)) {
+					throw new RuntimeProtocolError("INVALID_PARAMS", `Unsupported thinking level: ${level}`);
+				}
+				return this.session(params).setThinkingLevel(level as ModelThinkingLevel);
+			}
+			case "session.close":
+				return { closed: await this.sessions.close(requiredSessionId(params)) };
+			case "approval.resolve":
+				return {
+					requestId: this.session(params).resolveDecision(
+						"approval",
+						requiredString(params, "approvalId", 240),
+						params.approved === true,
+					),
+				};
+			case "review.resolve":
+				return {
+					requestId: this.session(params).resolveDecision(
+						"review",
+						requiredString(params, "runId", 240),
+						params.reviewed === true,
+					),
+				};
+			case "tools.list":
+				return { tools: this.session(params).listTools() };
+			case "tools.sync":
+				return { tools: await this.session(params).syncTools(params.tools) };
+			case "plugins.list":
+				return { plugins: await this.plugins.list() };
+			case "plugins.create":
+				return this.plugins.createDraft({
+					draftId: requiredString(params, "draftId", 64),
+					manifest: params.manifest,
+					files: params.files as Record<string, string>,
+				});
+			case "plugins.validate":
+				return this.plugins.validate(requiredString(params, "sourcePath"));
+			case "plugins.install": {
+				const plugin = await this.plugins.install({
+					sourcePath: requiredString(params, "sourcePath"),
+					expectedDigest: requiredString(params, "expectedDigest", 64),
+					approvalToken: optionalString(params, "approvalToken", 1024),
+					enable: params.enable === true,
+				});
+				await this.reloadPlugins();
+				return plugin;
+			}
+			case "plugins.enable": {
+				const plugin = await this.plugins.enable(
+					requiredString(params, "pluginId", 64),
+					optionalString(params, "approvalToken", 1024),
+				);
+				await this.reloadPlugins();
+				return plugin;
+			}
+			case "plugins.disable": {
+				const plugin = await this.plugins.disable(
+					requiredString(params, "pluginId", 64),
+					optionalString(params, "approvalToken", 1024),
+				);
+				await this.reloadPlugins();
+				return plugin;
+			}
+			case "plugins.rollback": {
+				const plugin = await this.plugins.rollback(
+					requiredString(params, "pluginId", 64),
+					optionalString(params, "approvalToken", 1024),
+				);
+				await this.reloadPlugins();
+				return plugin;
+			}
+		}
+	}
+}
+
+export function runtimeHostOptionsFromEnvironment(
+	emitEvent: (event: RuntimeEventEnvelope) => void,
+): RuntimeHostOptions {
+	const appSupport = resolve(
+		process.env.RAG_IME_APP_SUPPORT_DIR || join(homedir(), "Library", "Application Support", "RagIme"),
+	);
+	const agentDir = resolve(process.env.RAG_IME_PI_AGENT_DIR || join(appSupport, "Agent", "config"));
+	const roots = (process.env.RAG_IME_WORKSPACE_ROOTS ?? "")
+		.split(process.platform === "win32" ? ";" : ":")
+		.map((value) => value.trim())
+		.filter(Boolean);
+	const maxSessionsValue = Number.parseInt(process.env.RAG_IME_PI_MAX_SESSIONS || "8", 10);
+	return {
+		agentDir,
+		sessionDir: resolve(process.env.RAG_IME_PI_SESSION_DIR || join(appSupport, "Agent", "sessions")),
+		pluginsRoot: resolve(process.env.RAG_IME_PI_PLUGINS_DIR || join(appSupport, "Agent", "plugins")),
+		pluginInbox: resolve(process.env.RAG_IME_PI_PLUGIN_INBOX || join(appSupport, "Agent", "plugin-inbox")),
+		maxSessions: Number.isInteger(maxSessionsValue) && maxSessionsValue > 0 ? Math.min(maxSessionsValue, 32) : 8,
+		toolGatewayUrl: process.env.RAG_IME_TOOL_GATEWAY_URL,
+		toolGatewayToken: process.env.RAG_IME_TOOL_GATEWAY_TOKEN,
+		pluginApprovalToken: process.env.RAG_IME_PLUGIN_APPROVAL_TOKEN,
+		allowedWorkspaceRoots: roots,
+		emitEvent,
+	};
+}

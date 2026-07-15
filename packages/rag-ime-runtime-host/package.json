@@ -1,0 +1,40 @@
+{
+	"name": "@earendil-works/pi-rag-ime-runtime-host",
+	"version": "0.80.7",
+	"description": "SDK-backed Pi runtime host for the Wisdom Weasel product adapter",
+	"license": "MIT",
+	"type": "module",
+	"private": true,
+	"bin": {
+		"rag-ime-runtime-host": "dist/cli.js"
+	},
+	"main": "./dist/index.js",
+	"types": "./dist/index.d.ts",
+	"exports": {
+		".": {
+			"types": "./dist/index.d.ts",
+			"import": "./dist/index.js"
+		}
+	},
+	"files": [
+		"dist",
+		"README.md"
+	],
+	"scripts": {
+		"clean": "shx rm -rf dist",
+		"build": "tsgo -p tsconfig.build.json && shx chmod +x dist/cli.js",
+		"test": "vitest --run",
+		"prepublishOnly": "npm run clean && npm run build"
+	},
+	"dependencies": {
+		"@earendil-works/pi-ai": "^0.80.7",
+		"@earendil-works/pi-coding-agent": "^0.80.7"
+	},
+	"devDependencies": {
+		"shx": "0.4.0",
+		"vitest": "4.1.9"
+	},
+	"engines": {
+		"node": ">=22.19.0"
+	}
+}
