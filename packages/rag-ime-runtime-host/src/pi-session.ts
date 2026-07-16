@@ -21,6 +21,7 @@ export interface PiSessionOpenOptions {
 	cwd: string;
 	sessionDir: string;
 	sessionFile?: string;
+	sessionManager?: SessionManager;
 	agentDir: string;
 	activePluginDir: string;
 	modelRuntime: ModelRuntime;
@@ -32,6 +33,64 @@ export interface PiSessionOpenOptions {
 	toolGatewayToken?: string;
 	systemPrompt?: string;
 	emitEvent(event: RuntimeEventEnvelope): void;
+}
+
+export interface PreparedPiFork {
+	entryId: string;
+	selectedText: string;
+	branchAnchor: string;
+	sessionFile: string;
+	sessionManager: SessionManager;
+}
+
+export interface PiForkRuntimeProfile {
+	cwd: string;
+	provider?: string;
+	modelId?: string;
+	thinkingLevel?: NonNullable<CreateAgentSessionOptions["thinkingLevel"]>;
+	toolManifest: BackendToolManifest[];
+	systemPrompt: string;
+}
+
+export function prepareNativePiFork(sourceManager: SessionManager, entryId: string): PreparedPiFork {
+	const selected = sourceManager.getEntry(entryId);
+	if (!selected || selected.type !== "message" || selected.message.role !== "user") {
+		throw new RuntimeProtocolError("INVALID_FORK_TARGET", "Fork entry must identify a user message");
+	}
+	const selectedText =
+		typeof selected.message.content === "string"
+			? selected.message.content
+			: selected.message.content
+					.filter((item): item is { type: "text"; text: string } => item.type === "text")
+					.map((item) => item.text)
+					.join("");
+	if (!selectedText) {
+		throw new RuntimeProtocolError("INVALID_FORK_TARGET", "Fork entry does not contain user text");
+	}
+	const sourceFile = sourceManager.getSessionFile();
+	if (!sourceManager.isPersisted() || !sourceFile) {
+		throw new RuntimeProtocolError("SESSION_NOT_PERSISTED", "Conversation forks require a persisted source Session");
+	}
+	const targetLeafId = selected.parentId;
+	let sessionManager: SessionManager;
+	let sessionFile: string | undefined;
+	if (targetLeafId) {
+		sessionManager = SessionManager.open(sourceFile, sourceManager.getSessionDir(), sourceManager.getCwd());
+		sessionFile = sessionManager.createBranchedSession(targetLeafId);
+	} else {
+		sessionManager = SessionManager.create(sourceManager.getCwd(), sourceManager.getSessionDir());
+		sessionFile = sessionManager.newSession({ parentSession: sourceFile });
+	}
+	if (!sessionFile || sessionFile === sourceFile) {
+		throw new RuntimeProtocolError("FORK_FAILED", "Pi did not create a distinct branch transcript");
+	}
+	return {
+		entryId,
+		selectedText,
+		branchAnchor: targetLeafId ?? "",
+		sessionFile,
+		sessionManager,
+	};
 }
 
 export interface ActiveTurn {
@@ -106,9 +165,11 @@ export class PiProductSession implements PooledSession {
 			systemPrompt: options.systemPrompt,
 		});
 		await resourceLoader.reload();
-		const sessionManager = options.sessionFile
-			? SessionManager.open(options.sessionFile, options.sessionDir, options.cwd)
-			: SessionManager.create(options.cwd, options.sessionDir);
+		const sessionManager =
+			options.sessionManager ??
+			(options.sessionFile
+				? SessionManager.open(options.sessionFile, options.sessionDir, options.cwd)
+				: SessionManager.create(options.cwd, options.sessionDir));
 		let model: Model<Api> | undefined;
 		if (options.provider || options.modelId) {
 			if (!options.provider || !options.modelId) {
@@ -259,6 +320,31 @@ export class PiProductSession implements PooledSession {
 			profile: backend.get(tool.name)?.profile,
 			risk: backend.get(tool.name)?.risk,
 		}));
+	}
+
+	forkCandidates(): Array<{ entryId: string; text: string }> {
+		if (!this.session.isIdle || this.activeTurn || this.pendingDecisions.size > 0) {
+			throw new RuntimeProtocolError("SESSION_BUSY", "Session must be idle before creating a fork");
+		}
+		return this.session.getUserMessagesForForking();
+	}
+
+	prepareFork(entryId: string): PreparedPiFork {
+		if (!this.session.isIdle || this.activeTurn || this.pendingDecisions.size > 0) {
+			throw new RuntimeProtocolError("SESSION_BUSY", "Session must be idle before creating a fork");
+		}
+		return prepareNativePiFork(this.session.sessionManager, entryId);
+	}
+
+	forkRuntimeProfile(): PiForkRuntimeProfile {
+		return {
+			cwd: this.cwd,
+			provider: this.session.model?.provider,
+			modelId: this.session.model?.id,
+			thinkingLevel: this.session.thinkingLevel,
+			toolManifest: this.toolRegistry.list(),
+			systemPrompt: this.session.systemPrompt,
+		};
 	}
 
 	async syncTools(manifest: unknown): Promise<BackendToolManifest[]> {

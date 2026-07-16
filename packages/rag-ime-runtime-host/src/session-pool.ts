@@ -53,10 +53,13 @@ export class BoundedSessionPool<T extends PooledSession> {
 		}
 	}
 
-	async open(sessionId: string, create: () => Promise<T>): Promise<{ session: T; evictedSessionId?: string }> {
+	async open(
+		sessionId: string,
+		create: () => Promise<T>,
+	): Promise<{ session: T; created: boolean; evictedSessionId?: string }> {
 		return this.withAdmission(async () => {
 			const existing = this.get(sessionId);
-			if (existing) return { session: existing };
+			if (existing) return { session: existing, created: false };
 
 			let evictedSessionId: string | undefined;
 			if (this.entries.size >= this.maxSessions) {
@@ -81,7 +84,7 @@ export class BoundedSessionPool<T extends PooledSession> {
 				throw new Error("Session factory returned a mismatched externalSessionId");
 			}
 			this.entries.set(sessionId, { session, lastUsedAt: Date.now() });
-			return { session, evictedSessionId };
+			return { session, created: true, evictedSessionId };
 		});
 	}
 

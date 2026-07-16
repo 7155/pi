@@ -11,6 +11,22 @@ describe("runtime protocol", () => {
 				params: {},
 			}),
 		).toMatchObject({ id: "request-1", method: "plugins.create" });
+		expect(
+			parseRuntimeRequest({
+				protocolVersion: PROTOCOL_VERSION,
+				id: "request-2",
+				method: "session.fork.candidates",
+				params: { sessionId: "source" },
+			}),
+		).toMatchObject({ id: "request-2", method: "session.fork.candidates" });
+		expect(
+			parseRuntimeRequest({
+				protocolVersion: PROTOCOL_VERSION,
+				id: "request-3",
+				method: "session.fork",
+				params: { sessionId: "source", targetSessionId: "target", entryId: "entry" },
+			}),
+		).toMatchObject({ id: "request-3", method: "session.fork" });
 	});
 
 	it("rejects unknown or unversioned requests", () => {

@@ -24,6 +24,11 @@ The host maintains a bounded LRU session pool. Eviction closes a Pi SDK session
 without deleting its persisted transcript, allowing later recovery through the
 normal session manager.
 
+Conversation branches use `session.fork.candidates` and `session.fork`. The
+candidate ids come from Pi's session tree. A fork creates a distinct native Pi
+transcript at the selected user-message anchor and opens it under a new product
+`sessionId`; the source transcript and source binding are never rewritten.
+
 ## Managed plugins
 
 Plugin changes use validate/preview/apply. Validation stages a bounded directory

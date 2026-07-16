@@ -1,4 +1,4 @@
-import { mkdir, realpath, stat } from "node:fs/promises";
+import { mkdir, realpath, rm, stat } from "node:fs/promises";
 import { homedir } from "node:os";
 import { isAbsolute, join, relative, resolve, sep } from "node:path";
 import { type Api, getSupportedThinkingLevels, type Model, type ModelThinkingLevel } from "@earendil-works/pi-ai";
@@ -49,12 +49,16 @@ function optionalString(params: Record<string, unknown>, key: string, maximum = 
 	return value.trim() || undefined;
 }
 
-function requiredSessionId(params: Record<string, unknown>): string {
-	const sessionId = requiredString(params, "sessionId", 200);
+function sessionIdParam(params: Record<string, unknown>, key: string): string {
+	const sessionId = requiredString(params, key, 200);
 	if (!SESSION_ID_PATTERN.test(sessionId)) {
-		throw new RuntimeProtocolError("INVALID_PARAMS", "sessionId contains unsupported characters");
+		throw new RuntimeProtocolError("INVALID_PARAMS", `${key} contains unsupported characters`);
 	}
 	return sessionId;
+}
+
+function requiredSessionId(params: Record<string, unknown>): string {
+	return sessionIdParam(params, "sessionId");
 }
 
 function isInside(root: string, candidate: string): boolean {
@@ -167,6 +171,7 @@ export class RagImeRuntimeHost {
 						settledEvents: true,
 						dynamicTools: true,
 						sessionSnapshot: true,
+						conversationFork: true,
 						managedPlugins: true,
 						pluginDrafts: true,
 					},
@@ -228,6 +233,60 @@ export class RagImeRuntimeHost {
 			}
 			case "session.snapshot":
 				return this.session(params).snapshot();
+			case "session.fork.candidates":
+				return { items: this.session(params).forkCandidates() };
+			case "session.fork": {
+				const sourceSessionId = requiredSessionId(params);
+				const targetSessionId = sessionIdParam(params, "targetSessionId");
+				if (sourceSessionId === targetSessionId) {
+					throw new RuntimeProtocolError("INVALID_PARAMS", "Conversation fork target must differ from its source");
+				}
+				const source = this.session(params);
+				if (this.sessions.get(targetSessionId)) {
+					throw new RuntimeProtocolError("SESSION_ALREADY_OPEN", `Session is already open: ${targetSessionId}`);
+				}
+				const prepared = source.prepareFork(requiredString(params, "entryId", 240));
+				const profile = source.forkRuntimeProfile();
+				let targetCreated = false;
+				try {
+					const opened = await this.sessions.open(targetSessionId, async () =>
+						PiProductSession.create({
+							externalSessionId: targetSessionId,
+							cwd: profile.cwd,
+							sessionDir: this.options.sessionDir,
+							sessionManager: prepared.sessionManager,
+							agentDir: this.options.agentDir,
+							activePluginDir: this.plugins.activeDir,
+							modelRuntime: this.modelRuntime,
+							provider: profile.provider,
+							modelId: profile.modelId,
+							thinkingLevel: profile.thinkingLevel,
+							toolManifest: profile.toolManifest,
+							toolGatewayUrl: this.options.toolGatewayUrl,
+							toolGatewayToken: this.options.toolGatewayToken,
+							systemPrompt: profile.systemPrompt,
+							emitEvent: this.options.emitEvent,
+						}),
+					);
+					if (!opened.created) {
+						throw new RuntimeProtocolError("SESSION_ALREADY_OPEN", `Session is already open: ${targetSessionId}`);
+					}
+					targetCreated = true;
+					return {
+						sourceSessionId,
+						targetSessionId,
+						entryId: prepared.entryId,
+						selectedText: prepared.selectedText,
+						branchAnchor: prepared.branchAnchor,
+						snapshot: opened.session.snapshot(),
+						evictedSessionId: opened.evictedSessionId,
+					};
+				} catch (error) {
+					if (targetCreated) await this.sessions.close(targetSessionId);
+					await rm(prepared.sessionFile, { force: true });
+					throw error;
+				}
+			}
 			case "session.prompt":
 				return this.session(params).prompt({
 					message: requiredString(params, "message", 1_000_000),
