@@ -24,6 +24,7 @@ export interface PiSessionOpenOptions {
 	sessionManager?: SessionManager;
 	agentDir: string;
 	activePluginDir: string;
+	skillPaths: string[];
 	modelRuntime: ModelRuntime;
 	provider?: string;
 	modelId?: string;
@@ -121,6 +122,7 @@ export class PiProductSession implements PooledSession {
 	readonly cwd: string;
 	readonly toolRegistry: BackendToolRegistry;
 	private readonly session: AgentSession;
+	private readonly resourceLoader: DefaultResourceLoader;
 	private readonly emitEvent: (event: RuntimeEventEnvelope) => void;
 	private unsubscribe: (() => void) | undefined;
 	private sequence = 0;
@@ -130,11 +132,17 @@ export class PiProductSession implements PooledSession {
 		{ requestId: string; resolve(value: boolean): void; cleanup(): void }
 	>();
 
-	private constructor(options: PiSessionOpenOptions, session: AgentSession, registry: BackendToolRegistry) {
+	private constructor(
+		options: PiSessionOpenOptions,
+		session: AgentSession,
+		registry: BackendToolRegistry,
+		resourceLoader: DefaultResourceLoader,
+	) {
 		this.externalSessionId = options.externalSessionId;
 		this.cwd = options.cwd;
 		this.session = session;
 		this.toolRegistry = registry;
+		this.resourceLoader = resourceLoader;
 		this.emitEvent = options.emitEvent;
 		this.unsubscribe = session.subscribe((event) => this.onSessionEvent(event));
 	}
@@ -149,6 +157,7 @@ export class PiProductSession implements PooledSession {
 			agentDir: options.agentDir,
 			settingsManager,
 			additionalExtensionPaths: [options.activePluginDir],
+			additionalSkillPaths: options.skillPaths,
 			extensionFactories: [
 				createBackendToolExtension({
 					sessionId: options.externalSessionId,
@@ -194,7 +203,7 @@ export class PiProductSession implements PooledSession {
 			resourceLoader,
 			sessionManager,
 		});
-		productSession = new PiProductSession(options, created.session, registry);
+		productSession = new PiProductSession(options, created.session, registry, resourceLoader);
 		await created.session.bindExtensions({
 			mode: "rpc",
 			onError: (error) => {
@@ -319,6 +328,15 @@ export class PiProductSession implements PooledSession {
 			active: active.has(tool.name),
 			profile: backend.get(tool.name)?.profile,
 			risk: backend.get(tool.name)?.risk,
+		}));
+	}
+
+	listCommands(): Array<Record<string, unknown>> {
+		return this.resourceLoader.getSkills().skills.map((skill) => ({
+			name: `skill:${skill.name}`,
+			description: skill.description,
+			source: "skill",
+			location: skill.sourceInfo?.scope ?? "runtime",
 		}));
 	}
 

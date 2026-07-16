@@ -1,6 +1,8 @@
+import { existsSync } from "node:fs";
 import { mkdir, realpath, rm, stat } from "node:fs/promises";
 import { homedir } from "node:os";
-import { isAbsolute, join, relative, resolve, sep } from "node:path";
+import { delimiter, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
+import { fileURLToPath } from "node:url";
 import { type Api, getSupportedThinkingLevels, type Model, type ModelThinkingLevel } from "@earendil-works/pi-ai";
 import { ModelRuntime } from "@earendil-works/pi-coding-agent";
 import { PiProductSession } from "./pi-session.ts";
@@ -23,6 +25,7 @@ export interface RuntimeHostOptions {
 	sessionDir: string;
 	pluginsRoot: string;
 	pluginInbox: string;
+	skillPaths?: string[];
 	maxSessions: number;
 	toolGatewayUrl?: string;
 	toolGatewayToken?: string;
@@ -174,6 +177,8 @@ export class RagImeRuntimeHost {
 						conversationFork: true,
 						managedPlugins: true,
 						pluginDrafts: true,
+						managedSkills: true,
+						commandCatalog: true,
 					},
 				};
 			case "health":
@@ -218,6 +223,7 @@ export class RagImeRuntimeHost {
 						sessionFile,
 						agentDir: this.options.agentDir,
 						activePluginDir: this.plugins.activeDir,
+						skillPaths: this.options.skillPaths ?? [],
 						modelRuntime: this.modelRuntime,
 						provider,
 						modelId,
@@ -233,6 +239,8 @@ export class RagImeRuntimeHost {
 			}
 			case "session.snapshot":
 				return this.session(params).snapshot();
+			case "session.commands":
+				return { commands: this.session(params).listCommands() };
 			case "session.fork.candidates":
 				return { items: this.session(params).forkCandidates() };
 			case "session.fork": {
@@ -257,6 +265,7 @@ export class RagImeRuntimeHost {
 							sessionManager: prepared.sessionManager,
 							agentDir: this.options.agentDir,
 							activePluginDir: this.plugins.activeDir,
+							skillPaths: this.options.skillPaths ?? [],
 							modelRuntime: this.modelRuntime,
 							provider: profile.provider,
 							modelId: profile.modelId,
@@ -392,11 +401,22 @@ export function runtimeHostOptionsFromEnvironment(
 		.map((value) => value.trim())
 		.filter(Boolean);
 	const maxSessionsValue = Number.parseInt(process.env.RAG_IME_PI_MAX_SESSIONS || "8", 10);
+	const moduleDir = dirname(fileURLToPath(import.meta.url));
+	const bundledSkillCandidates = [
+		join(moduleDir, "skills", "rag-ime-plugin-creator"),
+		join(moduleDir, "..", "skills", "rag-ime-plugin-creator"),
+	];
+	const configuredSkillPaths = (process.env.RAG_IME_PI_SKILL_PATHS ?? "")
+		.split(delimiter)
+		.map((value) => value.trim())
+		.filter(Boolean)
+		.map((value) => resolve(value));
 	return {
 		agentDir,
 		sessionDir: resolve(process.env.RAG_IME_PI_SESSION_DIR || join(appSupport, "Agent", "sessions")),
 		pluginsRoot: resolve(process.env.RAG_IME_PI_PLUGINS_DIR || join(appSupport, "Agent", "plugins")),
 		pluginInbox: resolve(process.env.RAG_IME_PI_PLUGIN_INBOX || join(appSupport, "Agent", "plugin-inbox")),
+		skillPaths: [...new Set([...bundledSkillCandidates.filter(existsSync), ...configuredSkillPaths])],
 		maxSessions: Number.isInteger(maxSessionsValue) && maxSessionsValue > 0 ? Math.min(maxSessionsValue, 32) : 8,
 		toolGatewayUrl: process.env.RAG_IME_TOOL_GATEWAY_URL,
 		toolGatewayToken: process.env.RAG_IME_TOOL_GATEWAY_TOKEN,

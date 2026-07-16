@@ -9,6 +9,7 @@ export type RuntimeMethod =
 	| "tools.sync"
 	| "session.open"
 	| "session.snapshot"
+	| "session.commands"
 	| "session.fork.candidates"
 	| "session.fork"
 	| "session.prompt"
@@ -135,6 +136,7 @@ const RUNTIME_METHODS = new Set<RuntimeMethod>([
 	"tools.sync",
 	"session.open",
 	"session.snapshot",
+	"session.commands",
 	"session.fork.candidates",
 	"session.fork",
 	"session.prompt",
