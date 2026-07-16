@@ -76,7 +76,9 @@ const RAG_WRAPPER_PATTERN = /<\/?rag-ime-(?:deep-search-context|user-query)\b/i;
 
 function messageBlocks(content: unknown): Array<Record<string, unknown>> {
 	if (!Array.isArray(content)) return [];
-	return content.filter((item): item is Record<string, unknown> => typeof item === "object" && item !== null);
+	return content.filter(
+		(item): item is Record<string, unknown> => typeof item === "object" && item !== null,
+	);
 }
 
 function textFromContent(content: unknown): string {
@@ -128,7 +130,8 @@ export function publicPiForkCandidates(sourceManager: SessionManager): PublicPiF
 		const message = entry.message as unknown as Record<string, unknown>;
 		if (message.role !== "user" && message.role !== "assistant") continue;
 
-		const text = message.role === "user" ? publicUserText(message.content) : publicAssistantText(message);
+		const text =
+			message.role === "user" ? publicUserText(message.content) : publicAssistantText(message);
 		if (!text) continue;
 		result.push({
 			entryId: entry.id,
@@ -139,7 +142,6 @@ export function publicPiForkCandidates(sourceManager: SessionManager): PublicPiF
 	}
 	return result;
 }
-
 export function prepareNativePiFork(sourceManager: SessionManager, entryId: string): PreparedPiFork {
 	const selected = sourceManager.getEntry(entryId);
 	const candidate = publicPiForkCandidates(sourceManager).find((item) => item.entryId === entryId);
