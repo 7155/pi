@@ -38,6 +38,7 @@ const compat = {
 	zaiToolStream: false,
 	supportsStrictMode: true,
 	cacheControlFormat: undefined,
+	supportsPromptCacheKey: false,
 	sendSessionAffinityHeaders: false,
 	sessionAffinityFormat: "openai",
 	supportsLongCacheRetention: true,

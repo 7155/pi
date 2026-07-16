@@ -36,6 +36,7 @@ const compat: Required<OpenAICompletionsCompat> = {
 	zaiToolStream: false,
 	supportsStrictMode: true,
 	cacheControlFormat: "anthropic",
+	supportsPromptCacheKey: false,
 	sendSessionAffinityHeaders: false,
 	sessionAffinityFormat: "openai",
 	supportsLongCacheRetention: true,
