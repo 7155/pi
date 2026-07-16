@@ -24,6 +24,7 @@ import {
 	createBackendToolExtension,
 	diffBackendToolCatalog,
 } from "./tool-bridge.ts";
+import { createTransientContextExtension } from "./transient-context.ts";
 
 export interface PiSessionOpenOptions {
 	externalSessionId: string;
@@ -76,9 +77,7 @@ const RAG_WRAPPER_PATTERN = /<\/?rag-ime-(?:deep-search-context|user-query)\b/i;
 
 function messageBlocks(content: unknown): Array<Record<string, unknown>> {
 	if (!Array.isArray(content)) return [];
-	return content.filter(
-		(item): item is Record<string, unknown> => typeof item === "object" && item !== null,
-	);
+	return content.filter((item): item is Record<string, unknown> => typeof item === "object" && item !== null);
 }
 
 function textFromContent(content: unknown): string {
@@ -130,8 +129,7 @@ export function publicPiForkCandidates(sourceManager: SessionManager): PublicPiF
 		const message = entry.message as unknown as Record<string, unknown>;
 		if (message.role !== "user" && message.role !== "assistant") continue;
 
-		const text =
-			message.role === "user" ? publicUserText(message.content) : publicAssistantText(message);
+		const text = message.role === "user" ? publicUserText(message.content) : publicAssistantText(message);
 		if (!text) continue;
 		result.push({
 			entryId: entry.id,
@@ -212,6 +210,7 @@ export class PiProductSession implements PooledSession {
 	private unsubscribe: (() => void) | undefined;
 	private sequence = 0;
 	private activeTurn: ActiveTurn | undefined;
+	private transientContext = "";
 	private readonly pendingDecisions = new Map<
 		string,
 		{ requestId: string; resolve(value: boolean): void; cleanup(): void }
@@ -266,6 +265,7 @@ export class PiProductSession implements PooledSession {
 					createBackendTool: (tool) => createBackendToolDefinition(backendBridge, tool),
 				}),
 				createBackendToolExtension(backendBridge),
+				createTransientContextExtension(() => productSession?.transientContext ?? ""),
 			],
 			noExtensions: true,
 			noContextFiles: options.noContextFiles ?? false,
@@ -382,7 +382,10 @@ export class PiProductSession implements PooledSession {
 			sequence: ++this.sequence,
 			payload: toSerializableEvent(event),
 		});
-		if (event.type === "agent_settled") this.activeTurn = undefined;
+		if (event.type === "agent_settled") {
+			this.activeTurn = undefined;
+			this.transientContext = "";
+		}
 	}
 
 	private notice(payload: Record<string, unknown>): void {
@@ -545,12 +548,14 @@ export class PiProductSession implements PooledSession {
 		message: string;
 		clientMessageId?: string;
 		images?: PromptOptions["images"];
+		transientContext?: string;
 	}): Promise<ActiveTurn> {
 		if (!this.session.isIdle || this.activeTurn) {
 			throw new RuntimeProtocolError("SESSION_BUSY", "Session already has an active turn");
 		}
 		const turn = { turnId: randomUUID(), clientMessageId: options.clientMessageId };
 		this.activeTurn = turn;
+		this.transientContext = options.transientContext?.trim() ?? "";
 		let preflightSettled = false;
 		return new Promise<ActiveTurn>((accept, reject) => {
 			void this.session
@@ -560,14 +565,20 @@ export class PiProductSession implements PooledSession {
 					preflightResult: (success) => {
 						if (preflightSettled) return;
 						preflightSettled = true;
-						if (success) accept(turn);
-						else reject(new RuntimeProtocolError("PROMPT_REJECTED", "Prompt preflight was rejected"));
+						if (success) {
+							accept(turn);
+						} else {
+							this.activeTurn = undefined;
+							this.transientContext = "";
+							reject(new RuntimeProtocolError("PROMPT_REJECTED", "Prompt preflight was rejected"));
+						}
 					},
 				})
 				.catch((error) => {
 					if (!preflightSettled) {
 						preflightSettled = true;
 						this.activeTurn = undefined;
+						this.transientContext = "";
 						reject(error);
 					}
 				});
@@ -632,6 +643,7 @@ export class PiProductSession implements PooledSession {
 			pending.resolve(false);
 		}
 		this.pendingDecisions.clear();
+		this.transientContext = "";
 		this.unsubscribe?.();
 		this.unsubscribe = undefined;
 		this.session.dispose();

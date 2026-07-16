@@ -15,6 +15,7 @@ import {
 	type RuntimeRequest,
 } from "./protocol.ts";
 import { BoundedSessionPool } from "./session-pool.ts";
+import { decodeRuntimePrompt } from "./transient-context.ts";
 
 const HOST_VERSION = "1.0.0";
 const SESSION_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,199}$/;
@@ -188,6 +189,7 @@ export class RagImeRuntimeHost {
 						pluginDrafts: true,
 						managedSkills: true,
 						commandCatalog: true,
+						transientContext: true,
 					},
 				};
 			case "health":
@@ -307,12 +309,15 @@ export class RagImeRuntimeHost {
 					throw error;
 				}
 			}
-			case "session.prompt":
+			case "session.prompt": {
+				const prompt = decodeRuntimePrompt(requiredString(params, "message", 1_000_000));
 				return this.session(params).prompt({
-					message: requiredString(params, "message", 1_000_000),
+					message: prompt.message,
+					transientContext: prompt.transientContext,
 					clientMessageId: optionalString(params, "clientMessageId", 128),
 					images: Array.isArray(params.images) ? (params.images as never) : undefined,
 				});
+			}
 			case "session.abort":
 				await this.session(params).abort();
 				return { aborted: true };
