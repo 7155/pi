@@ -43,6 +43,20 @@ function toSerializableEvent(event: AgentSessionEvent): Record<string, unknown> 
 	return { ...(event as unknown as Record<string, unknown>) };
 }
 
+function publicSessionModel(model: Model<Api>): Record<string, unknown> {
+	return {
+		provider: model.provider,
+		id: model.id,
+		name: model.name,
+		api: model.api,
+		reasoning: model.reasoning,
+		thinkingLevels: getSupportedThinkingLevels(model),
+		input: [...model.input],
+		contextWindow: model.contextWindow,
+		maxTokens: model.maxTokens,
+	};
+}
+
 export class PiProductSession implements PooledSession {
 	readonly externalSessionId: string;
 	readonly cwd: string;
@@ -220,19 +234,7 @@ export class PiProductSession implements PooledSession {
 			cwd: this.cwd,
 			sessionFile: this.session.sessionFile,
 			sessionName: this.session.sessionName,
-			model: this.session.model
-				? {
-						provider: this.session.model.provider,
-						id: this.session.model.id,
-						name: this.session.model.name,
-						api: this.session.model.api,
-						reasoning: this.session.model.reasoning,
-						thinkingLevels: getSupportedThinkingLevels(this.session.model),
-						input: [...this.session.model.input],
-						contextWindow: this.session.model.contextWindow,
-						maxTokens: this.session.model.maxTokens,
-					}
-				: undefined,
+			model: this.session.model ? publicSessionModel(this.session.model) : undefined,
 			thinkingLevel: this.session.thinkingLevel,
 			isIdle: this.session.isIdle,
 			isCompacting: this.session.isCompacting,
@@ -319,12 +321,7 @@ export class PiProductSession implements PooledSession {
 		const model = this.session.modelRuntime.getModel(provider, modelId);
 		if (!model) throw new RuntimeProtocolError("MODEL_NOT_FOUND", `Model not found: ${provider}/${modelId}`);
 		await this.session.setModel(model);
-		return {
-			provider: model.provider,
-			id: model.id,
-			name: model.name,
-			thinkingLevels: getSupportedThinkingLevels(model),
-		};
+		return publicSessionModel(model);
 	}
 
 	setThinkingLevel(level: NonNullable<CreateAgentSessionOptions["thinkingLevel"]>): Record<string, unknown> {
