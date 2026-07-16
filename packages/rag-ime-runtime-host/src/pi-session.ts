@@ -33,6 +33,7 @@ export interface PiSessionOpenOptions {
 	toolGatewayUrl?: string;
 	toolGatewayToken?: string;
 	systemPrompt?: string;
+	noContextFiles?: boolean;
 	emitEvent(event: RuntimeEventEnvelope): void;
 }
 
@@ -51,6 +52,7 @@ export interface PiForkRuntimeProfile {
 	thinkingLevel?: NonNullable<CreateAgentSessionOptions["thinkingLevel"]>;
 	toolManifest: BackendToolManifest[];
 	systemPrompt: string;
+	noContextFiles: boolean;
 }
 
 export function prepareNativePiFork(sourceManager: SessionManager, entryId: string): PreparedPiFork {
@@ -121,6 +123,7 @@ export class PiProductSession implements PooledSession {
 	readonly externalSessionId: string;
 	readonly cwd: string;
 	readonly toolRegistry: BackendToolRegistry;
+	readonly noContextFiles: boolean;
 	private readonly session: AgentSession;
 	private readonly resourceLoader: DefaultResourceLoader;
 	private readonly emitEvent: (event: RuntimeEventEnvelope) => void;
@@ -140,6 +143,7 @@ export class PiProductSession implements PooledSession {
 	) {
 		this.externalSessionId = options.externalSessionId;
 		this.cwd = options.cwd;
+		this.noContextFiles = options.noContextFiles ?? false;
 		this.session = session;
 		this.toolRegistry = registry;
 		this.resourceLoader = resourceLoader;
@@ -171,6 +175,7 @@ export class PiProductSession implements PooledSession {
 				}),
 			],
 			noExtensions: true,
+			noContextFiles: options.noContextFiles ?? false,
 			systemPrompt: options.systemPrompt,
 		});
 		await resourceLoader.reload();
@@ -362,6 +367,7 @@ export class PiProductSession implements PooledSession {
 			thinkingLevel: this.session.thinkingLevel,
 			toolManifest: this.toolRegistry.list(),
 			systemPrompt: this.session.systemPrompt,
+			noContextFiles: this.noContextFiles,
 		};
 	}
 

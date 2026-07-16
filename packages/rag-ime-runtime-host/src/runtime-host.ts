@@ -52,6 +52,15 @@ function optionalString(params: Record<string, unknown>, key: string, maximum = 
 	return value.trim() || undefined;
 }
 
+function optionalBoolean(params: Record<string, unknown>, key: string, fallback = false): boolean {
+	const value = params[key];
+	if (value === undefined || value === null) return fallback;
+	if (typeof value !== "boolean") {
+		throw new RuntimeProtocolError("INVALID_PARAMS", `${key} must be a boolean`);
+	}
+	return value;
+}
+
 function sessionIdParam(params: Record<string, unknown>, key: string): string {
 	const sessionId = requiredString(params, key, 200);
 	if (!SESSION_ID_PATTERN.test(sessionId)) {
@@ -232,6 +241,7 @@ export class RagImeRuntimeHost {
 						toolGatewayUrl: this.options.toolGatewayUrl,
 						toolGatewayToken: this.options.toolGatewayToken,
 						systemPrompt: optionalString(params, "systemPrompt", 64_000),
+						noContextFiles: optionalBoolean(params, "noContextFiles"),
 						emitEvent: this.options.emitEvent,
 					}),
 				);
@@ -274,6 +284,7 @@ export class RagImeRuntimeHost {
 							toolGatewayUrl: this.options.toolGatewayUrl,
 							toolGatewayToken: this.options.toolGatewayToken,
 							systemPrompt: profile.systemPrompt,
+							noContextFiles: profile.noContextFiles,
 							emitEvent: this.options.emitEvent,
 						}),
 					);
