@@ -163,6 +163,7 @@ export class RagImeRuntimeHost {
 					capabilities: {
 						multiSession: true,
 						maxSessions: this.sessions.maxSessions,
+						concurrentControlPlane: true,
 						settledEvents: true,
 						dynamicTools: true,
 						sessionSnapshot: true,

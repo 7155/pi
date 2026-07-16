@@ -15,6 +15,7 @@ export class BoundedSessionPool<T extends PooledSession> {
 	readonly maxSessions: number;
 	readonly evictionPolicy = "lru-idle" as const;
 	private readonly entries = new Map<string, PoolEntry<T>>();
+	private admission = Promise.resolve();
 
 	constructor(maxSessions: number) {
 		if (!Number.isInteger(maxSessions) || maxSessions < 1) {
@@ -38,42 +39,60 @@ export class BoundedSessionPool<T extends PooledSession> {
 		return entry.session;
 	}
 
+	private async withAdmission<TResult>(operation: () => Promise<TResult>): Promise<TResult> {
+		let releaseAdmission: (() => void) | undefined;
+		const previousAdmission = this.admission;
+		this.admission = new Promise<void>((resolve) => {
+			releaseAdmission = resolve;
+		});
+		await previousAdmission;
+		try {
+			return await operation();
+		} finally {
+			releaseAdmission?.();
+		}
+	}
+
 	async open(sessionId: string, create: () => Promise<T>): Promise<{ session: T; evictedSessionId?: string }> {
-		const existing = this.get(sessionId);
-		if (existing) return { session: existing };
+		return this.withAdmission(async () => {
+			const existing = this.get(sessionId);
+			if (existing) return { session: existing };
 
-		let evictedSessionId: string | undefined;
-		if (this.entries.size >= this.maxSessions) {
-			const idleEntries = [...this.entries.entries()]
-				.filter(([, entry]) => entry.session.isIdle)
-				.sort((left, right) => left[1].lastUsedAt - right[1].lastUsedAt);
-			const victim = idleEntries[0];
-			if (!victim) {
-				throw new RuntimeProtocolError(
-					"SESSION_CAPACITY",
-					`Runtime session limit (${this.maxSessions}) reached and all sessions are active`,
-				);
+			let evictedSessionId: string | undefined;
+			if (this.entries.size >= this.maxSessions) {
+				const idleEntries = [...this.entries.entries()]
+					.filter(([, entry]) => entry.session.isIdle)
+					.sort((left, right) => left[1].lastUsedAt - right[1].lastUsedAt);
+				const victim = idleEntries[0];
+				if (!victim) {
+					throw new RuntimeProtocolError(
+						"SESSION_CAPACITY",
+						`Runtime session limit (${this.maxSessions}) reached and all sessions are active`,
+					);
+				}
+				this.entries.delete(victim[0]);
+				await victim[1].session.dispose();
+				evictedSessionId = victim[0];
 			}
-			this.entries.delete(victim[0]);
-			await victim[1].session.dispose();
-			evictedSessionId = victim[0];
-		}
 
-		const session = await create();
-		if (session.externalSessionId !== sessionId) {
-			await session.dispose();
-			throw new Error("Session factory returned a mismatched externalSessionId");
-		}
-		this.entries.set(sessionId, { session, lastUsedAt: Date.now() });
-		return { session, evictedSessionId };
+			const session = await create();
+			if (session.externalSessionId !== sessionId) {
+				await session.dispose();
+				throw new Error("Session factory returned a mismatched externalSessionId");
+			}
+			this.entries.set(sessionId, { session, lastUsedAt: Date.now() });
+			return { session, evictedSessionId };
+		});
 	}
 
 	async close(sessionId: string): Promise<boolean> {
-		const entry = this.entries.get(sessionId);
-		if (!entry) return false;
-		this.entries.delete(sessionId);
-		await entry.session.dispose();
-		return true;
+		return this.withAdmission(async () => {
+			const entry = this.entries.get(sessionId);
+			if (!entry) return false;
+			this.entries.delete(sessionId);
+			await entry.session.dispose();
+			return true;
+		});
 	}
 
 	async dispose(): Promise<void> {

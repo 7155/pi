@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 import { createInterface } from "node:readline";
-import { errorResponse, parseRuntimeRequest, successResponse } from "./protocol.ts";
+import { RuntimeRequestDispatcher } from "./request-dispatcher.ts";
 import { RagImeRuntimeHost, runtimeHostOptionsFromEnvironment } from "./runtime-host.ts";
 
 function output(value: unknown): void {
@@ -9,27 +9,16 @@ function output(value: unknown): void {
 
 async function main(): Promise<void> {
 	const host = await RagImeRuntimeHost.create(runtimeHostOptionsFromEnvironment(output));
-	let chain = Promise.resolve();
+	const dispatcher = new RuntimeRequestDispatcher(host, output);
 	const reader = createInterface({ input: process.stdin, crlfDelay: Infinity });
 	reader.on("line", (line) => {
-		chain = chain.then(async () => {
-			let id = "";
-			try {
-				const value: unknown = JSON.parse(line);
-				if (typeof value === "object" && value !== null && "id" in value && typeof value.id === "string")
-					id = value.id;
-				const request = parseRuntimeRequest(value);
-				output(successResponse(request.id, await host.handle(request)));
-			} catch (error) {
-				output(errorResponse(id, error));
-			}
-		});
+		dispatcher.dispatch(line);
 	});
 	await new Promise<void>((resolve, reject) => {
 		reader.on("close", resolve);
 		reader.on("error", reject);
 	});
-	await chain;
+	await dispatcher.settle();
 	await host.dispose();
 }
 
