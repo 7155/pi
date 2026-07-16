@@ -12,16 +12,9 @@ import {
 	SessionManager,
 	SettingsManager,
 } from "@earendil-works/pi-coding-agent";
-import { createDiscoveryToolsExtension, diffSkillCatalog, runtimeSkillCatalogRevision } from "./discovery-tools.ts";
 import { PROTOCOL_VERSION, type RuntimeEventEnvelope, RuntimeProtocolError } from "./protocol.ts";
 import type { PooledSession } from "./session-pool.ts";
-import {
-	type BackendToolManifest,
-	BackendToolRegistry,
-	backendToolSchemaRevision,
-	createBackendToolExtension,
-	diffBackendToolCatalog,
-} from "./tool-bridge.ts";
+import { type BackendToolManifest, BackendToolRegistry, createBackendToolExtension } from "./tool-bridge.ts";
 
 export interface PiSessionOpenOptions {
 	externalSessionId: string;
@@ -74,7 +67,9 @@ const RAG_WRAPPER_PATTERN = /<\/?rag-ime-(?:deep-search-context|user-query)\b/i;
 
 function messageBlocks(content: unknown): Array<Record<string, unknown>> {
 	if (!Array.isArray(content)) return [];
-	return content.filter((item): item is Record<string, unknown> => typeof item === "object" && item !== null);
+	return content.filter(
+		(item): item is Record<string, unknown> => typeof item === "object" && item !== null,
+	);
 }
 
 function textFromContent(content: unknown): string {
@@ -126,7 +121,8 @@ export function publicPiForkCandidates(sourceManager: SessionManager): PublicPiF
 		const message = entry.message as unknown as Record<string, unknown>;
 		if (message.role !== "user" && message.role !== "assistant") continue;
 
-		const text = message.role === "user" ? publicUserText(message.content) : publicAssistantText(message);
+		const text =
+			message.role === "user" ? publicUserText(message.content) : publicAssistantText(message);
 		if (!text) continue;
 		result.push({
 			entryId: entry.id,
@@ -234,22 +230,13 @@ export class PiProductSession implements PooledSession {
 		if (options.toolManifest !== undefined) registry.sync(options.toolManifest);
 		let productSession: PiProductSession | undefined;
 		const settingsManager = SettingsManager.create(options.cwd, options.agentDir, { projectTrusted: true });
-		let resourceLoader: DefaultResourceLoader | undefined;
-		const getResourceLoader = (): DefaultResourceLoader => {
-			if (!resourceLoader) throw new Error("Product session resource loader is not ready");
-			return resourceLoader;
-		};
-		resourceLoader = new DefaultResourceLoader({
+		const resourceLoader = new DefaultResourceLoader({
 			cwd: options.cwd,
 			agentDir: options.agentDir,
 			settingsManager,
 			additionalExtensionPaths: [options.activePluginDir],
 			additionalSkillPaths: options.skillPaths,
 			extensionFactories: [
-				createDiscoveryToolsExtension({
-					getResourceLoader,
-					registry,
-				}),
 				createBackendToolExtension({
 					sessionId: options.externalSessionId,
 					registry,
@@ -402,9 +389,6 @@ export class PiProductSession implements PooledSession {
 			isCompacting: this.session.isCompacting,
 			activeTurn: this.activeTurn,
 			sequence: this.sequence,
-			toolCatalogRevision: this.toolRegistry.revision(),
-			toolSchemaRevision: backendToolSchemaRevision(this.toolRegistry.list()),
-			skillCatalogRevision: runtimeSkillCatalogRevision(this.resourceLoader.getSkills().skills),
 			messages: this.session.messages,
 			entries: this.session.sessionManager.getEntries(),
 			leafId: this.session.sessionManager.getLeafId(),
@@ -461,57 +445,12 @@ export class PiProductSession implements PooledSession {
 		};
 	}
 
-	private registeredToolSchemas(): BackendToolManifest[] {
-		return this.session.getAllTools().map((tool) => ({
-			name: tool.name,
-			description: tool.description,
-			parameters: tool.parameters as Record<string, unknown>,
-		}));
-	}
-
-	private async appendCatalogChange(
-		kind: "skill_catalog_changed" | "tool_catalog_changed" | "runtime_catalog_changed",
-		details: Record<string, unknown>,
-	): Promise<void> {
-		const change = {
-			schemaVersion: "rag-ime.runtime-catalog-change.v1",
-			kind,
-			...details,
-		};
-		await this.session.sendCustomMessage({
-			customType: "rag-ime.runtime-catalog-change",
-			content: [
-				"<rag-ime-runtime-catalog-change>",
-				JSON.stringify(change),
-				"</rag-ime-runtime-catalog-change>",
-			].join("\n"),
-			display: false,
-			details: change,
-		});
-		this.notice({
-			type: "runtime_catalog_changed",
-			...change,
-		});
-	}
-
 	async syncTools(manifest: unknown): Promise<BackendToolManifest[]> {
 		if (!this.session.isIdle) {
 			throw new RuntimeProtocolError("SESSION_BUSY", "Tools can only be synchronized while the session is idle");
 		}
-		const before = this.toolRegistry.list();
 		const tools = this.toolRegistry.sync(manifest);
-		const diff = diffBackendToolCatalog(before, tools);
-		if (diff.previousRevision === diff.revision) return tools;
-
-		// Permission/profile-only updates are model-visible as an appended delta but
-		// do not rebuild the stable tool-schema prefix.
-		if (diff.previousSchemaRevision !== diff.schemaRevision) {
-			await this.session.reload();
-		}
-		await this.appendCatalogChange("tool_catalog_changed", {
-			...diff,
-			schemaReloaded: diff.previousSchemaRevision !== diff.schemaRevision,
-		});
+		await this.session.reload();
 		return tools;
 	}
 
@@ -583,21 +522,7 @@ export class PiProductSession implements PooledSession {
 
 	async reloadPlugins(): Promise<void> {
 		if (!this.session.isIdle) return;
-		const skillsBefore = this.resourceLoader.getSkills().skills;
-		const toolsBefore = this.registeredToolSchemas();
 		await this.session.reload();
-		const skillDiff = diffSkillCatalog(skillsBefore, this.resourceLoader.getSkills().skills);
-		const toolDiff = diffBackendToolCatalog(toolsBefore, this.registeredToolSchemas());
-		if (
-			skillDiff.previousRevision !== skillDiff.revision ||
-			toolDiff.previousSchemaRevision !== toolDiff.schemaRevision
-		) {
-			await this.appendCatalogChange("runtime_catalog_changed", {
-				skills: skillDiff,
-				tools: toolDiff,
-				schemaReloaded: true,
-			});
-		}
 	}
 
 	dispose(): void {
