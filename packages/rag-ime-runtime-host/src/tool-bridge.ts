@@ -1,5 +1,7 @@
+import { createHash } from "node:crypto";
 import type { InlineExtension, ToolDefinition } from "@earendil-works/pi-coding-agent";
 import { RuntimeProtocolError } from "./protocol.ts";
+import { RESERVED_RUNTIME_TOOL_NAMES } from "./runtime-tool-names.ts";
 
 const TOOL_NAME_PATTERN = /^[a-zA-Z][a-zA-Z0-9_.-]{0,127}$/;
 const MAX_TOOLS = 256;
@@ -12,6 +14,18 @@ export interface BackendToolManifest {
 	risk?: string;
 }
 
+export interface BackendToolCatalogDiff {
+	previousRevision: string;
+	revision: string;
+	previousSchemaRevision: string;
+	schemaRevision: string;
+	added: string[];
+	removed: string[];
+	changed: string[];
+	schemaChanged: string[];
+	metadataChanged: string[];
+}
+
 interface ToolGatewayResponse {
 	ok: boolean;
 	result?: Record<string, unknown>;
@@ -21,9 +35,34 @@ interface ToolGatewayResponse {
 
 export class BackendToolRegistry {
 	private manifest: BackendToolManifest[] = [];
+	private activeNames = new Set<string>();
 
 	list(): BackendToolManifest[] {
 		return structuredClone(this.manifest);
+	}
+
+	active(): BackendToolManifest[] {
+		return this.manifest.filter((tool) => this.activeNames.has(tool.name)).map((tool) => structuredClone(tool));
+	}
+
+	get(name: string): BackendToolManifest | undefined {
+		const tool = this.manifest.find((candidate) => candidate.name === name);
+		return tool ? structuredClone(tool) : undefined;
+	}
+
+	activate(name: string): BackendToolManifest {
+		const tool = this.get(name);
+		if (!tool) throw new RuntimeProtocolError("TOOL_NOT_FOUND", `Unknown or unavailable product tool: ${name}`);
+		this.activeNames.add(name);
+		return tool;
+	}
+
+	isActive(name: string): boolean {
+		return this.activeNames.has(name);
+	}
+
+	revision(): string {
+		return backendToolCatalogRevision(this.manifest);
 	}
 
 	sync(value: unknown): BackendToolManifest[] {
@@ -34,49 +73,129 @@ export class BackendToolRegistry {
 			throw new RuntimeProtocolError("INVALID_TOOL_MANIFEST", `Tool manifest exceeds ${MAX_TOOLS} tools`);
 		}
 		const names = new Set<string>();
-		const manifest = value.map((item, index): BackendToolManifest => {
-			if (typeof item !== "object" || item === null || Array.isArray(item)) {
-				throw new RuntimeProtocolError("INVALID_TOOL_MANIFEST", `Tool ${index} must be an object`);
-			}
-			const record = item as Record<string, unknown>;
-			if (typeof record.name !== "string" || !TOOL_NAME_PATTERN.test(record.name)) {
-				throw new RuntimeProtocolError("INVALID_TOOL_MANIFEST", `Tool ${index} has an invalid name`);
-			}
-			if (names.has(record.name)) {
-				throw new RuntimeProtocolError("INVALID_TOOL_MANIFEST", `Duplicate tool name: ${record.name}`);
-			}
-			names.add(record.name);
-			if (typeof record.description !== "string" || record.description.length === 0) {
-				throw new RuntimeProtocolError("INVALID_TOOL_MANIFEST", `Tool ${record.name} needs a description`);
-			}
-			if (
-				typeof record.parameters !== "object" ||
-				record.parameters === null ||
-				Array.isArray(record.parameters) ||
-				(record.parameters as Record<string, unknown>).type !== "object"
-			) {
-				throw new RuntimeProtocolError(
-					"INVALID_TOOL_MANIFEST",
-					`Tool ${record.name} parameters must be a JSON object schema`,
-				);
-			}
-			if (record.profile !== undefined && typeof record.profile !== "string") {
-				throw new RuntimeProtocolError("INVALID_TOOL_MANIFEST", `Tool ${record.name} profile must be a string`);
-			}
-			if (record.risk !== undefined && typeof record.risk !== "string") {
-				throw new RuntimeProtocolError("INVALID_TOOL_MANIFEST", `Tool ${record.name} risk must be a string`);
-			}
-			return {
-				name: record.name,
-				description: record.description,
-				parameters: structuredClone(record.parameters as Record<string, unknown>),
-				profile: record.profile,
-				risk: record.risk,
-			};
-		});
+		const manifest = value
+			.map((item, index): BackendToolManifest => {
+				if (typeof item !== "object" || item === null || Array.isArray(item)) {
+					throw new RuntimeProtocolError("INVALID_TOOL_MANIFEST", `Tool ${index} must be an object`);
+				}
+				const record = item as Record<string, unknown>;
+				if (typeof record.name !== "string" || !TOOL_NAME_PATTERN.test(record.name)) {
+					throw new RuntimeProtocolError("INVALID_TOOL_MANIFEST", `Tool ${index} has an invalid name`);
+				}
+				if (names.has(record.name)) {
+					throw new RuntimeProtocolError("INVALID_TOOL_MANIFEST", `Duplicate tool name: ${record.name}`);
+				}
+				if (RESERVED_RUNTIME_TOOL_NAMES.has(record.name)) {
+					throw new RuntimeProtocolError(
+						"INVALID_TOOL_MANIFEST",
+						`Tool name is reserved by the runtime host: ${record.name}`,
+					);
+				}
+				names.add(record.name);
+				if (typeof record.description !== "string" || record.description.length === 0) {
+					throw new RuntimeProtocolError("INVALID_TOOL_MANIFEST", `Tool ${record.name} needs a description`);
+				}
+				if (
+					typeof record.parameters !== "object" ||
+					record.parameters === null ||
+					Array.isArray(record.parameters) ||
+					(record.parameters as Record<string, unknown>).type !== "object"
+				) {
+					throw new RuntimeProtocolError(
+						"INVALID_TOOL_MANIFEST",
+						`Tool ${record.name} parameters must be a JSON object schema`,
+					);
+				}
+				if (record.profile !== undefined && typeof record.profile !== "string") {
+					throw new RuntimeProtocolError("INVALID_TOOL_MANIFEST", `Tool ${record.name} profile must be a string`);
+				}
+				if (record.risk !== undefined && typeof record.risk !== "string") {
+					throw new RuntimeProtocolError("INVALID_TOOL_MANIFEST", `Tool ${record.name} risk must be a string`);
+				}
+				return {
+					name: record.name,
+					description: record.description,
+					parameters: canonicalJson(record.parameters) as Record<string, unknown>,
+					profile: record.profile,
+					risk: record.risk,
+				};
+			})
+			.sort((left, right) => left.name.localeCompare(right.name));
+		this.activeNames = new Set([...this.activeNames].filter((name) => names.has(name)));
 		this.manifest = manifest;
 		return this.list();
 	}
+}
+
+function canonicalJson(value: unknown): unknown {
+	if (Array.isArray(value)) {
+		return value.map(canonicalJson);
+	}
+	if (typeof value === "object" && value !== null) {
+		const record = value as Record<string, unknown>;
+		return Object.fromEntries(
+			Object.keys(record)
+				.sort()
+				.map((key) => [key, canonicalJson(record[key])]),
+		);
+	}
+	return value;
+}
+
+export function backendToolCatalogRevision(tools: BackendToolManifest[]): string {
+	const canonical = tools
+		.slice()
+		.sort((left, right) => left.name.localeCompare(right.name))
+		.map((tool) => canonicalJson(tool));
+	return createHash("sha256").update(JSON.stringify(canonical)).digest("hex");
+}
+
+export function backendToolSchemaRevision(tools: BackendToolManifest[]): string {
+	const schemas = tools.map(({ name, description, parameters }) => ({ name, description, parameters }));
+	return backendToolCatalogRevision(schemas);
+}
+
+export function diffBackendToolCatalog(
+	before: BackendToolManifest[],
+	after: BackendToolManifest[],
+): BackendToolCatalogDiff {
+	const previousByName = new Map(before.map((tool) => [tool.name, tool]));
+	const nextByName = new Map(after.map((tool) => [tool.name, tool]));
+	const added = [...nextByName.keys()].filter((name) => !previousByName.has(name)).sort();
+	const removed = [...previousByName.keys()].filter((name) => !nextByName.has(name)).sort();
+	const changed = [...nextByName.keys()]
+		.filter((name) => {
+			const previous = previousByName.get(name);
+			const next = nextByName.get(name);
+			return (
+				previous !== undefined &&
+				next !== undefined &&
+				backendToolCatalogRevision([previous]) !== backendToolCatalogRevision([next])
+			);
+		})
+		.sort();
+	const schemaChanged = changed.filter((name) => {
+		const previous = previousByName.get(name);
+		const next = nextByName.get(name);
+		return (
+			previous !== undefined &&
+			next !== undefined &&
+			backendToolSchemaRevision([previous]) !== backendToolSchemaRevision([next])
+		);
+	});
+	const schemaChangedSet = new Set(schemaChanged);
+	const metadataChanged = changed.filter((name) => !schemaChangedSet.has(name));
+	return {
+		previousRevision: backendToolCatalogRevision(before),
+		revision: backendToolCatalogRevision(after),
+		previousSchemaRevision: backendToolSchemaRevision(before),
+		schemaRevision: backendToolSchemaRevision(after),
+		added,
+		removed,
+		changed,
+		schemaChanged,
+		metadataChanged,
+	};
 }
 
 export interface BackendToolBridgeOptions {
@@ -191,7 +310,20 @@ async function executeGatewayTool(
 	}
 	return {
 		content: [{ type: "text", text: JSON.stringify(result) }],
-		details: result,
+		details: { ...result, toolName: tool.name },
+	};
+}
+
+export function createBackendToolDefinition(
+	options: BackendToolBridgeOptions,
+	tool: BackendToolManifest,
+): ToolDefinition {
+	return {
+		name: tool.name,
+		label: tool.name,
+		description: tool.description,
+		parameters: tool.parameters as ToolDefinition["parameters"],
+		execute: async (toolCallId, args, signal) => executeGatewayTool(options, tool, toolCallId, args, signal),
 	};
 }
 
@@ -199,14 +331,8 @@ export function createBackendToolExtension(options: BackendToolBridgeOptions): I
 	return {
 		name: "rag-ime-backend-tools",
 		factory(pi) {
-			for (const tool of options.registry.list()) {
-				pi.registerTool({
-					name: tool.name,
-					label: tool.name,
-					description: tool.description,
-					parameters: tool.parameters as ToolDefinition["parameters"],
-					execute: async (toolCallId, args, signal) => executeGatewayTool(options, tool, toolCallId, args, signal),
-				});
+			for (const tool of options.registry.active()) {
+				pi.registerTool(createBackendToolDefinition(options, tool));
 			}
 		},
 	};

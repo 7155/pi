@@ -12,9 +12,18 @@ import {
 	SessionManager,
 	SettingsManager,
 } from "@earendil-works/pi-coding-agent";
+import { createDiscoveryToolsExtension, diffSkillCatalog, runtimeSkillCatalogRevision } from "./discovery-tools.ts";
 import { PROTOCOL_VERSION, type RuntimeEventEnvelope, RuntimeProtocolError } from "./protocol.ts";
 import type { PooledSession } from "./session-pool.ts";
-import { type BackendToolManifest, BackendToolRegistry, createBackendToolExtension } from "./tool-bridge.ts";
+import {
+	type BackendToolBridgeOptions,
+	type BackendToolManifest,
+	BackendToolRegistry,
+	backendToolSchemaRevision,
+	createBackendToolDefinition,
+	createBackendToolExtension,
+	diffBackendToolCatalog,
+} from "./tool-bridge.ts";
 
 export interface PiSessionOpenOptions {
 	externalSessionId: string;
@@ -45,6 +54,13 @@ export interface PreparedPiFork {
 	sessionManager: SessionManager;
 }
 
+export interface PublicPiForkCandidate {
+	entryId: string;
+	text: string;
+	role: "user" | "assistant";
+	createdAtMs: number;
+}
+
 export interface PiForkRuntimeProfile {
 	cwd: string;
 	provider?: string;
@@ -55,26 +71,90 @@ export interface PiForkRuntimeProfile {
 	noContextFiles: boolean;
 }
 
+const RAG_USER_QUERY_PATTERN = /<rag-ime-user-query>\s*([\s\S]*?)\s*<\/rag-ime-user-query>/i;
+const RAG_WRAPPER_PATTERN = /<\/?rag-ime-(?:deep-search-context|user-query)\b/i;
+
+function messageBlocks(content: unknown): Array<Record<string, unknown>> {
+	if (!Array.isArray(content)) return [];
+	return content.filter((item): item is Record<string, unknown> => typeof item === "object" && item !== null);
+}
+
+function textFromContent(content: unknown): string {
+	if (typeof content === "string") return content.trim();
+	return messageBlocks(content)
+		.filter((item) => item.type === "text" && typeof item.text === "string")
+		.map((item) => item.text as string)
+		.join("")
+		.trim();
+}
+
+function publicUserText(content: unknown): string | undefined {
+	const rawText = textFromContent(content);
+	const taggedQuery = RAG_USER_QUERY_PATTERN.exec(rawText)?.[1]?.trim();
+	if (taggedQuery) return taggedQuery;
+
+	// The wrapper contains private retrieval context. Fail closed unless it carries
+	// the explicit public-query tag above.
+	if (RAG_WRAPPER_PATTERN.test(rawText)) return undefined;
+	if (rawText) return rawText;
+	if (messageBlocks(content).some((item) => item.type === "image")) return "非文本消息";
+	return undefined;
+}
+
+function publicAssistantText(message: Record<string, unknown>): string | undefined {
+	const blocks = messageBlocks(message.content);
+	if (blocks.some((item) => item.type === "toolCall" || item.type === "tool_call")) {
+		return undefined;
+	}
+	const text = textFromContent(message.content);
+	if (text) return text;
+	if (typeof message.errorMessage === "string" && message.errorMessage.trim()) {
+		return message.errorMessage.trim();
+	}
+	if (blocks.some((item) => item.type === "image")) return "非文本消息";
+	return undefined;
+}
+
+function entryCreatedAtMs(entryTimestamp: string, messageTimestamp: unknown): number {
+	if (typeof messageTimestamp === "number" && Number.isFinite(messageTimestamp)) return messageTimestamp;
+	const parsed = Date.parse(entryTimestamp);
+	return Number.isFinite(parsed) ? parsed : 0;
+}
+
+export function publicPiForkCandidates(sourceManager: SessionManager): PublicPiForkCandidate[] {
+	const result: PublicPiForkCandidate[] = [];
+	for (const entry of sourceManager.getEntries()) {
+		if (entry.type !== "message") continue;
+		const message = entry.message as unknown as Record<string, unknown>;
+		if (message.role !== "user" && message.role !== "assistant") continue;
+
+		const text = message.role === "user" ? publicUserText(message.content) : publicAssistantText(message);
+		if (!text) continue;
+		result.push({
+			entryId: entry.id,
+			text,
+			role: message.role,
+			createdAtMs: entryCreatedAtMs(entry.timestamp, message.timestamp),
+		});
+	}
+	return result;
+}
+
 export function prepareNativePiFork(sourceManager: SessionManager, entryId: string): PreparedPiFork {
 	const selected = sourceManager.getEntry(entryId);
-	if (!selected || selected.type !== "message" || selected.message.role !== "user") {
-		throw new RuntimeProtocolError("INVALID_FORK_TARGET", "Fork entry must identify a user message");
-	}
-	const selectedText =
-		typeof selected.message.content === "string"
-			? selected.message.content
-			: selected.message.content
-					.filter((item): item is { type: "text"; text: string } => item.type === "text")
-					.map((item) => item.text)
-					.join("");
-	if (!selectedText) {
-		throw new RuntimeProtocolError("INVALID_FORK_TARGET", "Fork entry does not contain user text");
+	const candidate = publicPiForkCandidates(sourceManager).find((item) => item.entryId === entryId);
+	if (!selected || selected.type !== "message" || !candidate) {
+		throw new RuntimeProtocolError(
+			"INVALID_FORK_TARGET",
+			"Fork entry must identify a public user or assistant message",
+		);
 	}
 	const sourceFile = sourceManager.getSessionFile();
 	if (!sourceManager.isPersisted() || !sourceFile) {
 		throw new RuntimeProtocolError("SESSION_NOT_PERSISTED", "Conversation forks require a persisted source Session");
 	}
-	const targetLeafId = selected.parentId;
+	const targetLeafId = candidate.role === "assistant" ? selected.id : selected.parentId;
+	const selectedText = candidate.role === "user" ? candidate.text : "";
 	let sessionManager: SessionManager;
 	let sessionFile: string | undefined;
 	if (targetLeafId) {
@@ -156,23 +236,34 @@ export class PiProductSession implements PooledSession {
 		if (options.toolManifest !== undefined) registry.sync(options.toolManifest);
 		let productSession: PiProductSession | undefined;
 		const settingsManager = SettingsManager.create(options.cwd, options.agentDir, { projectTrusted: true });
-		const resourceLoader = new DefaultResourceLoader({
+		let resourceLoader: DefaultResourceLoader | undefined;
+		const getResourceLoader = (): DefaultResourceLoader => {
+			if (!resourceLoader) throw new Error("Product session resource loader is not ready");
+			return resourceLoader;
+		};
+		const backendBridge: BackendToolBridgeOptions = {
+			sessionId: options.externalSessionId,
+			registry,
+			gatewayUrl: options.toolGatewayUrl,
+			gatewayToken: options.toolGatewayToken,
+			waitForDecision: (kind, targetId, details, signal) => {
+				if (!productSession) throw new Error("Product session decision bridge is not ready");
+				return productSession.waitForDecision(kind, targetId, details, signal);
+			},
+		};
+		resourceLoader = new DefaultResourceLoader({
 			cwd: options.cwd,
 			agentDir: options.agentDir,
 			settingsManager,
 			additionalExtensionPaths: [options.activePluginDir],
 			additionalSkillPaths: options.skillPaths,
 			extensionFactories: [
-				createBackendToolExtension({
-					sessionId: options.externalSessionId,
+				createDiscoveryToolsExtension({
+					getResourceLoader,
 					registry,
-					gatewayUrl: options.toolGatewayUrl,
-					gatewayToken: options.toolGatewayToken,
-					waitForDecision: (kind, targetId, details, signal) => {
-						if (!productSession) throw new Error("Product session decision bridge is not ready");
-						return productSession.waitForDecision(kind, targetId, details, signal);
-					},
+					createBackendTool: (tool) => createBackendToolDefinition(backendBridge, tool),
 				}),
+				createBackendToolExtension(backendBridge),
 			],
 			noExtensions: true,
 			noContextFiles: options.noContextFiles ?? false,
@@ -315,6 +406,10 @@ export class PiProductSession implements PooledSession {
 			isCompacting: this.session.isCompacting,
 			activeTurn: this.activeTurn,
 			sequence: this.sequence,
+			toolCatalogRevision: this.toolRegistry.revision(),
+			toolSchemaRevision: backendToolSchemaRevision(this.toolRegistry.list()),
+			activeBackendTools: this.toolRegistry.active().map((tool) => tool.name),
+			skillCatalogRevision: runtimeSkillCatalogRevision(this.resourceLoader.getSkills().skills),
 			messages: this.session.messages,
 			entries: this.session.sessionManager.getEntries(),
 			leafId: this.session.sessionManager.getLeafId(),
@@ -324,16 +419,31 @@ export class PiProductSession implements PooledSession {
 	listTools(): Array<Record<string, unknown>> {
 		const active = new Set(this.session.getActiveToolNames());
 		const backend = new Map(this.toolRegistry.list().map((tool) => [tool.name, tool]));
-		return this.session.getAllTools().map((tool) => ({
+		const registered = this.session.getAllTools().map((tool) => ({
 			name: tool.name,
 			description: tool.description,
 			parameters: tool.parameters,
 			promptGuidelines: tool.promptGuidelines,
 			sourceInfo: tool.sourceInfo,
 			active: active.has(tool.name),
+			catalogOnly: false,
 			profile: backend.get(tool.name)?.profile,
 			risk: backend.get(tool.name)?.risk,
 		}));
+		const registeredNames = new Set(registered.map((tool) => tool.name));
+		const catalogOnly = this.toolRegistry
+			.list()
+			.filter((tool) => !registeredNames.has(tool.name))
+			.map((tool) => ({
+				name: tool.name,
+				description: tool.description,
+				parameters: tool.parameters,
+				active: false,
+				catalogOnly: true,
+				profile: tool.profile,
+				risk: tool.risk,
+			}));
+		return [...registered, ...catalogOnly].sort((left, right) => left.name.localeCompare(right.name));
 	}
 
 	listCommands(): Array<Record<string, unknown>> {
@@ -345,11 +455,11 @@ export class PiProductSession implements PooledSession {
 		}));
 	}
 
-	forkCandidates(): Array<{ entryId: string; text: string }> {
+	forkCandidates(): PublicPiForkCandidate[] {
 		if (!this.session.isIdle || this.activeTurn || this.pendingDecisions.size > 0) {
 			throw new RuntimeProtocolError("SESSION_BUSY", "Session must be idle before creating a fork");
 		}
-		return this.session.getUserMessagesForForking();
+		return publicPiForkCandidates(this.session.sessionManager);
 	}
 
 	prepareFork(entryId: string): PreparedPiFork {
@@ -371,12 +481,61 @@ export class PiProductSession implements PooledSession {
 		};
 	}
 
+	private registeredToolSchemas(): BackendToolManifest[] {
+		return this.session.getAllTools().map((tool) => ({
+			name: tool.name,
+			description: tool.description,
+			parameters: tool.parameters as Record<string, unknown>,
+		}));
+	}
+
+	private async appendCatalogChange(
+		kind: "skill_catalog_changed" | "tool_catalog_changed" | "runtime_catalog_changed",
+		details: Record<string, unknown>,
+	): Promise<void> {
+		const change = {
+			schemaVersion: "rag-ime.runtime-catalog-change.v1",
+			kind,
+			...details,
+		};
+		await this.session.sendCustomMessage({
+			customType: "rag-ime.runtime-catalog-change",
+			content: [
+				"<rag-ime-runtime-catalog-change>",
+				JSON.stringify(change),
+				"</rag-ime-runtime-catalog-change>",
+			].join("\n"),
+			display: false,
+			details: change,
+		});
+		this.notice({
+			type: "runtime_catalog_changed",
+			...change,
+		});
+	}
+
 	async syncTools(manifest: unknown): Promise<BackendToolManifest[]> {
 		if (!this.session.isIdle) {
 			throw new RuntimeProtocolError("SESSION_BUSY", "Tools can only be synchronized while the session is idle");
 		}
+		const before = this.toolRegistry.list();
+		const activeBefore = new Set(this.toolRegistry.active().map((tool) => tool.name));
 		const tools = this.toolRegistry.sync(manifest);
-		await this.session.reload();
+		const diff = diffBackendToolCatalog(before, tools);
+		if (diff.previousRevision === diff.revision) return tools;
+
+		const activeSchemaChanged =
+			diff.schemaChanged.some((name) => activeBefore.has(name)) ||
+			diff.removed.some((name) => activeBefore.has(name));
+		// Catalog-only changes remain discoverable through tool_search without
+		// rebuilding the active Provider tool prefix.
+		if (activeSchemaChanged) {
+			await this.session.reload();
+		}
+		await this.appendCatalogChange("tool_catalog_changed", {
+			...diff,
+			schemaReloaded: activeSchemaChanged,
+		});
 		return tools;
 	}
 
@@ -448,7 +607,21 @@ export class PiProductSession implements PooledSession {
 
 	async reloadPlugins(): Promise<void> {
 		if (!this.session.isIdle) return;
+		const skillsBefore = this.resourceLoader.getSkills().skills;
+		const toolsBefore = this.registeredToolSchemas();
 		await this.session.reload();
+		const skillDiff = diffSkillCatalog(skillsBefore, this.resourceLoader.getSkills().skills);
+		const toolDiff = diffBackendToolCatalog(toolsBefore, this.registeredToolSchemas());
+		if (
+			skillDiff.previousRevision !== skillDiff.revision ||
+			toolDiff.previousSchemaRevision !== toolDiff.schemaRevision
+		) {
+			await this.appendCatalogChange("runtime_catalog_changed", {
+				skills: skillDiff,
+				tools: toolDiff,
+				schemaReloaded: true,
+			});
+		}
 	}
 
 	dispose(): void {
