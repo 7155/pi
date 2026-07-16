@@ -4,7 +4,7 @@ import { join } from "node:path";
 import type { AssistantMessage } from "@earendil-works/pi-ai";
 import { SessionManager } from "@earendil-works/pi-coding-agent";
 import { describe, expect, it } from "vitest";
-import { prepareNativePiFork } from "../src/pi-session.ts";
+import { prepareNativePiFork, publicPiForkCandidates } from "../src/pi-session.ts";
 
 function assistant(text: string, timestamp: number): AssistantMessage {
 	return {
@@ -23,6 +23,18 @@ function assistant(text: string, timestamp: number): AssistantMessage {
 		},
 		stopReason: "stop",
 		timestamp,
+	};
+}
+
+function assistantWith(
+	content: AssistantMessage["content"],
+	timestamp: number,
+	options: Partial<AssistantMessage> = {},
+): AssistantMessage {
+	return {
+		...assistant("", timestamp),
+		content,
+		...options,
 	};
 }
 
@@ -53,14 +65,130 @@ describe("native Pi conversation fork", () => {
 		}
 	});
 
-	it("rejects a non-user anchor instead of copying the conversation", async () => {
+	it("creates an assistant branch at the response and leaves the composer empty", async () => {
 		const root = await mkdtemp(join(tmpdir(), "pi-runtime-host-fork-"));
 		try {
 			const source = SessionManager.create(root, root);
 			source.appendMessage({ role: "user", content: "question", timestamp: 1 });
 			const assistantId = source.appendMessage(assistant("answer", 2));
+			source.appendMessage({ role: "user", content: "later question", timestamp: 3 });
+			const sourceLeaf = source.appendMessage(assistant("later answer", 4));
+			const sourceFile = source.getSessionFile();
 
-			expect(() => prepareNativePiFork(source, assistantId)).toThrow("Fork entry must identify a user message");
+			const prepared = prepareNativePiFork(source, assistantId);
+
+			expect(prepared.selectedText).toBe("");
+			expect(prepared.branchAnchor).toBe(assistantId);
+			expect(prepared.sessionFile).not.toBe(sourceFile);
+			expect(prepared.sessionManager.buildSessionContext().messages.map((message) => message.role)).toEqual([
+				"user",
+				"assistant",
+			]);
+			expect(source.getLeafId()).toBe(sourceLeaf);
+			expect(source.getSessionFile()).toBe(sourceFile);
+		} finally {
+			await rm(root, { recursive: true, force: true });
+		}
+	});
+
+	it("returns every public user and assistant node without exposing tools or hidden RAG context", async () => {
+		const root = await mkdtemp(join(tmpdir(), "pi-runtime-host-fork-"));
+		try {
+			const source = SessionManager.create(root, root);
+			const userId = source.appendMessage({ role: "user", content: "plain question", timestamp: 10 });
+			const assistantId = source.appendMessage(assistant("plain answer", 20));
+			source.appendMessage(
+				assistantWith(
+					[
+						{ type: "text", text: "calling a tool" },
+						{ type: "toolCall", id: "tool-1", name: "memory", arguments: {} },
+					],
+					30,
+					{ stopReason: "toolUse" },
+				),
+			);
+			source.appendMessage({
+				role: "toolResult",
+				toolCallId: "tool-1",
+				toolName: "memory",
+				content: [{ type: "text", text: "private tool result" }],
+				isError: false,
+				timestamp: 40,
+			});
+			const failedId = source.appendMessage(
+				assistantWith([], 50, { stopReason: "error", errorMessage: '404 Model "missing" is unavailable' }),
+			);
+			const imageUserId = source.appendMessage({
+				role: "user",
+				content: [{ type: "image", data: "AA==", mimeType: "image/png" }],
+				timestamp: 60,
+			});
+			const imageAssistantId = source.appendMessage(
+				assistantWith(
+					[{ type: "image", data: "AA==", mimeType: "image/png" }] as unknown as AssistantMessage["content"],
+					70,
+				),
+			);
+			const wrappedUserId = source.appendMessage({
+				role: "user",
+				content:
+					"<rag-ime-deep-search-context>private evidence</rag-ime-deep-search-context>" +
+					"<rag-ime-user-query>public query</rag-ime-user-query>",
+				timestamp: 80,
+			});
+			source.appendMessage({
+				role: "user",
+				content: "<rag-ime-deep-search-context>private only</rag-ime-deep-search-context>",
+				timestamp: 90,
+			});
+			source.appendMessage(assistantWith([{ type: "thinking", thinking: "private reasoning" }], 100));
+
+			const candidates = publicPiForkCandidates(source);
+
+			expect(candidates).toEqual([
+				{ entryId: userId, text: "plain question", role: "user", createdAtMs: 10 },
+				{ entryId: assistantId, text: "plain answer", role: "assistant", createdAtMs: 20 },
+				{
+					entryId: failedId,
+					text: '404 Model "missing" is unavailable',
+					role: "assistant",
+					createdAtMs: 50,
+				},
+				{ entryId: imageUserId, text: "非文本消息", role: "user", createdAtMs: 60 },
+				{ entryId: imageAssistantId, text: "非文本消息", role: "assistant", createdAtMs: 70 },
+				{ entryId: wrappedUserId, text: "public query", role: "user", createdAtMs: 80 },
+			]);
+			expect(JSON.stringify(candidates)).not.toContain("private evidence");
+			expect(JSON.stringify(candidates)).not.toContain("private tool result");
+			expect(JSON.stringify(candidates)).not.toContain("private reasoning");
+		} finally {
+			await rm(root, { recursive: true, force: true });
+		}
+	});
+
+	it("rejects hidden tool-call assistant nodes as fork anchors", async () => {
+		const root = await mkdtemp(join(tmpdir(), "pi-runtime-host-fork-"));
+		try {
+			const source = SessionManager.create(root, root);
+			source.appendMessage({ role: "user", content: "question", timestamp: 1 });
+			const toolCallId = source.appendMessage(
+				assistantWith([{ type: "toolCall", id: "tool-1", name: "memory", arguments: {} }], 2, {
+					stopReason: "toolUse",
+				}),
+			);
+			source.appendMessage({
+				role: "toolResult",
+				toolCallId: "tool-1",
+				toolName: "memory",
+				content: [{ type: "text", text: "result" }],
+				isError: false,
+				timestamp: 3,
+			});
+			source.appendMessage(assistant("answer", 4));
+
+			expect(() => prepareNativePiFork(source, toolCallId)).toThrow(
+				"Fork entry must identify a public user or assistant message",
+			);
 		} finally {
 			await rm(root, { recursive: true, force: true });
 		}
