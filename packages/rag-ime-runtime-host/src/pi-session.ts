@@ -225,7 +225,12 @@ export class PiProductSession implements PooledSession {
 						provider: this.session.model.provider,
 						id: this.session.model.id,
 						name: this.session.model.name,
+						api: this.session.model.api,
+						reasoning: this.session.model.reasoning,
 						thinkingLevels: getSupportedThinkingLevels(this.session.model),
+						input: [...this.session.model.input],
+						contextWindow: this.session.model.contextWindow,
+						maxTokens: this.session.model.maxTokens,
 					}
 				: undefined,
 			thinkingLevel: this.session.thinkingLevel,
