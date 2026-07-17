@@ -3,8 +3,13 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { AssistantMessage } from "@earendil-works/pi-ai";
 import { SessionManager } from "@earendil-works/pi-coding-agent";
-import { describe, expect, it } from "vitest";
-import { prepareNativePiFork, publicPiForkCandidates, publicPiRewriteTarget } from "../src/pi-session.ts";
+import { describe, expect, it, vi } from "vitest";
+import {
+	PiProductSession,
+	prepareNativePiFork,
+	publicPiForkCandidates,
+	publicPiRewriteTarget,
+} from "../src/pi-session.ts";
 
 function assistant(text: string, timestamp: number): AssistantMessage {
 	return {
@@ -212,5 +217,66 @@ describe("native Pi conversation fork", () => {
 		} finally {
 			await rm(root, { recursive: true, force: true });
 		}
+	});
+});
+
+describe("active-turn message queue", () => {
+	it("queues steering and follow-up messages against the current product turn", async () => {
+		const steering: string[] = [];
+		const followUp: string[] = [];
+		const steer = vi.fn(async (message: string) => {
+			steering.push(message);
+		});
+		const queueFollowUp = vi.fn(async (message: string) => {
+			followUp.push(message);
+		});
+		const productSession = Object.create(PiProductSession.prototype) as PiProductSession;
+		Object.assign(productSession as unknown as Record<string, unknown>, {
+			activeTurn: { turnId: "turn-1", clientMessageId: "prompt-1" },
+			session: {
+				isIdle: false,
+				steer,
+				followUp: queueFollowUp,
+				getSteeringMessages: () => steering,
+				getFollowUpMessages: () => followUp,
+				steeringMode: "one-at-a-time",
+				followUpMode: "one-at-a-time",
+			},
+		});
+
+		await expect(
+			productSession.queueMessage({
+				delivery: "steer",
+				message: "change direction",
+				clientMessageId: "steer-1",
+			}),
+		).resolves.toMatchObject({
+			accepted: true,
+			queued: true,
+			delivery: "steer",
+			turnId: "turn-1",
+			clientMessageId: "steer-1",
+			messageQueue: { steering: ["change direction"], followUp: [] },
+		});
+		await expect(
+			productSession.queueMessage({ delivery: "followUp", message: "then summarize" }),
+		).resolves.toMatchObject({
+			delivery: "followUp",
+			messageQueue: { steering: ["change direction"], followUp: ["then summarize"] },
+		});
+		expect(steer).toHaveBeenCalledWith("change direction", undefined);
+		expect(queueFollowUp).toHaveBeenCalledWith("then summarize", undefined);
+	});
+
+	it("rejects queued messages when no turn is running", async () => {
+		const productSession = Object.create(PiProductSession.prototype) as PiProductSession;
+		Object.assign(productSession as unknown as Record<string, unknown>, {
+			activeTurn: undefined,
+			session: { isIdle: true },
+		});
+
+		await expect(productSession.queueMessage({ delivery: "steer", message: "too late" })).rejects.toMatchObject({
+			code: "SESSION_IDLE",
+		});
 	});
 });

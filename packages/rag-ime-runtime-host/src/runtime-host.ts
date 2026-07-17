@@ -190,6 +190,7 @@ export class RagImeRuntimeHost {
 						commandCatalog: true,
 						debugContext: true,
 						conversationRewrite: true,
+						activeTurnMessaging: true,
 					},
 				};
 			case "health":
@@ -315,6 +316,20 @@ export class RagImeRuntimeHost {
 				return this.session(params).rewind(requiredString(params, "entryId", 240));
 			case "session.prompt":
 				return this.session(params).prompt({
+					message: requiredString(params, "message", 1_000_000),
+					clientMessageId: optionalString(params, "clientMessageId", 128),
+					images: Array.isArray(params.images) ? (params.images as never) : undefined,
+				});
+			case "session.steer":
+				return this.session(params).queueMessage({
+					delivery: "steer",
+					message: requiredString(params, "message", 1_000_000),
+					clientMessageId: optionalString(params, "clientMessageId", 128),
+					images: Array.isArray(params.images) ? (params.images as never) : undefined,
+				});
+			case "session.follow_up":
+				return this.session(params).queueMessage({
+					delivery: "followUp",
 					message: requiredString(params, "message", 1_000_000),
 					clientMessageId: optionalString(params, "clientMessageId", 128),
 					images: Array.isArray(params.images) ? (params.images as never) : undefined,

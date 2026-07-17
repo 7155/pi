@@ -581,6 +581,7 @@ export class PiProductSession implements PooledSession {
 			isCompacting: this.session.isCompacting,
 			telemetry: this.telemetry(),
 			activeTurn: this.activeTurn,
+			messageQueue: this.messageQueue(),
 			sequence: this.sequence,
 			toolCatalogRevision: this.toolRegistry.revision(),
 			toolSchemaRevision: backendToolSchemaRevision(this.toolRegistry.list()),
@@ -784,6 +785,37 @@ export class PiProductSession implements PooledSession {
 					}
 				});
 		});
+	}
+
+	async queueMessage(options: {
+		delivery: "steer" | "followUp";
+		message: string;
+		clientMessageId?: string;
+		images?: PromptOptions["images"];
+	}): Promise<Record<string, unknown>> {
+		const turn = this.activeTurn;
+		if (!turn || this.session.isIdle) {
+			throw new RuntimeProtocolError("SESSION_IDLE", "Session has no active turn to receive a queued message");
+		}
+		if (options.delivery === "steer") await this.session.steer(options.message, options.images);
+		else await this.session.followUp(options.message, options.images);
+		return {
+			accepted: true,
+			queued: true,
+			delivery: options.delivery,
+			turnId: turn.turnId,
+			clientMessageId: options.clientMessageId,
+			messageQueue: this.messageQueue(),
+		};
+	}
+
+	private messageQueue(): Record<string, unknown> {
+		return {
+			steering: [...(this.session.getSteeringMessages?.() ?? [])],
+			followUp: [...(this.session.getFollowUpMessages?.() ?? [])],
+			steeringMode: this.session.steeringMode,
+			followUpMode: this.session.followUpMode,
+		};
 	}
 
 	async abort(): Promise<void> {

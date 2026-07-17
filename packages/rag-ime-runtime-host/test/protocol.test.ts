@@ -51,6 +51,22 @@ describe("runtime protocol", () => {
 				params: { sessionId: "source", entryId: "message-1" },
 			}),
 		).toMatchObject({ id: "request-6", method: "session.rewind" });
+		expect(
+			parseRuntimeRequest({
+				protocolVersion: PROTOCOL_VERSION,
+				id: "request-7",
+				method: "session.steer",
+				params: { sessionId: "source", message: "change direction" },
+			}),
+		).toMatchObject({ id: "request-7", method: "session.steer" });
+		expect(
+			parseRuntimeRequest({
+				protocolVersion: PROTOCOL_VERSION,
+				id: "request-8",
+				method: "session.follow_up",
+				params: { sessionId: "source", message: "continue afterwards" },
+			}),
+		).toMatchObject({ id: "request-8", method: "session.follow_up" });
 	});
 
 	it("rejects unknown or unversioned requests", () => {
