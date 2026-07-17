@@ -218,6 +218,7 @@ export class RagImeRuntimeHost {
 						managedSkills: true,
 						commandCatalog: true,
 						debugContext: true,
+						persistentDebugContext: Boolean(process.env.RAG_IME_PI_DEBUG_CONTEXT_DIR),
 						conversationRewrite: true,
 						activeTurnMessaging: true,
 						statelessCompletion: true,

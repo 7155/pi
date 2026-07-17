@@ -304,6 +304,10 @@ export class PiProductSession implements PooledSession {
 		const debugContextRecorder = new PiDebugContextRecorder(
 			options.externalSessionId,
 			() => productSession?.activeTurn,
+			{
+				directory: process.env.RAG_IME_PI_DEBUG_CONTEXT_DIR,
+				maxBytes: Number.parseInt(process.env.RAG_IME_PI_DEBUG_CONTEXT_MAX_BYTES ?? "", 10),
+			},
 		);
 		const settingsManager = SettingsManager.create(options.cwd, options.agentDir, { projectTrusted: true });
 		let resourceLoader: DefaultResourceLoader | undefined;
@@ -597,12 +601,14 @@ export class PiProductSession implements PooledSession {
 
 	debugContext(turnId?: string): Record<string, unknown> {
 		const context = this.debugContextRecorder.get(turnId);
+		const storage = this.debugContextRecorder.storage();
 		return {
 			schemaVersion: "rag-ime.pi-debug-context-response.v1",
 			sessionId: this.externalSessionId,
 			turnId: turnId ?? context?.turnId ?? "",
 			available: Boolean(context),
-			transient: true,
+			transient: !storage.persistent,
+			storage,
 			availableTurns: this.debugContextRecorder.list(),
 			context: context ?? null,
 			telemetry: this.telemetry(),

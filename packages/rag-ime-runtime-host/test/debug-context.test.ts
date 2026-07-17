@@ -1,3 +1,6 @@
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { describe, expect, it } from "vitest";
 import { PiDebugContextRecorder } from "../src/debug-context.ts";
 
@@ -157,5 +160,53 @@ describe("PiDebugContextRecorder", () => {
 		expect(recorder.get("turn-2")).toBeUndefined();
 		recorder.clear();
 		expect(recorder.get()).toBeUndefined();
+	});
+
+	it("persists recent snapshots and restores them without exceeding the configured cap", async () => {
+		const directory = mkdtempSync(join(tmpdir(), "pi-debug-context-"));
+		try {
+			const activeTurn = { turnId: "turn-persisted", clientMessageId: "client-persisted" };
+			const recorder = new PiDebugContextRecorder("session-persisted", () => activeTurn, {
+				directory,
+				maxBytes: 64 * 1024,
+			});
+			const handlers = new Map<string, DebugHandler>();
+			recorder.extension()({
+				on: (name: string, handler: DebugHandler) => handlers.set(name, handler),
+				getActiveTools: () => [],
+				getAllTools: () => [],
+			} as never);
+			handlers.get("before_agent_start")?.(
+				{
+					prompt: "persist me",
+					systemPrompt: "system",
+					systemPromptOptions: { cwd: "/workspace" },
+				},
+				{},
+			);
+			handlers.get("turn_start")?.({ turnIndex: 0, timestamp: Date.now() });
+			handlers.get("context")?.({ messages: [{ role: "user", content: "persist me" }] });
+			handlers.get("turn_end")?.({ turnIndex: 0, message: { role: "assistant" }, toolResults: [] });
+			recorder.clear();
+			await recorder.flush();
+
+			const storage = recorder.storage();
+			expect(storage).toMatchObject({ persistent: true, directory, maxBytes: 64 * 1024, fileCount: 1 });
+			expect(storage.usedBytes).toBeGreaterThan(0);
+			expect(storage.usedBytes).toBeLessThanOrEqual(64 * 1024);
+
+			const restored = new PiDebugContextRecorder("session-persisted", () => undefined, {
+				directory,
+				maxBytes: 64 * 1024,
+			});
+			await restored.flush();
+			expect(restored.get("turn-persisted")).toMatchObject({
+				turnId: "turn-persisted",
+				prompt: "persist me",
+			});
+			expect(restored.list()).toHaveLength(1);
+		} finally {
+			rmSync(directory, { recursive: true, force: true });
+		}
 	});
 });
