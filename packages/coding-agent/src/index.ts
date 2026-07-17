@@ -249,6 +249,7 @@ export {
 } from "./core/settings-manager.ts";
 // Skills
 export {
+	type FormatSkillsForPromptOptions,
 	formatSkillsForPrompt,
 	type LoadSkillsFromDirOptions,
 	type LoadSkillsResult,
@@ -256,6 +257,7 @@ export {
 	loadSkillsFromDir,
 	type Skill,
 	type SkillFrontmatter,
+	skillCatalogRevision,
 } from "./core/skills.ts";
 export { createSyntheticSourceInfo } from "./core/source-info.ts";
 export { type EditDiffResult, generateDiffString, generateUnifiedPatch } from "./core/tools/edit-diff.ts";

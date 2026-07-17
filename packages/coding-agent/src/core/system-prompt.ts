@@ -60,10 +60,18 @@ export function buildSystemPrompt(options: BuildSystemPromptOptions): string {
 			prompt += "</project_context>\n";
 		}
 
-		// Append skills section (only if read tool is available)
-		const customPromptHasRead = !selectedTools || selectedTools.includes("read");
-		if (customPromptHasRead && skills.length > 0) {
-			prompt += formatSkillsForPrompt(skills);
+		const customPromptSkillLoader = selectedTools?.includes("skill_load")
+			? "skill_load"
+			: !selectedTools || selectedTools.includes("read")
+				? "read"
+				: undefined;
+		if (customPromptSkillLoader && skills.length > 0) {
+			prompt += formatSkillsForPrompt(skills, {
+				loadToolName: customPromptSkillLoader,
+				searchToolName: selectedTools?.includes("skill_search") ? "skill_search" : undefined,
+				includeLocations: customPromptSkillLoader === "read",
+				includeRevision: customPromptSkillLoader !== "read",
+			});
 		}
 
 		prompt += `\nCurrent working directory: ${promptCwd}`;
@@ -151,9 +159,14 @@ Pi documentation (read only when the user asks about pi itself, its SDK, extensi
 		prompt += "</project_context>\n";
 	}
 
-	// Append skills section (only if read tool is available)
-	if (hasRead && skills.length > 0) {
-		prompt += formatSkillsForPrompt(skills);
+	const skillLoader = tools.includes("skill_load") ? "skill_load" : hasRead ? "read" : undefined;
+	if (skillLoader && skills.length > 0) {
+		prompt += formatSkillsForPrompt(skills, {
+			loadToolName: skillLoader,
+			searchToolName: tools.includes("skill_search") ? "skill_search" : undefined,
+			includeLocations: skillLoader === "read",
+			includeRevision: skillLoader !== "read",
+		});
 	}
 
 	prompt += `\nCurrent working directory: ${promptCwd}`;

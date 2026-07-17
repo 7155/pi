@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import { existsSync, readdirSync, readFileSync, statSync } from "fs";
 import ignore from "ignore";
 import { basename, dirname, join, relative, resolve, sep } from "path";
@@ -324,6 +325,32 @@ function loadSkillFromFile(
 	}
 }
 
+export interface FormatSkillsForPromptOptions {
+	/** Tool used to load a selected skill. Defaults to the built-in read tool. */
+	loadToolName?: string;
+	/** Optional catalog search tool shown in the discovery instructions. */
+	searchToolName?: string;
+	/** Include absolute skill locations. Defaults to true only for the read tool. */
+	includeLocations?: boolean;
+	/** Include a deterministic metadata revision on the catalog element. */
+	includeRevision?: boolean;
+}
+
+function visibleSkillsInStableOrder(skills: Skill[]): Skill[] {
+	return skills
+		.filter((skill) => !skill.disableModelInvocation)
+		.slice()
+		.sort((left, right) => left.name.localeCompare(right.name));
+}
+
+export function skillCatalogRevision(skills: Skill[]): string {
+	const catalog = visibleSkillsInStableOrder(skills).map((skill) => ({
+		name: skill.name,
+		description: skill.description,
+	}));
+	return createHash("sha256").update(JSON.stringify(catalog)).digest("hex");
+}
+
 /**
  * Format skills for inclusion in a system prompt.
  * Uses XML format per Agent Skills standard.
@@ -332,26 +359,42 @@ function loadSkillFromFile(
  * Skills with disableModelInvocation=true are excluded from the prompt
  * (they can only be invoked explicitly via /skill:name commands).
  */
-export function formatSkillsForPrompt(skills: Skill[]): string {
-	const visibleSkills = skills.filter((s) => !s.disableModelInvocation);
+export function formatSkillsForPrompt(skills: Skill[], options: FormatSkillsForPromptOptions = {}): string {
+	const visibleSkills = visibleSkillsInStableOrder(skills);
 
 	if (visibleSkills.length === 0) {
 		return "";
 	}
 
-	const lines = [
-		"\n\nThe following skills provide specialized instructions for specific tasks.",
-		"Use the read tool to load a skill's file when the task matches its description.",
-		"When a skill file references a relative path, resolve it against the skill directory (parent of SKILL.md / dirname of the path) and use that absolute path in tool commands.",
-		"",
-		"<available_skills>",
-	];
+	const loadToolName = options.loadToolName ?? "read";
+	const includeLocations = options.includeLocations ?? loadToolName === "read";
+	const catalogTag = options.includeRevision
+		? `<available_skills revision="sha256:${skillCatalogRevision(visibleSkills)}">`
+		: "<available_skills>";
+	const lines = ["\n\nThe following skills provide specialized instructions for specific tasks."];
+	if (options.searchToolName) {
+		lines.push(
+			`Use the ${options.searchToolName} tool when you need to find the best matching skill from this catalog.`,
+		);
+	}
+	if (loadToolName === "read") {
+		lines.push("Use the read tool to load a skill's file when the task matches its description.");
+		lines.push(
+			"When a skill file references a relative path, resolve it against the skill directory (parent of SKILL.md / dirname of the path) and use that absolute path in tool commands.",
+		);
+	} else {
+		lines.push(`Use the ${loadToolName} tool with the exact skill name before following that skill's instructions.`);
+		lines.push("Do not guess or reconstruct a skill body from its catalog description.");
+	}
+	lines.push("", catalogTag);
 
 	for (const skill of visibleSkills) {
 		lines.push("  <skill>");
 		lines.push(`    <name>${escapeXml(skill.name)}</name>`);
 		lines.push(`    <description>${escapeXml(skill.description)}</description>`);
-		lines.push(`    <location>${escapeXml(skill.filePath)}</location>`);
+		if (includeLocations) {
+			lines.push(`    <location>${escapeXml(skill.filePath)}</location>`);
+		}
 		lines.push("  </skill>");
 	}
 

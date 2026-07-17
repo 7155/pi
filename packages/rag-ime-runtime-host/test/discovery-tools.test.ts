@@ -125,23 +125,24 @@ describe("runtime discovery tools", () => {
 			getSkills: () => ({ skills, diagnostics: [] }),
 		} as unknown as ResourceLoader;
 		const registered = new Map<string, ToolDefinition>();
+		let activeTools: string[] = [];
 		const extension = createDiscoveryToolsExtension({
 			getResourceLoader: () => resourceLoader,
 			registry,
-			createBackendTool: (tool) => ({
-				name: tool.name,
-				label: tool.name,
-				description: tool.description,
-				parameters: tool.parameters as ToolDefinition["parameters"],
-				execute: async () => ({ content: [{ type: "text", text: "{}" }], details: {} }),
-			}),
 		});
 		if (typeof extension === "function") throw new Error("Expected a named inline extension");
 		await extension.factory({
 			registerTool(toolDefinition: ToolDefinition) {
 				registered.set(toolDefinition.name, toolDefinition);
 			},
+			getActiveTools() {
+				return activeTools;
+			},
+			setActiveTools(toolNames: string[]) {
+				activeTools = [...toolNames];
+			},
 		} as never);
+		activeTools = [...registered.keys()];
 
 		expect([...registered.keys()]).toEqual([
 			SKILL_SEARCH_TOOL_NAME,
@@ -179,11 +180,12 @@ describe("runtime discovery tools", () => {
 			undefined,
 			{} as never,
 		);
-		expect(registry.isActive("memory.query")).toBe(true);
-		expect(registered.has("memory.query")).toBe(true);
+		expect(registry.isDisclosed("memory.query")).toBe(true);
+		expect(activeTools).toContain("memory.query");
+		expect(registered.has("memory.query")).toBe(false);
 		expect(loadResult.details).toMatchObject({
-			active: true,
-			alreadyActive: false,
+			disclosed: true,
+			alreadyDisclosed: false,
 			tool: { name: "memory.query" },
 		});
 		expect(JSON.stringify(loadResult.content)).not.toContain('"parameters"');

@@ -90,7 +90,6 @@ export interface SkillCatalogDiff {
 export interface DiscoveryToolsOptions {
 	getResourceLoader(): ResourceLoader;
 	registry: BackendToolRegistry;
-	createBackendTool(tool: BackendToolManifest): ToolDefinition;
 	includeToolSearch?: boolean;
 }
 
@@ -330,17 +329,19 @@ export function createDiscoveryToolsExtension(options: DiscoveryToolsOptions): I
 					name: TOOL_LOAD_TOOL_NAME,
 					label: "Load tool",
 					description:
-						"Load and activate one exact product tool, returning its full parameter schema only when needed.",
-					promptSnippet: "Load one exact tool returned by tool_search before calling it",
+						"Disclose one exact product tool schema to the Provider only when its parameters are needed.",
+					promptSnippet: "Disclose one exact tool schema returned by tool_search before calling it",
 					parameters: TOOL_LOAD_PARAMETERS,
 					execute: async (_toolCallId, args) => {
 						const loaded = loadBackendTool(options.registry, args as { name?: unknown });
-						const alreadyActive = options.registry.isActive(loaded.tool.name);
-						options.registry.activate(loaded.tool.name);
-						pi.registerTool(options.createBackendTool(loaded.tool));
+						const alreadyDisclosed = options.registry.isDisclosed(loaded.tool.name);
+						options.registry.disclose(loaded.tool.name);
+						const activeTools = new Set(pi.getActiveTools());
+						activeTools.add(loaded.tool.name);
+						pi.setActiveTools([...activeTools]);
 						const nextCall = {
 							tool: loaded.tool.name,
-							instruction: `Call ${loaded.tool.name} directly with arguments from its newly active Provider schema.`,
+							instruction: `Call ${loaded.tool.name} directly with arguments from its newly disclosed Provider schema.`,
 						};
 						const providerResult = {
 							schemaVersion: "rag-ime.tool-load.v1",
@@ -352,14 +353,14 @@ export function createDiscoveryToolsExtension(options: DiscoveryToolsOptions): I
 								profile: loaded.tool.profile,
 								risk: loaded.tool.risk,
 							},
-							active: true,
-							alreadyActive,
+							disclosed: true,
+							alreadyDisclosed,
 							nextCall,
 						};
 						const details = {
 							...loaded.result,
-							active: true,
-							alreadyActive,
+							disclosed: true,
+							alreadyDisclosed,
 							nextCall,
 						};
 						return {

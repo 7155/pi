@@ -33,16 +33,22 @@ interface ToolGatewayResponse {
 	error?: string;
 }
 
+interface GatewayFetchResponse {
+	ok: boolean;
+	status: number;
+	json(): Promise<unknown>;
+}
+
 export class BackendToolRegistry {
 	private manifest: BackendToolManifest[] = [];
-	private activeNames = new Set<string>();
+	private disclosedNames = new Set<string>();
 
 	list(): BackendToolManifest[] {
 		return structuredClone(this.manifest);
 	}
 
-	active(): BackendToolManifest[] {
-		return this.manifest.filter((tool) => this.activeNames.has(tool.name)).map((tool) => structuredClone(tool));
+	disclosed(): BackendToolManifest[] {
+		return this.manifest.filter((tool) => this.disclosedNames.has(tool.name)).map((tool) => structuredClone(tool));
 	}
 
 	get(name: string): BackendToolManifest | undefined {
@@ -50,15 +56,15 @@ export class BackendToolRegistry {
 		return tool ? structuredClone(tool) : undefined;
 	}
 
-	activate(name: string): BackendToolManifest {
+	disclose(name: string): BackendToolManifest {
 		const tool = this.get(name);
 		if (!tool) throw new RuntimeProtocolError("TOOL_NOT_FOUND", `Unknown or unavailable product tool: ${name}`);
-		this.activeNames.add(name);
+		this.disclosedNames.add(name);
 		return tool;
 	}
 
-	isActive(name: string): boolean {
-		return this.activeNames.has(name);
+	isDisclosed(name: string): boolean {
+		return this.disclosedNames.has(name);
 	}
 
 	revision(): string {
@@ -121,7 +127,7 @@ export class BackendToolRegistry {
 				};
 			})
 			.sort((left, right) => left.name.localeCompare(right.name));
-		this.activeNames = new Set([...this.activeNames].filter((name) => names.has(name)));
+		this.disclosedNames = new Set([...this.disclosedNames].filter((name) => names.has(name)));
 		this.manifest = manifest;
 		return this.list();
 	}
@@ -224,12 +230,12 @@ async function gatewayRequest(
 	const base = options.gatewayUrl.endsWith(executeSuffix)
 		? options.gatewayUrl.slice(0, -executeSuffix.length)
 		: options.gatewayUrl.replace(/\/$/u, "");
-	const response = await fetch(path === "execute" ? options.gatewayUrl : `${base}/tool/${path}`, {
+	const response = (await fetch(path === "execute" ? options.gatewayUrl : `${base}/tool/${path}`, {
 		method: "POST",
 		headers,
 		body: JSON.stringify(body),
 		signal,
-	});
+	})) as GatewayFetchResponse;
 	const payload = (await response.json()) as ToolGatewayResponse;
 	if (!response.ok || !payload.ok) throw new Error(payload.error || `Tool gateway returned HTTP ${response.status}`);
 	return payload;
@@ -323,6 +329,7 @@ export function createBackendToolDefinition(
 		label: tool.name,
 		description: tool.description,
 		parameters: tool.parameters as ToolDefinition["parameters"],
+		executionMode: "parallel",
 		execute: async (toolCallId, args, signal) => executeGatewayTool(options, tool, toolCallId, args, signal),
 	};
 }
@@ -331,7 +338,9 @@ export function createBackendToolExtension(options: BackendToolBridgeOptions): I
 	return {
 		name: "rag-ime-backend-tools",
 		factory(pi) {
-			for (const tool of options.registry.active()) {
+			// Register the complete session-authorized catalog for execution lookup.
+			// Provider visibility is narrowed separately by AgentSession.active tools.
+			for (const tool of options.registry.list()) {
 				pi.registerTool(createBackendToolDefinition(options, tool));
 			}
 		},

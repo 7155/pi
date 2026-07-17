@@ -4,7 +4,7 @@ import { join } from "node:path";
 import type { AssistantMessage } from "@earendil-works/pi-ai";
 import { SessionManager } from "@earendil-works/pi-coding-agent";
 import { describe, expect, it } from "vitest";
-import { prepareNativePiFork, publicPiForkCandidates } from "../src/pi-session.ts";
+import { prepareNativePiFork, publicPiForkCandidates, publicPiRewriteTarget } from "../src/pi-session.ts";
 
 function assistant(text: string, timestamp: number): AssistantMessage {
 	return {
@@ -188,6 +188,26 @@ describe("native Pi conversation fork", () => {
 
 			expect(() => prepareNativePiFork(source, toolCallId)).toThrow(
 				"Fork entry must identify a public user or assistant message",
+			);
+		} finally {
+			await rm(root, { recursive: true, force: true });
+		}
+	});
+
+	it("only accepts public user entries as in-place rewrite targets", async () => {
+		const root = await mkdtemp(join(tmpdir(), "pi-runtime-host-rewrite-"));
+		try {
+			const source = SessionManager.create(root, root);
+			const userId = source.appendMessage({ role: "user", content: "edit me", timestamp: 1 });
+			const assistantId = source.appendMessage(assistant("answer", 2));
+
+			expect(publicPiRewriteTarget(source, userId)).toMatchObject({
+				entryId: userId,
+				role: "user",
+				text: "edit me",
+			});
+			expect(() => publicPiRewriteTarget(source, assistantId)).toThrow(
+				"Rewrite entry must identify a public user message",
 			);
 		} finally {
 			await rm(root, { recursive: true, force: true });

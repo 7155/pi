@@ -4,12 +4,13 @@ import {
 	EventStream,
 	type Message,
 	type Model,
+	type Tool,
 	type UserMessage,
 } from "@earendil-works/pi-ai";
 import { Type } from "typebox";
 import { describe, expect, it } from "vitest";
 import { agentLoop, agentLoopContinue } from "../src/agent-loop.ts";
-import type { AgentContext, AgentEvent, AgentLoopConfig, AgentMessage, AgentTool } from "../src/types.ts";
+import type { AgentContext, AgentEvent, AgentLoopConfig, AgentMessage, AgentTool, StreamFn } from "../src/types.ts";
 
 // Mock stream for testing - mimics MockAssistantStream
 class MockAssistantStream extends EventStream<AssistantMessageEvent, AssistantMessage> {
@@ -305,6 +306,57 @@ describe("agentLoop with AgentMessage", () => {
 		if (toolEnd?.type === "tool_execution_end") {
 			expect(toolEnd.isError).toBe(false);
 		}
+	});
+
+	it("executes an exact registered tool without disclosing its schema to the Provider", async () => {
+		const toolSchema = Type.Object({ value: Type.String() });
+		const executed: string[] = [];
+		const providerToolNames: string[][] = [];
+		const hiddenTool: AgentTool<typeof toolSchema, { value: string }> = {
+			name: "hidden_echo",
+			label: "Hidden echo",
+			description: "Execution-only test tool",
+			parameters: toolSchema,
+			async execute(_toolCallId, params) {
+				executed.push(params.value);
+				return {
+					content: [{ type: "text", text: params.value }],
+					details: { value: params.value },
+				};
+			},
+		};
+		const context: AgentContext = { systemPrompt: "", messages: [], tools: [] };
+		const config: AgentLoopConfig = {
+			model: createModel(),
+			convertToLlm: identityConverter,
+			resolveToolForExecution: (name) => (name === hiddenTool.name ? hiddenTool : undefined),
+		};
+		let callIndex = 0;
+		const streamFn: StreamFn = (_model, providerContext: { tools?: Tool[] }) => {
+			providerToolNames.push(providerContext.tools?.map((tool) => tool.name) ?? []);
+			const stream = new MockAssistantStream();
+			queueMicrotask(() => {
+				const reason = callIndex === 0 ? "toolUse" : "stop";
+				const message =
+					callIndex === 0
+						? createAssistantMessage(
+								[{ type: "toolCall", id: "hidden-1", name: hiddenTool.name, arguments: { value: "ok" } }],
+								"toolUse",
+							)
+						: createAssistantMessage([{ type: "text", text: "done" }]);
+				callIndex += 1;
+				stream.push({ type: "done", reason, message });
+			});
+			return stream;
+		};
+
+		const stream = agentLoop([createUserMessage("use the remembered tool")], context, config, undefined, streamFn);
+		for await (const _event of stream) {
+			// consume
+		}
+
+		expect(executed).toEqual(["ok"]);
+		expect(providerToolNames).toEqual([[], []]);
 	});
 
 	it("should not execute tool calls from a length-truncated assistant message", async () => {

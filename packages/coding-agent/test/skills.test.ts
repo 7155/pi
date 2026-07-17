@@ -265,6 +265,29 @@ describe("skills", () => {
 			expect(introText).toContain("Use the read tool to load a skill's file");
 		});
 
+		it("supports a controlled skill loader without exposing file locations", () => {
+			const skills: Skill[] = [
+				createTestSkill({
+					name: "test-skill",
+					description: "A test skill.",
+					filePath: "/path/to/skill/SKILL.md",
+					baseDir: "/path/to/skill",
+				}),
+			];
+
+			const result = formatSkillsForPrompt(skills, {
+				loadToolName: "skill_load",
+				searchToolName: "skill_search",
+				includeLocations: false,
+				includeRevision: true,
+			});
+
+			expect(result).toContain("Use the skill_search tool");
+			expect(result).toContain("Use the skill_load tool with the exact skill name");
+			expect(result).toContain('<available_skills revision="sha256:');
+			expect(result).not.toContain("<location>");
+		});
+
 		it("should escape XML special characters", () => {
 			const skills: Skill[] = [
 				createTestSkill({

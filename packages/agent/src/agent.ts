@@ -118,6 +118,8 @@ export interface AgentOptions {
 	transport?: Transport;
 	maxRetryDelayMs?: number;
 	toolExecution?: ToolExecutionMode;
+	/** Resolve an undisclosed tool for execution without adding its schema to Provider context. */
+	resolveToolForExecution?: (name: string) => AgentTool<any> | undefined;
 }
 
 class PendingMessageQueue {
@@ -206,6 +208,8 @@ export class Agent {
 	public maxRetryDelayMs?: number;
 	/** Tool execution strategy for assistant messages that contain multiple tool calls. */
 	public toolExecution: ToolExecutionMode;
+	/** Optional execution-only resolver for runtimes that separate capability from schema disclosure. */
+	public resolveToolForExecution?: (name: string) => AgentTool<any> | undefined;
 
 	constructor(options: AgentOptions = {}) {
 		this._state = createMutableAgentState(options.initialState);
@@ -226,6 +230,7 @@ export class Agent {
 		this.transport = options.transport ?? "auto";
 		this.maxRetryDelayMs = options.maxRetryDelayMs;
 		this.toolExecution = options.toolExecution ?? "parallel";
+		this.resolveToolForExecution = options.resolveToolForExecution;
 	}
 
 	/**
@@ -441,6 +446,7 @@ export class Agent {
 			thinkingBudgets: this.thinkingBudgets,
 			maxRetryDelayMs: this.maxRetryDelayMs,
 			toolExecution: this.toolExecution,
+			resolveToolForExecution: this.resolveToolForExecution,
 			beforeToolCall: this.beforeToolCall,
 			afterToolCall: this.afterToolCall,
 			prepareNextTurn:

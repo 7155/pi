@@ -188,6 +188,8 @@ export class RagImeRuntimeHost {
 						pluginDrafts: true,
 						managedSkills: true,
 						commandCatalog: true,
+						debugContext: true,
+						conversationRewrite: true,
 					},
 				};
 			case "health":
@@ -249,6 +251,8 @@ export class RagImeRuntimeHost {
 			}
 			case "session.snapshot":
 				return this.session(params).snapshot();
+			case "session.debug.context":
+				return this.session(params).debugContext(optionalString(params, "turnId", 240));
 			case "session.commands":
 				return { commands: this.session(params).listCommands() };
 			case "session.fork.candidates":
@@ -307,6 +311,8 @@ export class RagImeRuntimeHost {
 					throw error;
 				}
 			}
+			case "session.rewind":
+				return this.session(params).rewind(requiredString(params, "entryId", 240));
 			case "session.prompt":
 				return this.session(params).prompt({
 					message: requiredString(params, "message", 1_000_000),

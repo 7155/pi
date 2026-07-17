@@ -1,3 +1,4 @@
+export * from "./debug-context.ts";
 export * from "./discovery-tools.ts";
 export * from "./plugin-manager.ts";
 export * from "./protocol.ts";

@@ -1,9 +1,11 @@
 import { mkdir, mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import type { SessionManager } from "@earendil-works/pi-coding-agent";
 import { ModelRuntime } from "@earendil-works/pi-coding-agent";
 import { describe, expect, it, vi } from "vitest";
-import { PiProductSession } from "../src/pi-session.ts";
+import { PiProductSession, restoreBackendToolDisclosures } from "../src/pi-session.ts";
+import { BackendToolRegistry } from "../src/tool-bridge.ts";
 
 function manifest(risk: string, requireQuery = false) {
 	return [
@@ -22,6 +24,42 @@ function manifest(risk: string, requireQuery = false) {
 }
 
 describe("PiProductSession catalog updates", () => {
+	it("restores only schemas explicitly disclosed by tool_load", () => {
+		const registry = new BackendToolRegistry();
+		registry.sync([
+			...manifest("read"),
+			{
+				name: "settings.apply",
+				description: "Apply settings.",
+				parameters: { type: "object", properties: {} },
+			},
+		]);
+		const sessionManager = {
+			getBranch: () => [
+				{
+					type: "message",
+					message: { role: "toolResult", toolName: "memory.query", isError: false },
+				},
+				{
+					type: "message",
+					message: {
+						role: "toolResult",
+						toolName: "tool_load",
+						isError: false,
+						details: { tool: { name: "settings.apply" } },
+					},
+				},
+				{
+					type: "message",
+					message: { role: "toolResult", toolName: "unknown.tool", isError: false },
+				},
+			],
+		} as unknown as SessionManager;
+
+		expect(restoreBackendToolDisclosures(registry, sessionManager)).toEqual(["settings.apply"]);
+		expect(registry.disclosed().map((tool) => tool.name)).toEqual(["settings.apply"]);
+	});
+
 	it("keeps permission-only changes in the incremental suffix and reloads only real schema changes", async () => {
 		const root = await mkdtemp(join(tmpdir(), "pi-runtime-catalog-"));
 		const agentDir = join(root, "agent");
@@ -52,13 +90,18 @@ describe("PiProductSession catalog updates", () => {
 		});
 
 		try {
-			expect(productSession.snapshot()).toMatchObject({ activeBackendTools: [] });
+			expect(productSession.snapshot()).toMatchObject({
+				activeBackendTools: [],
+				disclosedBackendTools: [],
+			});
 			expect(productSession.listTools()).toEqual(
 				expect.arrayContaining([
 					expect.objectContaining({
 						name: "memory.query",
 						active: false,
-						catalogOnly: true,
+						disclosed: false,
+						routable: true,
+						catalogOnly: false,
 					}),
 					expect.objectContaining({
 						name: "tool_load",
@@ -68,8 +111,12 @@ describe("PiProductSession catalog updates", () => {
 				]),
 			);
 			const internal = productSession as unknown as {
-				session: { reload(): Promise<void> };
+				session: {
+					reload(): Promise<void>;
+					agent: { resolveToolForExecution?: (name: string) => unknown };
+				};
 			};
+			expect(internal.session.agent.resolveToolForExecution?.("memory.query")).toBeDefined();
 			const reload = vi.spyOn(internal.session, "reload").mockResolvedValue(undefined);
 
 			await productSession.syncTools(manifest("approval"));
@@ -95,7 +142,7 @@ describe("PiProductSession catalog updates", () => {
 				]),
 			);
 
-			productSession.toolRegistry.activate("memory.query");
+			productSession.toolRegistry.disclose("memory.query");
 			await productSession.syncTools(manifest("approval", true));
 
 			expect(reload).toHaveBeenCalledTimes(1);

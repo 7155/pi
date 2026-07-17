@@ -928,6 +928,18 @@ export class AgentSession {
 		this.agent.state.systemPrompt = this._systemPromptOverride ?? this._baseSystemPrompt;
 	}
 
+	/**
+	 * Opt in to execution lookup across the registered tool registry.
+	 *
+	 * Active tools still define the schemas sent to the Provider. This resolver
+	 * only lets a runtime execute an exact registered name that is already known
+	 * from a restored transcript or another trusted source. Registry allow/deny
+	 * filtering and downstream authorization remain authoritative.
+	 */
+	setRegisteredToolExecutionEnabled(enabled: boolean): void {
+		this.agent.resolveToolForExecution = enabled ? (name) => this._toolRegistry.get(name) : undefined;
+	}
+
 	/** Whether compaction or branch summarization is currently running */
 	get isCompacting(): boolean {
 		return (

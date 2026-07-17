@@ -1,4 +1,5 @@
 import { describe, expect, test } from "vitest";
+import { createSyntheticSourceInfo } from "../src/core/source-info.ts";
 import { buildSystemPrompt } from "../src/core/system-prompt.ts";
 
 describe("buildSystemPrompt", () => {
@@ -83,6 +84,34 @@ describe("buildSystemPrompt", () => {
 			});
 
 			expect(prompt).not.toContain("dynamic_tool");
+		});
+	});
+
+	describe("controlled skill discovery", () => {
+		test("includes a compact skill catalog for custom prompts when skill_load is active", () => {
+			const prompt = buildSystemPrompt({
+				customPrompt: "You are a personal assistant.",
+				selectedTools: ["skill_search", "skill_load"],
+				contextFiles: [],
+				skills: [
+					{
+						name: "memory-review",
+						description: "Review long-term memory.",
+						filePath: "/managed/memory-review/SKILL.md",
+						baseDir: "/managed/memory-review",
+						sourceInfo: createSyntheticSourceInfo("/managed/memory-review/SKILL.md", {
+							source: "test",
+						}),
+						disableModelInvocation: false,
+					},
+				],
+				cwd: process.cwd(),
+			});
+
+			expect(prompt).toContain("<name>memory-review</name>");
+			expect(prompt).toContain("Use the skill_load tool with the exact skill name");
+			expect(prompt).not.toContain("/managed/memory-review/SKILL.md");
+			expect(prompt).not.toContain("You are an expert coding assistant");
 		});
 	});
 

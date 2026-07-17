@@ -1,9 +1,11 @@
+import type { ToolDefinition } from "@earendil-works/pi-coding-agent";
 import { describe, expect, it, vi } from "vitest";
 import {
 	BackendToolRegistry,
 	backendToolCatalogRevision,
 	backendToolSchemaRevision,
 	createBackendToolDefinition,
+	createBackendToolExtension,
 	diffBackendToolCatalog,
 } from "../src/tool-bridge.ts";
 
@@ -102,15 +104,31 @@ describe("BackendToolRegistry", () => {
 
 		const registry = new BackendToolRegistry();
 		registry.sync(before);
-		expect(registry.active()).toEqual([]);
-		expect(registry.activate("memory.query").name).toBe("memory.query");
-		expect(registry.active().map((item) => item.name)).toEqual(["memory.query"]);
+		expect(registry.disclosed()).toEqual([]);
+		expect(registry.disclose("memory.query").name).toBe("memory.query");
+		expect(registry.disclosed().map((item) => item.name)).toEqual(["memory.query"]);
 		registry.sync(after);
-		expect(registry.active()).toEqual([]);
+		expect(registry.disclosed()).toEqual([]);
 
 		for (const name of ["skill_load", "tool_load"]) {
 			expect(() => registry.sync([tool({ name })])).toThrow("Tool name is reserved by the runtime host");
 		}
+	});
+
+	it("registers the authorized catalog without disclosing every schema", async () => {
+		const registry = new BackendToolRegistry();
+		registry.sync([tool({ name: "memory.query" }), tool({ name: "planning.update" })]);
+		const registered: string[] = [];
+		const extension = createBackendToolExtension({ sessionId: "session-1", registry });
+		if (typeof extension === "function") throw new Error("Expected a named inline extension");
+		await extension.factory({
+			registerTool(definition: ToolDefinition) {
+				registered.push(definition.name);
+			},
+		} as never);
+
+		expect(registered.sort()).toEqual(["memory.query", "planning.update"]);
+		expect(registry.disclosed()).toEqual([]);
 	});
 
 	it("keeps the native approval bridge on a dynamically loaded tool", async () => {
@@ -153,6 +171,7 @@ describe("BackendToolRegistry", () => {
 				},
 				tool({ name: "settings.apply" }),
 			);
+			expect(definition.executionMode).toBe("parallel");
 
 			const result = await definition.execute(
 				"call-1",

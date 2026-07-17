@@ -141,6 +141,16 @@ export interface AgentLoopConfig extends SimpleStreamOptions {
 	model: Model<any>;
 
 	/**
+	 * Optional execution-only lookup for a tool that was not disclosed in the
+	 * current Provider tool list.
+	 *
+	 * This does not add the resolved tool to `AgentContext.tools`, so its schema
+	 * remains absent from subsequent Provider requests. Runtimes must opt in and
+	 * keep authorization checks outside this context-budget mechanism.
+	 */
+	resolveToolForExecution?: (name: string) => AgentTool<any> | undefined;
+
+	/**
 	 * Converts AgentMessage[] to LLM-compatible Message[] before each LLM call.
 	 *
 	 * Each AgentMessage must be converted to a UserMessage, AssistantMessage, or ToolResultMessage

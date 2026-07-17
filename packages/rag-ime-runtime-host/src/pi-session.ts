@@ -12,15 +12,16 @@ import {
 	SessionManager,
 	SettingsManager,
 } from "@earendil-works/pi-coding-agent";
+import { PiDebugContextRecorder } from "./debug-context.ts";
 import { createDiscoveryToolsExtension, diffSkillCatalog, runtimeSkillCatalogRevision } from "./discovery-tools.ts";
 import { PROTOCOL_VERSION, type RuntimeEventEnvelope, RuntimeProtocolError } from "./protocol.ts";
+import { TOOL_LOAD_TOOL_NAME } from "./runtime-tool-names.ts";
 import type { PooledSession } from "./session-pool.ts";
 import {
 	type BackendToolBridgeOptions,
 	type BackendToolManifest,
 	BackendToolRegistry,
 	backendToolSchemaRevision,
-	createBackendToolDefinition,
 	createBackendToolExtension,
 	diffBackendToolCatalog,
 } from "./tool-bridge.ts";
@@ -121,6 +122,39 @@ function entryCreatedAtMs(entryTimestamp: string, messageTimestamp: unknown): nu
 	return Number.isFinite(parsed) ? parsed : 0;
 }
 
+function objectRecord(value: unknown): Record<string, unknown> | undefined {
+	return typeof value === "object" && value !== null && !Array.isArray(value)
+		? (value as Record<string, unknown>)
+		: undefined;
+}
+
+/** Restore only schemas explicitly disclosed by tool_load on the active branch. */
+export function restoreBackendToolDisclosures(registry: BackendToolRegistry, sessionManager: SessionManager): string[] {
+	const restored = new Set<string>();
+	for (const entry of sessionManager.getBranch()) {
+		if (entry.type !== "message") continue;
+		const message = objectRecord(entry.message);
+		if (message?.role !== "toolResult" || message.isError === true) continue;
+		if (message.toolName !== TOOL_LOAD_TOOL_NAME) continue;
+
+		const details = objectRecord(message.details);
+		const loadedTool = objectRecord(details?.tool);
+		const loadedName = typeof loadedTool?.name === "string" ? loadedTool.name : "";
+		if (registry.get(loadedName)) restored.add(loadedName);
+	}
+	for (const name of restored) registry.disclose(name);
+	return [...restored].sort();
+}
+
+function applyBackendToolDisclosure(session: AgentSession, registry: BackendToolRegistry): string[] {
+	const backendNames = new Set(registry.list().map((tool) => tool.name));
+	const visibleNames = session.getActiveToolNames().filter((name) => !backendNames.has(name));
+	visibleNames.push(...registry.disclosed().map((tool) => tool.name));
+	const uniqueNames = [...new Set(visibleNames)];
+	session.setActiveToolsByName(uniqueNames);
+	return uniqueNames;
+}
+
 export function publicPiForkCandidates(sourceManager: SessionManager): PublicPiForkCandidate[] {
 	const result: PublicPiForkCandidate[] = [];
 	for (const entry of sourceManager.getEntries()) {
@@ -176,9 +210,28 @@ export function prepareNativePiFork(sourceManager: SessionManager, entryId: stri
 	};
 }
 
+export function publicPiRewriteTarget(sourceManager: SessionManager, entryId: string): PublicPiForkCandidate {
+	const selected = sourceManager.getEntry(entryId);
+	const candidate = publicPiForkCandidates(sourceManager).find((item) => item.entryId === entryId);
+	if (!selected || selected.type !== "message" || candidate?.role !== "user") {
+		throw new RuntimeProtocolError("INVALID_REWRITE_TARGET", "Rewrite entry must identify a public user message");
+	}
+	return candidate;
+}
+
 export interface ActiveTurn {
 	turnId: string;
 	clientMessageId?: string;
+}
+
+interface PublicCompactionState {
+	reason: "manual" | "threshold" | "overflow";
+	status: "running" | "completed" | "failed" | "aborted";
+	tokensBefore?: number;
+	estimatedTokensAfter?: number;
+	willRetry?: boolean;
+	error?: string;
+	updatedAtMs: number;
 }
 
 function toSerializableEvent(event: AgentSessionEvent): Record<string, unknown> {
@@ -206,10 +259,13 @@ export class PiProductSession implements PooledSession {
 	readonly noContextFiles: boolean;
 	private readonly session: AgentSession;
 	private readonly resourceLoader: DefaultResourceLoader;
+	private readonly settingsManager: SettingsManager;
+	private readonly debugContextRecorder: PiDebugContextRecorder;
 	private readonly emitEvent: (event: RuntimeEventEnvelope) => void;
 	private unsubscribe: (() => void) | undefined;
 	private sequence = 0;
 	private activeTurn: ActiveTurn | undefined;
+	private latestCompaction: PublicCompactionState | undefined;
 	private readonly pendingDecisions = new Map<
 		string,
 		{ requestId: string; resolve(value: boolean): void; cleanup(): void }
@@ -220,6 +276,8 @@ export class PiProductSession implements PooledSession {
 		session: AgentSession,
 		registry: BackendToolRegistry,
 		resourceLoader: DefaultResourceLoader,
+		settingsManager: SettingsManager,
+		debugContextRecorder: PiDebugContextRecorder,
 	) {
 		this.externalSessionId = options.externalSessionId;
 		this.cwd = options.cwd;
@@ -227,6 +285,8 @@ export class PiProductSession implements PooledSession {
 		this.session = session;
 		this.toolRegistry = registry;
 		this.resourceLoader = resourceLoader;
+		this.settingsManager = settingsManager;
+		this.debugContextRecorder = debugContextRecorder;
 		this.emitEvent = options.emitEvent;
 		this.unsubscribe = session.subscribe((event) => this.onSessionEvent(event));
 	}
@@ -234,7 +294,17 @@ export class PiProductSession implements PooledSession {
 	static async create(options: PiSessionOpenOptions): Promise<PiProductSession> {
 		const registry = new BackendToolRegistry();
 		if (options.toolManifest !== undefined) registry.sync(options.toolManifest);
+		const sessionManager =
+			options.sessionManager ??
+			(options.sessionFile
+				? SessionManager.open(options.sessionFile, options.sessionDir, options.cwd)
+				: SessionManager.create(options.cwd, options.sessionDir));
+		restoreBackendToolDisclosures(registry, sessionManager);
 		let productSession: PiProductSession | undefined;
+		const debugContextRecorder = new PiDebugContextRecorder(
+			options.externalSessionId,
+			() => productSession?.activeTurn,
+		);
 		const settingsManager = SettingsManager.create(options.cwd, options.agentDir, { projectTrusted: true });
 		let resourceLoader: DefaultResourceLoader | undefined;
 		const getResourceLoader = (): DefaultResourceLoader => {
@@ -261,20 +331,15 @@ export class PiProductSession implements PooledSession {
 				createDiscoveryToolsExtension({
 					getResourceLoader,
 					registry,
-					createBackendTool: (tool) => createBackendToolDefinition(backendBridge, tool),
 				}),
 				createBackendToolExtension(backendBridge),
+				{ name: "rag-ime-debug-context", factory: debugContextRecorder.extension() },
 			],
 			noExtensions: true,
 			noContextFiles: options.noContextFiles ?? false,
 			systemPrompt: options.systemPrompt,
 		});
 		await resourceLoader.reload();
-		const sessionManager =
-			options.sessionManager ??
-			(options.sessionFile
-				? SessionManager.open(options.sessionFile, options.sessionDir, options.cwd)
-				: SessionManager.create(options.cwd, options.sessionDir));
 		let model: Model<Api> | undefined;
 		if (options.provider || options.modelId) {
 			if (!options.provider || !options.modelId) {
@@ -299,7 +364,18 @@ export class PiProductSession implements PooledSession {
 			resourceLoader,
 			sessionManager,
 		});
-		productSession = new PiProductSession(options, created.session, registry, resourceLoader);
+		// The manifest is already filtered by the Session permission policy. Keep
+		// every authorized tool routable while Provider schemas stay progressive.
+		created.session.setRegisteredToolExecutionEnabled(true);
+		applyBackendToolDisclosure(created.session, registry);
+		productSession = new PiProductSession(
+			options,
+			created.session,
+			registry,
+			resourceLoader,
+			settingsManager,
+			debugContextRecorder,
+		);
 		await created.session.bindExtensions({
 			mode: "rpc",
 			onError: (error) => {
@@ -371,6 +447,27 @@ export class PiProductSession implements PooledSession {
 
 	private onSessionEvent(event: AgentSessionEvent): void {
 		const turn = this.activeTurn;
+		const pendingAssistant =
+			event.type === "message_end" && event.message.role === "assistant"
+				? (event.message as unknown as Record<string, unknown>)
+				: undefined;
+		if (event.type === "compaction_start") {
+			this.latestCompaction = {
+				reason: event.reason,
+				status: "running",
+				updatedAtMs: Date.now(),
+			};
+		} else if (event.type === "compaction_end") {
+			this.latestCompaction = {
+				reason: event.reason,
+				status: event.aborted ? "aborted" : event.errorMessage ? "failed" : "completed",
+				tokensBefore: event.result?.tokensBefore,
+				estimatedTokensAfter: event.result?.estimatedTokensAfter,
+				willRetry: event.willRetry,
+				error: event.errorMessage,
+				updatedAtMs: Date.now(),
+			};
+		}
 		this.emitEvent({
 			protocolVersion: PROTOCOL_VERSION,
 			event: "agent.event",
@@ -378,9 +475,87 @@ export class PiProductSession implements PooledSession {
 			turnId: turn?.turnId,
 			clientMessageId: turn?.clientMessageId,
 			sequence: ++this.sequence,
-			payload: toSerializableEvent(event),
+			payload: {
+				...toSerializableEvent(event),
+				telemetry: this.telemetry(
+					event.type === "compaction_start" ? true : event.type === "compaction_end" ? false : undefined,
+					pendingAssistant,
+				),
+			},
 		});
 		if (event.type === "agent_settled") this.activeTurn = undefined;
+	}
+
+	private telemetry(
+		compactionOverride?: boolean,
+		pendingAssistant?: Record<string, unknown>,
+	): Record<string, unknown> {
+		const stats = this.session.getSessionStats();
+		const context = this.session.getContextUsage();
+		const settings = this.settingsManager.getCompactionSettings();
+		const contextWindow = context?.contextWindow ?? this.session.model?.contextWindow ?? 0;
+		const tokens = context?.tokens ?? null;
+		const compactAtTokens = Math.max(0, contextWindow - settings.reserveTokens);
+		const latestAssistant = (pendingAssistant ??
+			[...this.session.messages].reverse().find((message) => message.role === "assistant")) as
+			| {
+					usage?: {
+						input?: number;
+						output?: number;
+						cacheRead?: number;
+						cacheWrite?: number;
+						totalTokens?: number;
+					};
+			  }
+			| undefined;
+		const latestUsage = latestAssistant?.usage ?? {};
+		const latestInput = Math.max(0, Number(latestUsage.input) || 0);
+		const latestOutput = Math.max(0, Number(latestUsage.output) || 0);
+		const latestCacheRead = Math.max(0, Number(latestUsage.cacheRead) || 0);
+		const latestCacheWrite = Math.max(0, Number(latestUsage.cacheWrite) || 0);
+		const latestPromptTokens = latestInput + latestCacheRead + latestCacheWrite;
+		const pendingUsage = pendingAssistant ? latestUsage : undefined;
+		const cumulativeInput = stats.tokens.input + (Number(pendingUsage?.input) || 0);
+		const cumulativeOutput = stats.tokens.output + (Number(pendingUsage?.output) || 0);
+		const cumulativeCacheRead = stats.tokens.cacheRead + (Number(pendingUsage?.cacheRead) || 0);
+		const cumulativeCacheWrite = stats.tokens.cacheWrite + (Number(pendingUsage?.cacheWrite) || 0);
+		const entries = this.session.sessionManager.getEntries();
+		return {
+			schemaVersion: "rag-ime.agent-session-telemetry.v1",
+			model: this.session.model ? publicSessionModel(this.session.model) : undefined,
+			context: {
+				tokens,
+				contextWindow,
+				percent: context?.percent ?? null,
+				remainingTokens: tokens === null ? null : Math.max(0, contextWindow - tokens),
+				compactAtTokens,
+				tokensUntilCompact: tokens === null ? null : Math.max(0, compactAtTokens - tokens),
+				reserveTokens: settings.reserveTokens,
+				keepRecentTokens: settings.keepRecentTokens,
+				autoCompactEnabled: settings.enabled,
+			},
+			cumulativeUsage: {
+				input: cumulativeInput,
+				output: cumulativeOutput,
+				cacheRead: cumulativeCacheRead,
+				cacheWrite: cumulativeCacheWrite,
+				totalTokens: cumulativeInput + cumulativeOutput + cumulativeCacheRead + cumulativeCacheWrite,
+			},
+			latestUsage: {
+				input: latestInput,
+				output: latestOutput,
+				cacheRead: latestCacheRead,
+				cacheWrite: latestCacheWrite,
+				totalTokens:
+					Math.max(0, Number(latestUsage.totalTokens) || 0) ||
+					latestInput + latestOutput + latestCacheRead + latestCacheWrite,
+			},
+			latestCacheHitPercent: latestPromptTokens > 0 ? (latestCacheRead / latestPromptTokens) * 100 : null,
+			isCompacting: compactionOverride ?? this.session.isCompacting,
+			compactionCount: entries.filter((entry) => entry.type === "compaction").length,
+			latestCompaction: this.latestCompaction,
+			updatedAtMs: Date.now(),
+		};
 	}
 
 	private notice(payload: Record<string, unknown>): void {
@@ -404,15 +579,48 @@ export class PiProductSession implements PooledSession {
 			thinkingLevel: this.session.thinkingLevel,
 			isIdle: this.session.isIdle,
 			isCompacting: this.session.isCompacting,
+			telemetry: this.telemetry(),
 			activeTurn: this.activeTurn,
 			sequence: this.sequence,
 			toolCatalogRevision: this.toolRegistry.revision(),
 			toolSchemaRevision: backendToolSchemaRevision(this.toolRegistry.list()),
-			activeBackendTools: this.toolRegistry.active().map((tool) => tool.name),
+			disclosedBackendTools: this.toolRegistry.disclosed().map((tool) => tool.name),
+			// Compatibility field for older control-center clients.
+			activeBackendTools: this.toolRegistry.disclosed().map((tool) => tool.name),
 			skillCatalogRevision: runtimeSkillCatalogRevision(this.resourceLoader.getSkills().skills),
 			messages: this.session.messages,
 			entries: this.session.sessionManager.getEntries(),
 			leafId: this.session.sessionManager.getLeafId(),
+		};
+	}
+
+	debugContext(turnId?: string): Record<string, unknown> {
+		const context = this.debugContextRecorder.get(turnId);
+		return {
+			schemaVersion: "rag-ime.pi-debug-context-response.v1",
+			sessionId: this.externalSessionId,
+			turnId: turnId ?? context?.turnId ?? "",
+			available: Boolean(context),
+			transient: true,
+			context: context ?? null,
+			telemetry: this.telemetry(),
+		};
+	}
+
+	async rewind(entryId: string): Promise<Record<string, unknown>> {
+		if (!this.session.isIdle || this.activeTurn) {
+			throw new RuntimeProtocolError("SESSION_BUSY", "Session must be idle before rewriting history");
+		}
+		const target = publicPiRewriteTarget(this.session.sessionManager, entryId);
+		const result = await this.session.navigateTree(entryId, { summarize: false });
+		if (result.cancelled) {
+			throw new RuntimeProtocolError("REWRITE_CANCELLED", "Conversation rewrite was cancelled");
+		}
+		return {
+			entryId,
+			editorText: result.editorText ?? target.text,
+			leafId: this.session.sessionManager.getLeafId() ?? "",
+			snapshot: this.snapshot(),
 		};
 	}
 
@@ -426,6 +634,8 @@ export class PiProductSession implements PooledSession {
 			promptGuidelines: tool.promptGuidelines,
 			sourceInfo: tool.sourceInfo,
 			active: active.has(tool.name),
+			disclosed: active.has(tool.name),
+			routable: true,
 			catalogOnly: false,
 			profile: backend.get(tool.name)?.profile,
 			risk: backend.get(tool.name)?.risk,
@@ -519,22 +729,26 @@ export class PiProductSession implements PooledSession {
 			throw new RuntimeProtocolError("SESSION_BUSY", "Tools can only be synchronized while the session is idle");
 		}
 		const before = this.toolRegistry.list();
-		const activeBefore = new Set(this.toolRegistry.active().map((tool) => tool.name));
+		const disclosedBefore = new Set(this.toolRegistry.disclosed().map((tool) => tool.name));
 		const tools = this.toolRegistry.sync(manifest);
 		const diff = diffBackendToolCatalog(before, tools);
 		if (diff.previousRevision === diff.revision) return tools;
 
-		const activeSchemaChanged =
-			diff.schemaChanged.some((name) => activeBefore.has(name)) ||
-			diff.removed.some((name) => activeBefore.has(name));
-		// Catalog-only changes remain discoverable through tool_search without
-		// rebuilding the active Provider tool prefix.
-		if (activeSchemaChanged) {
+		const providerSchemaChanged =
+			diff.schemaChanged.some((name) => disclosedBefore.has(name)) ||
+			diff.removed.some((name) => disclosedBefore.has(name));
+		const registryReloaded = diff.added.length > 0 || diff.removed.length > 0 || diff.schemaChanged.length > 0;
+		// Catalog shape changes must refresh execution lookup, but the Provider
+		// still sees only the explicitly disclosed subset after the reload.
+		if (registryReloaded) {
 			await this.session.reload();
+			applyBackendToolDisclosure(this.session, this.toolRegistry);
 		}
 		await this.appendCatalogChange("tool_catalog_changed", {
 			...diff,
-			schemaReloaded: activeSchemaChanged,
+			registryReloaded,
+			providerSchemaChanged,
+			schemaReloaded: providerSchemaChanged,
 		});
 		return tools;
 	}
@@ -610,6 +824,7 @@ export class PiProductSession implements PooledSession {
 		const skillsBefore = this.resourceLoader.getSkills().skills;
 		const toolsBefore = this.registeredToolSchemas();
 		await this.session.reload();
+		applyBackendToolDisclosure(this.session, this.toolRegistry);
 		const skillDiff = diffSkillCatalog(skillsBefore, this.resourceLoader.getSkills().skills);
 		const toolDiff = diffBackendToolCatalog(toolsBefore, this.registeredToolSchemas());
 		if (
@@ -632,6 +847,7 @@ export class PiProductSession implements PooledSession {
 		this.pendingDecisions.clear();
 		this.unsubscribe?.();
 		this.unsubscribe = undefined;
+		this.debugContextRecorder.clear();
 		this.session.dispose();
 	}
 }

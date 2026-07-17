@@ -606,7 +606,8 @@ async function prepareToolCall(
 	config: AgentLoopConfig,
 	signal: AbortSignal | undefined,
 ): Promise<PreparedToolCall | ImmediateToolCallOutcome> {
-	const tool = currentContext.tools?.find((t) => t.name === toolCall.name);
+	const tool =
+		currentContext.tools?.find((t) => t.name === toolCall.name) ?? config.resolveToolForExecution?.(toolCall.name);
 	if (!tool) {
 		return {
 			kind: "immediate",
