@@ -3,7 +3,13 @@ import { mkdir, realpath, rm, stat } from "node:fs/promises";
 import { homedir } from "node:os";
 import { delimiter, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
-import { type Api, getSupportedThinkingLevels, type Model, type ModelThinkingLevel } from "@earendil-works/pi-ai";
+import {
+	type Api,
+	type Context,
+	getSupportedThinkingLevels,
+	type Model,
+	type ModelThinkingLevel,
+} from "@earendil-works/pi-ai";
 import { ModelRuntime } from "@earendil-works/pi-coding-agent";
 import { PiProductSession } from "./pi-session.ts";
 import { ManagedPluginManager } from "./plugin-manager.ts";
@@ -18,7 +24,9 @@ import { BoundedSessionPool } from "./session-pool.ts";
 
 const HOST_VERSION = "1.0.0";
 const SESSION_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,199}$/;
+const COMPLETION_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,199}$/;
 const THINKING_LEVELS = new Set<ModelThinkingLevel>(["off", "minimal", "low", "medium", "high", "xhigh", "max"]);
+const STATELESS_THINKING_LEVELS = new Set<ModelThinkingLevel>(["off", "low"]);
 
 export interface RuntimeHostOptions {
 	agentDir: string;
@@ -73,6 +81,23 @@ function requiredSessionId(params: Record<string, unknown>): string {
 	return sessionIdParam(params, "sessionId");
 }
 
+function completionIdParam(params: Record<string, unknown>): string {
+	const requestId = requiredString(params, "requestId", 200);
+	if (!COMPLETION_ID_PATTERN.test(requestId)) {
+		throw new RuntimeProtocolError("INVALID_PARAMS", "requestId contains unsupported characters");
+	}
+	return requestId;
+}
+
+function optionalTimeoutMs(params: Record<string, unknown>): number {
+	const value = params.timeoutMs;
+	if (value === undefined || value === null) return 120_000;
+	if (typeof value !== "number" || !Number.isInteger(value) || value < 1_000 || value > 300_000) {
+		throw new RuntimeProtocolError("INVALID_PARAMS", "timeoutMs must be an integer between 1000 and 300000");
+	}
+	return value;
+}
+
 function isInside(root: string, candidate: string): boolean {
 	const child = relative(root, candidate);
 	return child === "" || (!child.startsWith(`..${sep}`) && child !== ".." && !isAbsolute(child));
@@ -98,6 +123,7 @@ export class RagImeRuntimeHost {
 	readonly plugins: ManagedPluginManager;
 	private readonly options: RuntimeHostOptions;
 	private readonly allowedWorkspaceRoots: string[];
+	private readonly completions = new Map<string, AbortController>();
 
 	private constructor(options: RuntimeHostOptions, modelRuntime: ModelRuntime) {
 		this.options = options;
@@ -123,6 +149,7 @@ export class RagImeRuntimeHost {
 			(await ModelRuntime.create({
 				authPath: join(options.agentDir, "auth.json"),
 				modelsPath: join(options.agentDir, "models.json"),
+				allowModelNetwork: false,
 			}));
 		const host = new RagImeRuntimeHost(options, modelRuntime);
 		await host.plugins.initialize();
@@ -130,6 +157,8 @@ export class RagImeRuntimeHost {
 	}
 
 	async dispose(): Promise<void> {
+		for (const controller of this.completions.values()) controller.abort();
+		this.completions.clear();
 		await this.sessions.dispose();
 	}
 
@@ -191,6 +220,7 @@ export class RagImeRuntimeHost {
 						debugContext: true,
 						conversationRewrite: true,
 						activeTurnMessaging: true,
+						statelessCompletion: true,
 					},
 				};
 			case "health":
@@ -206,7 +236,7 @@ export class RagImeRuntimeHost {
 				// the live catalog capabilities. Re-read the file on every catalog
 				// request so product clients never need to cache or duplicate them.
 				try {
-					await this.modelRuntime.reloadConfig({ allowNetwork: false });
+					await this.modelRuntime.reloadConfig();
 				} catch {
 					// reloadConfig records configuration and availability failures for
 					// the public error field; return the runtime's resulting snapshot.
@@ -219,6 +249,118 @@ export class RagImeRuntimeHost {
 				}
 				models.sort((left, right) => `${left.provider}/${left.id}`.localeCompare(`${right.provider}/${right.id}`));
 				return { models: models.map(publicModel), error: this.modelRuntime.getError() ?? "" };
+			}
+			case "completion.once": {
+				const requestId = completionIdParam(params);
+				const provider = requiredString(params, "provider", 80);
+				const modelId = requiredString(params, "modelId", 200);
+				const thinkingLevel = requiredString(params, "thinkingLevel", 20) as ModelThinkingLevel;
+				const timeoutMs = optionalTimeoutMs(params);
+				if (!STATELESS_THINKING_LEVELS.has(thinkingLevel)) {
+					throw new RuntimeProtocolError(
+						"INVALID_PARAMS",
+						"Stateless completion only supports off or low thinking",
+					);
+				}
+				if (this.completions.has(requestId)) {
+					throw new RuntimeProtocolError("REQUEST_ALREADY_ACTIVE", `Completion is already active: ${requestId}`);
+				}
+
+				const controller = new AbortController();
+				this.completions.set(requestId, controller);
+				const started = performance.now();
+				try {
+					// Re-read Pi's local configuration for every request. The product only
+					// stores a model reference; Pi remains the model/capability authority.
+					try {
+						await this.modelRuntime.reloadConfig();
+					} catch {
+						// Use the resulting availability snapshot so the caller receives the
+						// concrete model/configuration error below instead of stale metadata.
+					}
+					let available: readonly Model<Api>[];
+					try {
+						available = await this.modelRuntime.getAvailable();
+					} catch {
+						available = this.modelRuntime.getAvailableSnapshot();
+					}
+					const model = available.find((entry) => entry.provider === provider && entry.id === modelId);
+					if (!model) {
+						throw new RuntimeProtocolError(
+							"MODEL_NOT_AVAILABLE",
+							`Pi model is not available: ${provider}/${modelId}`,
+							{ modelError: this.modelRuntime.getError() ?? "" },
+						);
+					}
+					if (!getSupportedThinkingLevels(model).includes(thinkingLevel)) {
+						throw new RuntimeProtocolError(
+							"THINKING_NOT_SUPPORTED",
+							`Pi model ${provider}/${modelId} does not support ${thinkingLevel} thinking`,
+						);
+					}
+					if (params.images !== undefined) {
+						throw new RuntimeProtocolError(
+							"INVALID_PARAMS",
+							"Stateless completion does not accept images; provide semantic Context Packet text",
+						);
+					}
+					if (controller.signal.aborted) {
+						throw new RuntimeProtocolError("REQUEST_ABORTED", "Stateless completion was cancelled");
+					}
+					const message = requiredString(params, "message", 64_000);
+					const context: Context = {
+						messages: [
+							{
+								role: "user",
+								content: message,
+								timestamp: Date.now(),
+							},
+						],
+					};
+					const response = await this.modelRuntime.completeSimple(model, context, {
+						...(thinkingLevel === "low" ? { reasoning: "low" as const } : {}),
+						cacheRetention: "none",
+						maxRetries: 0,
+						maxTokens: Math.min(model.maxTokens, 4096),
+						signal: controller.signal,
+						timeoutMs,
+					});
+					if (response.stopReason === "error" || response.stopReason === "aborted") {
+						throw new RuntimeProtocolError(
+							response.stopReason === "aborted" ? "REQUEST_ABORTED" : "COMPLETION_FAILED",
+							response.errorMessage || `Stateless completion ${response.stopReason}`,
+						);
+					}
+					if (response.stopReason === "toolUse") {
+						throw new RuntimeProtocolError("UNEXPECTED_TOOL_USE", "Stateless completion cannot call tools");
+					}
+					const text = response.content
+						.filter((block) => block.type === "text")
+						.map((block) => block.text)
+						.join("")
+						.trim();
+					if (!text) {
+						throw new RuntimeProtocolError("EMPTY_COMPLETION", "Stateless completion returned no text");
+					}
+					return {
+						requestId,
+						text,
+						provider,
+						modelId,
+						thinkingLevel,
+						usage: response.usage,
+						stopReason: response.stopReason,
+						elapsedMs: Math.max(0, Math.round(performance.now() - started)),
+					};
+				} finally {
+					this.completions.delete(requestId);
+				}
+			}
+			case "completion.cancel": {
+				const requestId = completionIdParam(params);
+				const controller = this.completions.get(requestId);
+				controller?.abort();
+				return { requestId, cancelled: controller !== undefined };
 			}
 			case "session.open": {
 				const sessionId = requiredSessionId(params);

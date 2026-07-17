@@ -5,6 +5,8 @@ export type RuntimeMethod =
 	| "hello"
 	| "health"
 	| "models.list"
+	| "completion.once"
+	| "completion.cancel"
 	| "tools.list"
 	| "tools.sync"
 	| "session.open"
@@ -136,6 +138,8 @@ const RUNTIME_METHODS = new Set<RuntimeMethod>([
 	"hello",
 	"health",
 	"models.list",
+	"completion.once",
+	"completion.cancel",
 	"tools.list",
 	"tools.sync",
 	"session.open",
