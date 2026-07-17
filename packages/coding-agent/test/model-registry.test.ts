@@ -235,6 +235,63 @@ describe("ModelRegistry", () => {
 		});
 	});
 
+	describe("model catalog provider aliases", () => {
+		test("inherits model capabilities from Pi while keeping custom transport settings", async () => {
+			writeRawModelsJson({
+				gpt: {
+					modelCatalogProvider: "openai",
+					baseUrl: "https://gateway.example.com/v1",
+					apiKey: "GPT_API_KEY",
+					api: "openai-completions",
+					compat: {
+						supportsReasoningEffort: true,
+						maxTokensField: "max_completion_tokens",
+					},
+					models: [{ id: "gpt-5.6-luna" }],
+				},
+			});
+
+			const registry = await createModelRegistry(authStorage, modelsJsonPath);
+			const model = registry.find("gpt", "gpt-5.6-luna");
+
+			expect(registry.getError()).toBeUndefined();
+			expect(model).toMatchObject({
+				provider: "gpt",
+				id: "gpt-5.6-luna",
+				name: "GPT-5.6 Luna",
+				api: "openai-completions",
+				baseUrl: "https://gateway.example.com/v1",
+				reasoning: true,
+				thinkingLevelMap: { off: "none", xhigh: "xhigh", max: "max" },
+				input: ["text", "image"],
+				contextWindow: 272000,
+				maxTokens: 128000,
+			});
+			expect(model?.compat).toMatchObject({
+				supportsReasoningEffort: true,
+				maxTokensField: "max_completion_tokens",
+			});
+			expect(model?.compat).not.toHaveProperty("supportsToolSearch");
+		});
+
+		test("fails closed when an alias model is absent from the Pi catalog", async () => {
+			writeRawModelsJson({
+				gpt: {
+					modelCatalogProvider: "openai",
+					baseUrl: "https://gateway.example.com/v1",
+					apiKey: "GPT_API_KEY",
+					api: "openai-completions",
+					models: [{ id: "not-in-pi-catalog" }],
+				},
+			});
+
+			const registry = await createModelRegistry(authStorage, modelsJsonPath);
+
+			expect(registry.find("gpt", "not-in-pi-catalog")).toBeUndefined();
+			expect(registry.getError()).toContain('not found in catalog provider "openai"');
+		});
+	});
+
 	describe("custom models merge behavior", () => {
 		test("built-in provider custom models inherit api and baseUrl without explicit fields", async () => {
 			// Built-in providers already have api/baseUrl on every model, and auth

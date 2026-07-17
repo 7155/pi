@@ -127,6 +127,7 @@ function modelFromJson(
 	providerConfig: ModelsJsonProvider,
 	defaults: Model<Api> | undefined,
 ): Model<Api> {
+	const inheritCatalogCapabilities = providerConfig.modelCatalogProvider !== undefined;
 	const api = definition.api ?? providerConfig.api ?? defaults?.api;
 	if (!api) {
 		throw new Error(
@@ -143,18 +144,35 @@ function modelFromJson(
 	}
 	return {
 		id: definition.id,
-		name: definition.name ?? definition.id,
+		name: definition.name ?? (inheritCatalogCapabilities ? defaults?.name : undefined) ?? definition.id,
 		api: api as Api,
 		provider: providerId,
 		baseUrl,
-		reasoning: definition.reasoning ?? false,
-		thinkingLevelMap: definition.thinkingLevelMap,
-		input: (definition.input ?? ["text"]) as ("text" | "image")[],
-		cost: definition.cost ?? { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
-		contextWindow: definition.contextWindow ?? 128000,
-		maxTokens: definition.maxTokens ?? 16384,
+		reasoning: definition.reasoning ?? (inheritCatalogCapabilities ? defaults?.reasoning : undefined) ?? false,
+		thinkingLevelMap:
+			definition.thinkingLevelMap ?? (inheritCatalogCapabilities ? defaults?.thinkingLevelMap : undefined),
+		input: (definition.input ?? (inheritCatalogCapabilities ? defaults?.input : undefined) ?? ["text"]) as (
+			| "text"
+			| "image"
+		)[],
+		cost: definition.cost ??
+			(inheritCatalogCapabilities ? defaults?.cost : undefined) ?? {
+				input: 0,
+				output: 0,
+				cacheRead: 0,
+				cacheWrite: 0,
+			},
+		contextWindow:
+			definition.contextWindow ?? (inheritCatalogCapabilities ? defaults?.contextWindow : undefined) ?? 128000,
+		maxTokens: definition.maxTokens ?? (inheritCatalogCapabilities ? defaults?.maxTokens : undefined) ?? 16384,
 		headers: undefined,
-		compat: mergeCompat(providerConfig.compat, definition.compat),
+		compat: mergeCompat(
+			mergeCompat(
+				inheritCatalogCapabilities && api === defaults?.api ? defaults.compat : undefined,
+				providerConfig.compat,
+			),
+			definition.compat,
+		),
 	};
 }
 
@@ -164,6 +182,22 @@ function applyModelsJson(
 	config: ModelsJsonProvider | undefined,
 ): Model<Api>[] {
 	if (!config) return [...baseModels];
+	if (config.modelCatalogProvider) {
+		if (!config.models?.length) {
+			throw new Error(
+				`Provider ${providerId}: "models" must select at least one model when "modelCatalogProvider" is set.`,
+			);
+		}
+		return config.models.map((definition) => {
+			const defaults = baseModels.find((model) => model.id === definition.id);
+			if (!defaults) {
+				throw new Error(
+					`Provider ${providerId}, model ${definition.id}: not found in catalog provider "${config.modelCatalogProvider}".`,
+				);
+			}
+			return modelFromJson(providerId, definition, config, defaults);
+		});
+	}
 	if (config.oauth && !config.baseUrl) {
 		throw new Error(`Provider ${providerId}: "baseUrl" is required when "oauth" is set.`);
 	}

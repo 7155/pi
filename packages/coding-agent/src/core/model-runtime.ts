@@ -186,20 +186,28 @@ export class ModelRuntime implements Models {
 	}
 
 	private recomposeProvider(providerId: string): void {
-		const base = this.builtins.get(providerId);
+		const configuredProvider = this.config.getProvider(providerId);
+		const catalogProviderId = configuredProvider?.modelCatalogProvider;
+		const base = catalogProviderId ? this.defaultBuiltins.get(catalogProviderId) : this.builtins.get(providerId);
 		const extension = this.extensionProviders.get(providerId);
-		if (!base && !this.config.getProvider(providerId) && !extension) {
+		if (!base && !configuredProvider && !extension) {
 			this.models.deleteProvider(providerId);
 			this.compositionErrors.delete(providerId);
 			return;
 		}
-		if (base && !this.config.getProvider(providerId) && !extension) {
+		if (base && !configuredProvider && !extension) {
 			// No overlays: use the builtin untouched so its auth/login/stream behavior is exact.
 			this.models.setProvider(base);
 			this.compositionErrors.delete(providerId);
 			return;
 		}
 		try {
+			if (catalogProviderId === providerId) {
+				throw new Error(`modelCatalogProvider must reference a different built-in provider.`);
+			}
+			if (catalogProviderId && !base) {
+				throw new Error(`model catalog provider "${catalogProviderId}" is not built in.`);
+			}
 			this.models.setProvider(composeModelProvider(providerId, base, this.config, extension));
 			this.compositionErrors.delete(providerId);
 		} catch (error) {
@@ -493,11 +501,14 @@ export class ModelRuntime implements Models {
 		await this.refresh({ allowNetwork: this.allowModelNetwork });
 	}
 
-	async reloadConfig(): Promise<void> {
+	async reloadConfig(options: ModelsRefreshOptions = {}): Promise<void> {
 		this.config = await ModelConfig.load(this.modelsPath);
 		this.configureRadiusProviders();
 		this.rebuildProviders();
-		await this.refresh({ allowNetwork: this.allowModelNetwork });
+		await this.refresh({
+			...options,
+			allowNetwork: options.allowNetwork ?? this.allowModelNetwork,
+		});
 	}
 
 	async refresh(options: ModelsRefreshOptions = {}): Promise<ModelsRefreshResult> {

@@ -202,6 +202,15 @@ export class RagImeRuntimeHost {
 					modelError: this.modelRuntime.getError() ?? "",
 				};
 			case "models.list": {
+				// models.json contains connection/selection references, while Pi owns
+				// the live catalog capabilities. Re-read the file on every catalog
+				// request so product clients never need to cache or duplicate them.
+				try {
+					await this.modelRuntime.reloadConfig({ allowNetwork: false });
+				} catch {
+					// reloadConfig records configuration and availability failures for
+					// the public error field; return the runtime's resulting snapshot.
+				}
 				let models: Model<Api>[];
 				try {
 					models = [...(await this.modelRuntime.getAvailable())];
