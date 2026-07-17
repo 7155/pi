@@ -39,6 +39,7 @@ describe("PiDebugContextRecorder", () => {
 				},
 			},
 		);
+		handlers.get("turn_start")?.({ turnIndex: 0, timestamp: Date.now() });
 		handlers.get("context")?.({
 			messages: [{ role: "user", content: "final context" }],
 		});
@@ -51,6 +52,52 @@ describe("PiDebugContextRecorder", () => {
 				headers: { Authorization: "Bearer nested-secret", "x-api-key": "x-secret" },
 				image: "data:image/png;base64,AAAA",
 			},
+		});
+		handlers.get("after_provider_response")?.({
+			status: 200,
+			headers: { "x-request-id": "request-1", "set-cookie": "private-cookie" },
+		});
+		handlers.get("message_end")?.({
+			message: { role: "assistant", content: [{ type: "toolCall", id: "tool-1", name: "read" }] },
+		});
+		handlers.get("tool_execution_start")?.({ toolCallId: "tool-1", toolName: "read", args: { path: "a.ts" } });
+		handlers.get("tool_execution_start")?.({ toolCallId: "tool-2", toolName: "read", args: { path: "b.ts" } });
+		handlers.get("tool_execution_end")?.({
+			toolCallId: "tool-2",
+			toolName: "read",
+			result: { text: "b" },
+			isError: false,
+		});
+		handlers.get("tool_execution_end")?.({
+			toolCallId: "tool-1",
+			toolName: "read",
+			result: { text: "a" },
+			isError: false,
+		});
+		handlers.get("turn_end")?.({ turnIndex: 0, message: { role: "assistant" }, toolResults: [] });
+
+		handlers.get("turn_start")?.({ turnIndex: 1, timestamp: Date.now() });
+		handlers.get("context")?.({
+			messages: [
+				{ role: "user", content: "final context" },
+				{ role: "assistant", content: "I inspected the files" },
+				{ role: "toolResult", content: "tool evidence" },
+			],
+		});
+		handlers.get("before_provider_request")?.({ payload: { model: "gpt-test", input: "follow-up" } });
+		handlers.get("tool_execution_start")?.({ toolCallId: "tool-3", toolName: "read", args: { path: "c.ts" } });
+		handlers.get("tool_execution_end")?.({
+			toolCallId: "tool-3",
+			toolName: "read",
+			result: { text: "c" },
+			isError: false,
+		});
+		handlers.get("tool_execution_start")?.({ toolCallId: "tool-4", toolName: "read", args: { path: "d.ts" } });
+		handlers.get("tool_execution_end")?.({
+			toolCallId: "tool-4",
+			toolName: "read",
+			result: { error: "denied" },
+			isError: true,
 		});
 
 		const captured = recorder.get("turn-1");
@@ -71,8 +118,40 @@ describe("PiDebugContextRecorder", () => {
 			headers: { Authorization: "[credential omitted]", "x-api-key": "[credential omitted]" },
 			image: expect.stringContaining("binary data omitted"),
 		});
+		expect(captured?.modelCalls).toHaveLength(2);
+		expect(captured?.modelCalls[0]?.providerExchanges[0]).toMatchObject({
+			status: 200,
+			headers: { "x-request-id": "request-1", "set-cookie": "[credential omitted]" },
+		});
+		expect(captured?.modelCalls[1]?.contextDelta).toMatchObject({
+			baseCallIndex: 1,
+			commonPrefixMessages: 1,
+			removedMessageCount: 0,
+			addedMessageCount: 2,
+		});
+		expect(captured?.modelCalls[1]?.contextDelta.addedMessages).toEqual([
+			{ role: "assistant", content: "I inspected the files" },
+			{ role: "toolResult", content: "tool evidence" },
+		]);
+		expect(captured?.toolExecutions).toHaveLength(4);
+		expect(captured?.toolBatches.map((batch) => ({ mode: batch.executionMode, ids: batch.toolCallIds }))).toEqual([
+			{ mode: "parallel", ids: ["tool-1", "tool-2"] },
+			{ mode: "serial", ids: ["tool-3"] },
+			{ mode: "serial", ids: ["tool-4"] },
+		]);
+		expect(captured?.toolExecutions.at(-1)).toMatchObject({ status: "failed", isError: true });
 		expect(JSON.stringify(captured)).not.toContain("nested-secret");
 		expect(JSON.stringify(captured)).not.toContain("x-secret");
+		expect(JSON.stringify(captured)).not.toContain("private-cookie");
+		expect(recorder.list()).toEqual([
+			expect.objectContaining({
+				turnId: "turn-1",
+				modelCallCount: 2,
+				providerRequestCount: 2,
+				toolCallCount: 4,
+				runningToolCount: 0,
+			}),
+		]);
 
 		activeTurn = { turnId: "turn-2", clientMessageId: "client-2" };
 		expect(recorder.get("turn-2")).toBeUndefined();

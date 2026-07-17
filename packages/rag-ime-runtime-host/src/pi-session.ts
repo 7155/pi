@@ -603,6 +603,7 @@ export class PiProductSession implements PooledSession {
 			turnId: turnId ?? context?.turnId ?? "",
 			available: Boolean(context),
 			transient: true,
+			availableTurns: this.debugContextRecorder.list(),
 			context: context ?? null,
 			telemetry: this.telemetry(),
 		};
