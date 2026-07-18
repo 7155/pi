@@ -4,6 +4,8 @@ import {
 	type InlineExtension,
 	type ResourceLoader,
 	type Skill,
+	skillCatalogEntry,
+	skillCatalogRevision,
 	stripFrontmatter,
 	type ToolDefinition,
 } from "@earendil-works/pi-coding-agent";
@@ -18,13 +20,15 @@ import { type BackendToolManifest, type BackendToolRegistry, backendToolSchemaRe
 const DEFAULT_RESULT_LIMIT = 8;
 const MAX_RESULT_LIMIT = 20;
 const MAX_SKILL_BYTES = 128 * 1024;
+const MAX_TOOL_ROUTE_CHARS = 200;
+const TOOL_CATALOG_MARKER = '<available_product_tools format="route-jsonl"';
 
 const SKILL_SEARCH_PARAMETERS = {
 	type: "object",
 	properties: {
 		query: {
 			type: "string",
-			description: "Optional name or description keywords. Leave empty to list the catalog.",
+			description: "Optional name, when, does, or notFor keywords. Leave empty to list the catalog.",
 		},
 		limit: {
 			type: "integer",
@@ -93,6 +97,11 @@ export interface DiscoveryToolsOptions {
 	includeToolSearch?: boolean;
 }
 
+export interface BackendToolRouteEntry {
+	name: string;
+	does: string;
+}
+
 function visibleSkills(skills: Skill[]): Skill[] {
 	return skills
 		.filter((skill) => !skill.disableModelInvocation)
@@ -129,9 +138,32 @@ function sha256(value: string): string {
 	return createHash("sha256").update(value).digest("hex");
 }
 
+export function backendToolRouteEntry(tool: BackendToolManifest): BackendToolRouteEntry {
+	const normalized = tool.description.replace(/\s+/gu, " ").trim();
+	let does = normalized;
+	let entry = { name: tool.name, does };
+	while (Array.from(JSON.stringify(entry)).length > MAX_TOOL_ROUTE_CHARS && does.length > 4) {
+		does = `${Array.from(does).slice(0, -8).join("")}...`;
+		entry = { name: tool.name, does };
+	}
+	return entry;
+}
+
+export function formatBackendToolRouteCatalog(tools: BackendToolManifest[], revision: string): string {
+	if (tools.length === 0) return "";
+	const entries = tools.map(backendToolRouteEntry).sort((left, right) => left.name.localeCompare(right.name));
+	return [
+		"",
+		"",
+		`${TOOL_CATALOG_MARKER} revision="sha256:${revision}">`,
+		"Each JSON line exposes only a tool name and short purpose. Use tool_search for its full description and risk, then tool_load before calling it so the Provider receives its parameter schema.",
+		...entries.map((entry) => JSON.stringify(entry)),
+		"</available_product_tools>",
+	].join("\n");
+}
+
 export function runtimeSkillCatalogRevision(skills: Skill[]): string {
-	const catalog = visibleSkills(skills).map(({ name, description }) => ({ name, description }));
-	return sha256(JSON.stringify(catalog));
+	return skillCatalogRevision(skills);
 }
 
 function escapeXmlAttribute(value: string): string {
@@ -139,8 +171,10 @@ function escapeXmlAttribute(value: string): string {
 }
 
 export function diffSkillCatalog(before: Skill[], after: Skill[]): SkillCatalogDiff {
-	const previous = new Map(visibleSkills(before).map((skill) => [skill.name, skill.description]));
-	const next = new Map(visibleSkills(after).map((skill) => [skill.name, skill.description]));
+	const previous = new Map(
+		visibleSkills(before).map((skill) => [skill.name, JSON.stringify(skillCatalogEntry(skill))]),
+	);
+	const next = new Map(visibleSkills(after).map((skill) => [skill.name, JSON.stringify(skillCatalogEntry(skill))]));
 	const added = [...next.keys()].filter((name) => !previous.has(name)).sort();
 	const removed = [...previous.keys()].filter((name) => !next.has(name)).sort();
 	const changed = [...next.keys()]
@@ -159,17 +193,21 @@ export function searchSkills(skills: Skill[], args: { query?: unknown; limit?: u
 	const query = typeof args.query === "string" ? args.query.trim() : "";
 	const limit = normalizedLimit(args.limit);
 	const items = visibleSkills(skills)
-		.map((skill) => ({
-			name: skill.name,
-			description: skill.description,
-			score: searchScore(query, skill.name, skill.description),
-		}))
+		.map((skill) => {
+			const entry = skillCatalogEntry(skill);
+			const routingText =
+				"description" in entry ? entry.description : [...entry.when, entry.does, ...(entry.notFor ?? [])].join(" ");
+			return {
+				entry,
+				score: searchScore(query, skill.name, routingText),
+			};
+		})
 		.filter((item) => !query || item.score > 0)
-		.sort((left, right) => right.score - left.score || left.name.localeCompare(right.name))
+		.sort((left, right) => right.score - left.score || left.entry.name.localeCompare(right.entry.name))
 		.slice(0, limit)
-		.map(({ score: _score, ...item }) => item);
+		.map(({ entry }) => entry);
 	return {
-		schemaVersion: "rag-ime.skill-search.v1",
+		schemaVersion: "rag-ime.skill-search.v2",
 		catalogRevision: runtimeSkillCatalogRevision(skills),
 		query,
 		items,
@@ -269,14 +307,19 @@ export function loadBackendTool(
 }
 
 export function createDiscoveryToolsExtension(options: DiscoveryToolsOptions): InlineExtension {
+	const initialToolCatalog = formatBackendToolRouteCatalog(options.registry.list(), options.registry.revision());
 	return {
 		name: "rag-ime-discovery-tools",
 		factory(pi) {
+			pi.on("before_agent_start", async (event) => {
+				if (!initialToolCatalog || event.systemPrompt.includes(TOOL_CATALOG_MARKER)) return undefined;
+				return { systemPrompt: `${event.systemPrompt}${initialToolCatalog}` };
+			});
 			pi.registerTool({
 				name: SKILL_SEARCH_TOOL_NAME,
 				label: "Search skills",
-				description: "Search the managed Skill Catalog by name or description.",
-				promptSnippet: "Search the stable managed Skill Catalog by name or description",
+				description: "Search the managed Skill Catalog by name, trigger, purpose, or exclusion.",
+				promptSnippet: "Search the stable managed Skill Catalog by routing-card fields",
 				parameters: SKILL_SEARCH_PARAMETERS,
 				execute: async (_toolCallId, args) => {
 					const result = searchSkills(

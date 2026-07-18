@@ -1,4 +1,4 @@
-import { mkdir, mkdtemp, rm } from "node:fs/promises";
+import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { SessionManager } from "@earendil-works/pi-coding-agent";
@@ -24,6 +24,106 @@ function manifest(risk: string, requireQuery = false) {
 }
 
 describe("PiProductSession catalog updates", () => {
+	it("loads product Skills always and Pi/Codex Skills only through their independent settings", async () => {
+		const root = await mkdtemp(join(tmpdir(), "pi-runtime-product-skills-"));
+		const agentDir = join(root, "agent");
+		const sessionDir = join(root, "sessions");
+		const activePluginDir = join(root, "plugins", "active");
+		const ambientSkillDir = join(agentDir, "skills", "ambient-workspace-skill");
+		const productSkillDir = join(root, "product-skills", "rag-ime-product-skill");
+		const piSkillDir = join(root, "pi-skills", "pi-user-skill");
+		const codexSkillDir = join(root, "codex-skills", "codex-user-skill");
+		await Promise.all([
+			mkdir(sessionDir, { recursive: true }),
+			mkdir(activePluginDir, { recursive: true }),
+			mkdir(ambientSkillDir, { recursive: true }),
+			mkdir(productSkillDir, { recursive: true }),
+			mkdir(piSkillDir, { recursive: true }),
+			mkdir(codexSkillDir, { recursive: true }),
+		]);
+		await Promise.all([
+			writeFile(
+				join(ambientSkillDir, "SKILL.md"),
+				"---\nname: ambient-workspace-skill\ndescription: Must remain outside the product catalog.\n---\n",
+			),
+			writeFile(
+				join(productSkillDir, "SKILL.md"),
+				"---\nname: rag-ime-product-skill\ndescription: Explicit product Skill.\n---\n",
+			),
+			writeFile(join(piSkillDir, "SKILL.md"), "---\nname: pi-user-skill\ndescription: Optional Pi Skill.\n---\n"),
+			writeFile(
+				join(codexSkillDir, "SKILL.md"),
+				"---\nname: codex-user-skill\ndescription: Optional Codex Skill.\n---\n",
+			),
+		]);
+		const modelRuntime = await ModelRuntime.create({
+			authPath: join(root, "auth.json"),
+			modelsPath: null,
+			allowModelNetwork: false,
+		});
+		const sessionOptions = {
+			externalSessionId: "product-skill-test",
+			cwd: root,
+			sessionDir,
+			agentDir,
+			activePluginDir,
+			skillPaths: [productSkillDir],
+			piSkillPaths: [piSkillDir],
+			codexSkillPaths: [codexSkillDir],
+			modelRuntime,
+			toolManifest: [],
+			noContextFiles: true,
+			emitEvent: () => undefined,
+		};
+		const productSession = await PiProductSession.create(sessionOptions);
+
+		try {
+			expect(productSession.listCommands()).toEqual([
+				expect.objectContaining({ name: "skill:rag-ime-product-skill" }),
+			]);
+			expect(productSession.snapshot()).toMatchObject({
+				piSkillsEnabled: false,
+				codexSkillsEnabled: false,
+			});
+			expect(JSON.stringify(productSession.listCommands())).not.toContain("ambient-workspace-skill");
+			expect(JSON.stringify(productSession.listCommands())).not.toContain("pi-user-skill");
+			expect(JSON.stringify(productSession.listCommands())).not.toContain("codex-user-skill");
+		} finally {
+			productSession.dispose();
+		}
+
+		const piSession = await PiProductSession.create({
+			...sessionOptions,
+			externalSessionId: "pi-skill-test",
+			piSkillsEnabled: true,
+		});
+		try {
+			expect(piSession.listCommands().map((command) => command.name)).toEqual([
+				"skill:rag-ime-product-skill",
+				"skill:pi-user-skill",
+			]);
+			expect(piSession.snapshot()).toMatchObject({ piSkillsEnabled: true, codexSkillsEnabled: false });
+		} finally {
+			piSession.dispose();
+		}
+
+		const codexSession = await PiProductSession.create({
+			...sessionOptions,
+			externalSessionId: "codex-skill-test",
+			codexSkillsEnabled: true,
+		});
+		try {
+			expect(codexSession.listCommands().map((command) => command.name)).toEqual([
+				"skill:rag-ime-product-skill",
+				"skill:codex-user-skill",
+			]);
+			expect(codexSession.snapshot()).toMatchObject({ piSkillsEnabled: false, codexSkillsEnabled: true });
+		} finally {
+			codexSession.dispose();
+			await rm(root, { recursive: true, force: true });
+		}
+	});
+
 	it("restores only schemas explicitly disclosed by tool_load", () => {
 		const registry = new BackendToolRegistry();
 		registry.sync([
@@ -83,6 +183,8 @@ describe("PiProductSession catalog updates", () => {
 			agentDir,
 			activePluginDir,
 			skillPaths: [],
+			piSkillPaths: [],
+			codexSkillPaths: [],
 			modelRuntime,
 			toolManifest: manifest("read"),
 			noContextFiles: true,

@@ -1,8 +1,7 @@
-import { existsSync } from "node:fs";
+import { existsSync, readdirSync } from "node:fs";
 import { mkdir, realpath, rm, stat } from "node:fs/promises";
 import { homedir } from "node:os";
-import { delimiter, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
-import { fileURLToPath } from "node:url";
+import { delimiter, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { type Api, getSupportedThinkingLevels, type Model, type ModelThinkingLevel } from "@earendil-works/pi-ai";
 import { ModelRuntime } from "@earendil-works/pi-coding-agent";
 import { PiProductSession } from "./pi-session.ts";
@@ -15,6 +14,11 @@ import {
 	type RuntimeRequest,
 } from "./protocol.ts";
 import { BoundedSessionPool } from "./session-pool.ts";
+import {
+	codexPluginSkillCatalogNames,
+	loadSkillRoutingCardCatalog,
+	type SkillRoutingCardCatalog,
+} from "./skill-routing-cards.ts";
 
 const HOST_VERSION = "1.0.0";
 const SESSION_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,199}$/;
@@ -26,6 +30,9 @@ export interface RuntimeHostOptions {
 	pluginsRoot: string;
 	pluginInbox: string;
 	skillPaths?: string[];
+	piSkillPaths?: string[];
+	codexSkillPaths?: string[];
+	skillRoutingCards?: SkillRoutingCardCatalog;
 	maxSessions: number;
 	toolGatewayUrl?: string;
 	toolGatewayToken?: string;
@@ -245,6 +252,11 @@ export class RagImeRuntimeHost {
 						agentDir: this.options.agentDir,
 						activePluginDir: this.plugins.activeDir,
 						skillPaths: this.options.skillPaths ?? [],
+						piSkillPaths: this.options.piSkillPaths ?? [],
+						codexSkillPaths: this.options.codexSkillPaths ?? [],
+						skillRoutingCards: this.options.skillRoutingCards,
+						piSkillsEnabled: optionalBoolean(params, "piSkillsEnabled"),
+						codexSkillsEnabled: optionalBoolean(params, "codexSkillsEnabled"),
 						modelRuntime: this.modelRuntime,
 						provider,
 						modelId,
@@ -290,6 +302,11 @@ export class RagImeRuntimeHost {
 							agentDir: this.options.agentDir,
 							activePluginDir: this.plugins.activeDir,
 							skillPaths: this.options.skillPaths ?? [],
+							piSkillPaths: this.options.piSkillPaths ?? [],
+							codexSkillPaths: this.options.codexSkillPaths ?? [],
+							skillRoutingCards: this.options.skillRoutingCards,
+							piSkillsEnabled: profile.piSkillsEnabled,
+							codexSkillsEnabled: profile.codexSkillsEnabled,
 							modelRuntime: this.modelRuntime,
 							provider: profile.provider,
 							modelId: profile.modelId,
@@ -430,6 +447,40 @@ export class RagImeRuntimeHost {
 	}
 }
 
+function childDirectories(root: string): string[] {
+	try {
+		return readdirSync(root, { withFileTypes: true })
+			.filter((entry) => entry.isDirectory())
+			.map((entry) => entry.name)
+			.sort((left, right) => left.localeCompare(right, undefined, { numeric: true }));
+	} catch {
+		return [];
+	}
+}
+
+function discoverCatalogedCodexPluginSkills(codexHome: string, catalog: SkillRoutingCardCatalog): string[] {
+	const cacheRoot = join(codexHome, "plugins", "cache");
+	const paths: string[] = [];
+	for (const marketplace of childDirectories(cacheRoot)) {
+		const marketplaceRoot = join(cacheRoot, marketplace);
+		for (const pluginName of childDirectories(marketplaceRoot)) {
+			const pluginRoot = join(marketplaceRoot, pluginName);
+			const newestVersion = childDirectories(pluginRoot).at(-1);
+			if (newestVersion) {
+				const skillsRoot = join(pluginRoot, newestVersion, "skills");
+				for (const skillName of childDirectories(skillsRoot)) {
+					const matchesCatalog = codexPluginSkillCatalogNames(pluginName, skillName).some(
+						(name) => catalog[name] !== undefined,
+					);
+					const skillPath = join(skillsRoot, skillName);
+					if (matchesCatalog && existsSync(join(skillPath, "SKILL.md"))) paths.push(skillPath);
+				}
+			}
+		}
+	}
+	return [...new Set(paths)];
+}
+
 export function runtimeHostOptionsFromEnvironment(
 	emitEvent: (event: RuntimeEventEnvelope) => void,
 ): RuntimeHostOptions {
@@ -442,22 +493,40 @@ export function runtimeHostOptionsFromEnvironment(
 		.map((value) => value.trim())
 		.filter(Boolean);
 	const maxSessionsValue = Number.parseInt(process.env.RAG_IME_PI_MAX_SESSIONS || "8", 10);
-	const moduleDir = dirname(fileURLToPath(import.meta.url));
-	const bundledSkillCandidates = [
-		join(moduleDir, "skills", "rag-ime-plugin-creator"),
-		join(moduleDir, "..", "skills", "rag-ime-plugin-creator"),
-	];
 	const configuredSkillPaths = (process.env.RAG_IME_PI_SKILL_PATHS ?? "")
 		.split(delimiter)
 		.map((value) => value.trim())
 		.filter(Boolean)
 		.map((value) => resolve(value));
+	const configuredPiSkillPaths = (process.env.RAG_IME_PI_USER_SKILL_PATHS ?? "")
+		.split(delimiter)
+		.map((value) => value.trim())
+		.filter(Boolean)
+		.map((value) => resolve(value));
+	const piAgentDir = resolve(process.env.PI_CODING_AGENT_DIR || join(homedir(), ".pi", "agent"));
+	const configuredCodexSkillPaths = (process.env.RAG_IME_CODEX_SKILL_PATHS ?? "")
+		.split(delimiter)
+		.map((value) => value.trim())
+		.filter(Boolean)
+		.map((value) => resolve(value));
+	const codexHome = resolve(process.env.CODEX_HOME || join(homedir(), ".codex"));
+	const routingCardsPath = (process.env.RAG_IME_PI_SKILL_ROUTING_CARDS ?? "").trim();
+	const skillRoutingCards = routingCardsPath ? loadSkillRoutingCardCatalog(resolve(routingCardsPath)) : {};
+	const codexDefaults = [
+		join(codexHome, "skills", ".system"),
+		join(codexHome, "skills"),
+		join(homedir(), ".agents", "skills"),
+		...discoverCatalogedCodexPluginSkills(codexHome, skillRoutingCards),
+	];
 	return {
 		agentDir,
 		sessionDir: resolve(process.env.RAG_IME_PI_SESSION_DIR || join(appSupport, "Agent", "sessions")),
 		pluginsRoot: resolve(process.env.RAG_IME_PI_PLUGINS_DIR || join(appSupport, "Agent", "plugins")),
 		pluginInbox: resolve(process.env.RAG_IME_PI_PLUGIN_INBOX || join(appSupport, "Agent", "plugin-inbox")),
-		skillPaths: [...new Set([...bundledSkillCandidates.filter(existsSync), ...configuredSkillPaths])],
+		skillPaths: [...new Set(configuredSkillPaths)],
+		piSkillPaths: [...new Set(configuredPiSkillPaths.length ? configuredPiSkillPaths : [join(piAgentDir, "skills")])],
+		codexSkillPaths: [...new Set(configuredCodexSkillPaths.length ? configuredCodexSkillPaths : codexDefaults)],
+		skillRoutingCards,
 		maxSessions: Number.isInteger(maxSessionsValue) && maxSessionsValue > 0 ? Math.min(maxSessionsValue, 32) : 8,
 		toolGatewayUrl: process.env.RAG_IME_TOOL_GATEWAY_URL,
 		toolGatewayToken: process.env.RAG_IME_TOOL_GATEWAY_TOKEN,

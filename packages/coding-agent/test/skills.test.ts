@@ -15,10 +15,12 @@ function createTestSkill(options: {
 	baseDir: string;
 	disableModelInvocation?: boolean;
 	source?: string;
+	routing?: Skill["routing"];
 }): Skill {
 	return {
 		name: options.name,
 		description: options.description,
+		routing: options.routing,
 		filePath: options.filePath,
 		baseDir: options.baseDir,
 		sourceInfo: createSyntheticSourceInfo(options.filePath, { source: options.source ?? "test" }),
@@ -219,6 +221,32 @@ describe("skills", () => {
 			expect(skills).toHaveLength(1);
 			expect(skills[0].disableModelInvocation).toBe(false);
 		});
+
+		it("should parse a compact routing card", () => {
+			const { skills, diagnostics } = loadSkillsFromDir({
+				dir: join(fixturesDir, "routing-card"),
+				source: "test",
+			});
+
+			expect(diagnostics).toHaveLength(0);
+			expect(skills).toHaveLength(1);
+			expect(skills[0].routing).toEqual({
+				when: ["用户要求整理长期记忆", "用户要求审阅记忆草案"],
+				does: "生成并审阅受控记忆草案。",
+				notFor: ["普通记忆查询"],
+			});
+		});
+
+		it("should reject a partial or malformed routing card", () => {
+			const { skills, diagnostics } = loadSkillsFromDir({
+				dir: join(fixturesDir, "invalid-routing-card"),
+				source: "test",
+			});
+
+			expect(skills).toHaveLength(0);
+			expect(diagnostics.some((diagnostic) => diagnostic.message.includes("when must be"))).toBe(true);
+			expect(diagnostics.some((diagnostic) => diagnostic.message.includes("does must be"))).toBe(true);
+		});
 	});
 
 	describe("formatSkillsForPrompt", () => {
@@ -285,6 +313,41 @@ describe("skills", () => {
 			expect(result).toContain("Use the skill_search tool");
 			expect(result).toContain("Use the skill_load tool with the exact skill name");
 			expect(result).toContain('<available_skills revision="sha256:');
+			expect(result).not.toContain("<location>");
+		});
+
+		it("renders structured routing cards as compact JSONL for a controlled loader", () => {
+			const skills: Skill[] = [
+				createTestSkill({
+					name: "memory-review",
+					description: "Compatibility description that must not enter the catalog.",
+					filePath: "/path/to/memory-review/SKILL.md",
+					baseDir: "/path/to/memory-review",
+					routing: {
+						when: ["用户要求审阅记忆草案", "用户要求回滚已应用草案"],
+						does: "审阅并受控应用长期记忆草案。",
+						notFor: ["普通记忆查询"],
+					},
+				}),
+			];
+
+			const result = formatSkillsForPrompt(skills, {
+				loadToolName: "skill_load",
+				searchToolName: "skill_search",
+				includeLocations: false,
+				includeRevision: true,
+			});
+
+			expect(result).toContain('format="routing-card-jsonl"');
+			expect(result).toContain(
+				JSON.stringify({
+					name: "memory-review",
+					when: ["用户要求审阅记忆草案", "用户要求回滚已应用草案"],
+					does: "审阅并受控应用长期记忆草案。",
+					notFor: ["普通记忆查询"],
+				}),
+			);
+			expect(result).not.toContain("Compatibility description");
 			expect(result).not.toContain("<location>");
 		});
 
