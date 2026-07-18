@@ -14,13 +14,13 @@ describe("transient context", () => {
 			JSON.stringify({
 				schemaVersion: "rag-ime.runtime-prompt.v1",
 				message: "继续当前任务",
-				sessionContext: "## 新 Session 个人记忆召回",
+				sessionContext: "## Session 记忆",
 				transientContext: "## 召回结果\n- Book: 输入法架构",
 			});
 
 		expect(decodeRuntimePrompt(encoded)).toEqual({
 			message: "继续当前任务",
-			sessionContext: "## 新 Session 个人记忆召回",
+			sessionContext: "## Session 记忆",
 			transientContext: "## 召回结果\n- Book: 输入法架构",
 		});
 	});

@@ -182,7 +182,6 @@ export function publicPiForkCandidates(sourceManager: SessionManager): PublicPiF
 	}
 	return result;
 }
-
 export function prepareNativePiFork(sourceManager: SessionManager, entryId: string): PreparedPiFork {
 	const selected = sourceManager.getEntry(entryId);
 	const candidate = publicPiForkCandidates(sourceManager).find((item) => item.entryId === entryId);
@@ -930,6 +929,7 @@ export class PiProductSession implements PooledSession {
 			pending.resolve(false);
 		}
 		this.pendingDecisions.clear();
+		this.transientContext = "";
 		this.unsubscribe?.();
 		this.unsubscribe = undefined;
 		this.debugContextRecorder.clear();
