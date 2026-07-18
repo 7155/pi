@@ -25,6 +25,7 @@ import {
 	createBackendToolExtension,
 	diffBackendToolCatalog,
 } from "./tool-bridge.ts";
+import { createTransientContextExtension } from "./transient-context.ts";
 
 export interface PiSessionOpenOptions {
 	externalSessionId: string;
@@ -265,6 +266,8 @@ export class PiProductSession implements PooledSession {
 	private unsubscribe: (() => void) | undefined;
 	private sequence = 0;
 	private activeTurn: ActiveTurn | undefined;
+	private sessionContext = "";
+	private transientContext = "";
 	private latestCompaction: PublicCompactionState | undefined;
 	private readonly pendingDecisions = new Map<
 		string,
@@ -337,6 +340,10 @@ export class PiProductSession implements PooledSession {
 					registry,
 				}),
 				createBackendToolExtension(backendBridge),
+				createTransientContextExtension(() => ({
+					sessionContext: productSession?.sessionContext ?? "",
+					transientContext: productSession?.transientContext ?? "",
+				})),
 				{ name: "rag-ime-debug-context", factory: debugContextRecorder.extension() },
 			],
 			noExtensions: true,
@@ -487,7 +494,10 @@ export class PiProductSession implements PooledSession {
 				),
 			},
 		});
-		if (event.type === "agent_settled") this.activeTurn = undefined;
+		if (event.type === "agent_settled") {
+			this.activeTurn = undefined;
+			this.transientContext = "";
+		}
 	}
 
 	private telemetry(
@@ -765,12 +775,18 @@ export class PiProductSession implements PooledSession {
 		message: string;
 		clientMessageId?: string;
 		images?: PromptOptions["images"];
+		sessionContext?: string;
+		transientContext?: string;
 	}): Promise<ActiveTurn> {
 		if (!this.session.isIdle || this.activeTurn) {
 			throw new RuntimeProtocolError("SESSION_BUSY", "Session already has an active turn");
 		}
 		const turn = { turnId: randomUUID(), clientMessageId: options.clientMessageId };
 		this.activeTurn = turn;
+		if (options.sessionContext !== undefined) {
+			this.sessionContext = options.sessionContext.trim();
+		}
+		this.transientContext = options.transientContext?.trim() ?? "";
 		let preflightSettled = false;
 		return new Promise<ActiveTurn>((accept, reject) => {
 			void this.session
@@ -781,13 +797,18 @@ export class PiProductSession implements PooledSession {
 						if (preflightSettled) return;
 						preflightSettled = true;
 						if (success) accept(turn);
-						else reject(new RuntimeProtocolError("PROMPT_REJECTED", "Prompt preflight was rejected"));
+						else {
+							this.activeTurn = undefined;
+							this.transientContext = "";
+							reject(new RuntimeProtocolError("PROMPT_REJECTED", "Prompt preflight was rejected"));
+						}
 					},
 				})
 				.catch((error) => {
 					if (!preflightSettled) {
 						preflightSettled = true;
 						this.activeTurn = undefined;
+						this.transientContext = "";
 						reject(error);
 					}
 				});

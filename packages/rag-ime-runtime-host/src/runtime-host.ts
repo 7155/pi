@@ -21,6 +21,7 @@ import {
 	type RuntimeRequest,
 } from "./protocol.ts";
 import { BoundedSessionPool } from "./session-pool.ts";
+import { decodeRuntimePrompt } from "./transient-context.ts";
 
 const HOST_VERSION = "1.0.0";
 const SESSION_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,199}$/;
@@ -222,6 +223,7 @@ export class RagImeRuntimeHost {
 						conversationRewrite: true,
 						activeTurnMessaging: true,
 						statelessCompletion: true,
+						transientContext: true,
 					},
 				};
 			case "health":
@@ -466,12 +468,16 @@ export class RagImeRuntimeHost {
 			}
 			case "session.rewind":
 				return this.session(params).rewind(requiredString(params, "entryId", 240));
-			case "session.prompt":
+			case "session.prompt": {
+				const prompt = decodeRuntimePrompt(requiredString(params, "message", 1_000_000));
 				return this.session(params).prompt({
-					message: requiredString(params, "message", 1_000_000),
+					message: prompt.message,
+					sessionContext: prompt.sessionContext,
+					transientContext: prompt.transientContext,
 					clientMessageId: optionalString(params, "clientMessageId", 128),
 					images: Array.isArray(params.images) ? (params.images as never) : undefined,
 				});
+			}
 			case "session.steer":
 				return this.session(params).queueMessage({
 					delivery: "steer",

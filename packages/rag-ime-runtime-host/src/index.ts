@@ -6,3 +6,4 @@ export * from "./runtime-host.ts";
 export * from "./runtime-tool-names.ts";
 export * from "./session-pool.ts";
 export * from "./tool-bridge.ts";
+export * from "./transient-context.ts";
