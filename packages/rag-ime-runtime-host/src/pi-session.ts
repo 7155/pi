@@ -17,6 +17,7 @@ import { createDiscoveryToolsExtension, diffSkillCatalog, runtimeSkillCatalogRev
 import { PROTOCOL_VERSION, type RuntimeEventEnvelope, RuntimeProtocolError } from "./protocol.ts";
 import { TOOL_LOAD_TOOL_NAME } from "./runtime-tool-names.ts";
 import type { PooledSession } from "./session-pool.ts";
+import { applySkillRoutingCardCatalog, type SkillRoutingCardCatalog } from "./skill-routing-cards.ts";
 import {
 	type BackendToolBridgeOptions,
 	type BackendToolManifest,
@@ -36,6 +37,11 @@ export interface PiSessionOpenOptions {
 	agentDir: string;
 	activePluginDir: string;
 	skillPaths: string[];
+	piSkillPaths: string[];
+	codexSkillPaths: string[];
+	skillRoutingCards?: SkillRoutingCardCatalog;
+	piSkillsEnabled?: boolean;
+	codexSkillsEnabled?: boolean;
 	modelRuntime: ModelRuntime;
 	provider?: string;
 	modelId?: string;
@@ -71,6 +77,8 @@ export interface PiForkRuntimeProfile {
 	toolManifest: BackendToolManifest[];
 	systemPrompt: string;
 	noContextFiles: boolean;
+	piSkillsEnabled: boolean;
+	codexSkillsEnabled: boolean;
 }
 
 const RAG_USER_QUERY_PATTERN = /<rag-ime-user-query>\s*([\s\S]*?)\s*<\/rag-ime-user-query>/i;
@@ -258,6 +266,8 @@ export class PiProductSession implements PooledSession {
 	readonly cwd: string;
 	readonly toolRegistry: BackendToolRegistry;
 	readonly noContextFiles: boolean;
+	readonly piSkillsEnabled: boolean;
+	readonly codexSkillsEnabled: boolean;
 	private readonly session: AgentSession;
 	private readonly resourceLoader: DefaultResourceLoader;
 	private readonly settingsManager: SettingsManager;
@@ -285,6 +295,8 @@ export class PiProductSession implements PooledSession {
 		this.externalSessionId = options.externalSessionId;
 		this.cwd = options.cwd;
 		this.noContextFiles = options.noContextFiles ?? false;
+		this.piSkillsEnabled = options.piSkillsEnabled ?? false;
+		this.codexSkillsEnabled = options.codexSkillsEnabled ?? false;
 		this.session = session;
 		this.toolRegistry = registry;
 		this.resourceLoader = resourceLoader;
@@ -328,12 +340,21 @@ export class PiProductSession implements PooledSession {
 				return productSession.waitForDecision(kind, targetId, details, signal);
 			},
 		};
+		const selectedSkillPaths = [
+			...options.skillPaths,
+			...(options.piSkillsEnabled ? options.piSkillPaths : []),
+			...(options.codexSkillsEnabled ? options.codexSkillPaths : []),
+		];
 		resourceLoader = new DefaultResourceLoader({
 			cwd: options.cwd,
 			agentDir: options.agentDir,
 			settingsManager,
 			additionalExtensionPaths: [options.activePluginDir],
-			additionalSkillPaths: options.skillPaths,
+			additionalSkillPaths: selectedSkillPaths,
+			// Product and explicitly selected source roots are the complete Skill
+			// boundary. Never fall back to workspace or package auto-discovery.
+			noSkills: true,
+			skillsOverride: (base) => applySkillRoutingCardCatalog(base, options.skillRoutingCards ?? {}),
 			extensionFactories: [
 				createDiscoveryToolsExtension({
 					getResourceLoader,
@@ -603,6 +624,8 @@ export class PiProductSession implements PooledSession {
 			// Compatibility field for older control-center clients.
 			activeBackendTools: this.toolRegistry.disclosed().map((tool) => tool.name),
 			skillCatalogRevision: runtimeSkillCatalogRevision(this.resourceLoader.getSkills().skills),
+			piSkillsEnabled: this.piSkillsEnabled,
+			codexSkillsEnabled: this.codexSkillsEnabled,
 			messages: this.session.messages,
 			entries: this.session.sessionManager.getEntries(),
 			leafId: this.session.sessionManager.getLeafId(),
@@ -706,6 +729,8 @@ export class PiProductSession implements PooledSession {
 			toolManifest: this.toolRegistry.list(),
 			systemPrompt: this.session.systemPrompt,
 			noContextFiles: this.noContextFiles,
+			piSkillsEnabled: this.piSkillsEnabled,
+			codexSkillsEnabled: this.codexSkillsEnabled,
 		};
 	}
 

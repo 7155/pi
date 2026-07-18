@@ -29,8 +29,33 @@ normal session manager.
 Each Session starts with one deterministic model-facing prefix:
 
 - the product Persona/System Prompt;
-- a concise, name-sorted Skill Catalog;
+- a concise, name-sorted product Skill Catalog whose entries contain `name`,
+  `when[]`, `does`, and optional `notFor[]`;
+- an authorized product-tool route catalog containing only `name` and a bounded
+  `does` summary;
 - fixed `skill_search`, `skill_load`, `tool_search`, and `tool_load` schemas.
+
+The Runtime Host package does not own or bundle product Skills. The input-method
+project packages them and supplies their managed paths through
+`RAG_IME_PI_SKILL_PATHS`; those paths are always loaded. Pi and Codex Skills
+are separate, per-session opt-ins (`piSkillsEnabled` and
+`codexSkillsEnabled`) and both default to false. Pi roots default to
+`$PI_CODING_AGENT_DIR/skills` or `~/.pi/agent/skills`. Codex roots default to
+`$CODEX_HOME/skills`, its `.system` subtree, and `~/.agents/skills`. Operators
+may replace those source roots through `RAG_IME_PI_USER_SKILL_PATHS` and
+`RAG_IME_CODEX_SKILL_PATHS`; workspace and package auto-discovery stays off.
+The product-owned `RAG_IME_PI_SKILL_ROUTING_CARDS` file overlays concise
+`when[]`/`does`/`notFor[]` metadata onto legacy external Skills while their full
+bodies remain at the original paths for `skill_load`. When that catalog is
+present, the Host also resolves matching installed Codex plugin Skills from the
+local plugin cache. Cached Skills without a product-owned routing card stay
+hidden, so an unrelated cache entry cannot silently expand context.
+
+Tool disclosure follows the same three levels without mutating the stable
+prefix: the initial route catalog has no parameters, `tool_search` returns the
+full description/profile/risk, and `tool_load` discloses one parameter schema.
+Later registry changes are appended as catalog-change messages rather than
+rewriting earlier context.
 
 OpenAI-compatible Chat Completions requests are stateless, so the physical HTTP
 payload still contains the same active tool schemas on later turns. The full

@@ -5,5 +5,6 @@ export * from "./protocol.ts";
 export * from "./runtime-host.ts";
 export * from "./runtime-tool-names.ts";
 export * from "./session-pool.ts";
+export * from "./skill-routing-cards.ts";
 export * from "./tool-bridge.ts";
 export * from "./transient-context.ts";

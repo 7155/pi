@@ -256,7 +256,10 @@ export {
 	loadSkills,
 	loadSkillsFromDir,
 	type Skill,
+	type SkillCatalogEntry,
 	type SkillFrontmatter,
+	type SkillRoutingCard,
+	skillCatalogEntry,
 	skillCatalogRevision,
 } from "./core/skills.ts";
 export { createSyntheticSourceInfo } from "./core/source-info.ts";

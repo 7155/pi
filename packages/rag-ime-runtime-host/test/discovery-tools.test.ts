@@ -9,6 +9,7 @@ import {
 } from "@earendil-works/pi-coding-agent";
 import { describe, expect, it } from "vitest";
 import {
+	backendToolRouteEntry,
 	createDiscoveryToolsExtension,
 	diffSkillCatalog,
 	loadBackendTool,
@@ -29,11 +30,13 @@ function skill(options: {
 	description: string;
 	filePath?: string;
 	disableModelInvocation?: boolean;
+	routing?: Skill["routing"];
 }): Skill {
 	const filePath = options.filePath ?? `/managed/${options.name}/SKILL.md`;
 	return {
 		name: options.name,
 		description: options.description,
+		routing: options.routing,
 		filePath,
 		baseDir: filePath.slice(0, -"/SKILL.md".length),
 		sourceInfo: createSyntheticSourceInfo(filePath, { source: "test" }),
@@ -66,6 +69,35 @@ describe("runtime discovery tools", () => {
 		expect(searchSkills(skills.slice().reverse(), { query: "" }).catalogRevision).toBe(
 			searchSkills(skills, { query: "" }).catalogRevision,
 		);
+	});
+
+	it("searches structured routing-card fields and returns the exact public card", () => {
+		const skills = [
+			skill({
+				name: "memory-review",
+				description: "Compatibility-only description.",
+				routing: {
+					when: ["用户要求审阅记忆草案", "用户要求回滚已应用草案"],
+					does: "审阅并受控应用长期记忆草案。",
+					notFor: ["普通记忆查询"],
+				},
+			}),
+		];
+
+		const result = searchSkills(skills, { query: "回滚" });
+
+		expect(result).toMatchObject({
+			schemaVersion: "rag-ime.skill-search.v2",
+			items: [
+				{
+					name: "memory-review",
+					when: ["用户要求审阅记忆草案", "用户要求回滚已应用草案"],
+					does: "审阅并受控应用长期记忆草案。",
+					notFor: ["普通记忆查询"],
+				},
+			],
+		});
+		expect(JSON.stringify(result)).not.toContain("Compatibility-only description");
 	});
 
 	it("loads a managed Skill by exact name and strips its frontmatter", async () => {
@@ -109,6 +141,36 @@ describe("runtime discovery tools", () => {
 		});
 	});
 
+	it("treats routing-card edits as catalog changes", () => {
+		const before = [
+			skill({
+				name: "memory-review",
+				description: "Stable compatibility description.",
+				routing: { when: ["用户要求审阅记忆草案"], does: "审阅记忆草案。" },
+			}),
+		];
+		const after = [
+			skill({
+				name: "memory-review",
+				description: "Stable compatibility description.",
+				routing: { when: ["用户要求审阅或回滚记忆草案"], does: "审阅记忆草案。" },
+			}),
+		];
+
+		expect(diffSkillCatalog(before, after).changed).toEqual(["memory-review"]);
+	});
+
+	it("bounds the always-visible tool route entry without exposing its schema", () => {
+		const entry = backendToolRouteEntry({
+			name: "workspace.long-running-operation",
+			description: "Long tool purpose. ".repeat(40),
+			parameters: { type: "object", properties: { secretArgument: { type: "string" } } },
+		});
+
+		expect(Array.from(JSON.stringify(entry)).length).toBeLessThanOrEqual(200);
+		expect(JSON.stringify(entry)).not.toContain("secretArgument");
+	});
+
 	it("registers fixed discovery schemas and searches the live backend catalog", async () => {
 		const registry = new BackendToolRegistry();
 		registry.sync([
@@ -126,12 +188,18 @@ describe("runtime discovery tools", () => {
 		} as unknown as ResourceLoader;
 		const registered = new Map<string, ToolDefinition>();
 		let activeTools: string[] = [];
+		let beforeAgentStart:
+			| ((event: { systemPrompt: string }) => Promise<{ systemPrompt: string } | undefined>)
+			| undefined;
 		const extension = createDiscoveryToolsExtension({
 			getResourceLoader: () => resourceLoader,
 			registry,
 		});
 		if (typeof extension === "function") throw new Error("Expected a named inline extension");
 		await extension.factory({
+			on(event: string, handler: typeof beforeAgentStart) {
+				if (event === "before_agent_start") beforeAgentStart = handler;
+			},
 			registerTool(toolDefinition: ToolDefinition) {
 				registered.set(toolDefinition.name, toolDefinition);
 			},
@@ -150,6 +218,11 @@ describe("runtime discovery tools", () => {
 			TOOL_SEARCH_TOOL_NAME,
 			TOOL_LOAD_TOOL_NAME,
 		]);
+		if (!beforeAgentStart) throw new Error("before_agent_start hook was not registered");
+		const prompt = await beforeAgentStart({ systemPrompt: "base prompt" });
+		expect(prompt?.systemPrompt).toContain('<available_product_tools format="route-jsonl"');
+		expect(prompt?.systemPrompt).toContain('{"name":"memory.query","does":"Query long-term memory."}');
+		expect(prompt?.systemPrompt).not.toContain('"parameters"');
 		const result = searchBackendTools(registry.list(), { query: "memory" }, registry.revision());
 		expect(result.items).toEqual([
 			{

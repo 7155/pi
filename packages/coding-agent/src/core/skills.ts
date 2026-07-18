@@ -14,6 +14,9 @@ const MAX_NAME_LENGTH = 64;
 /** Max description length per spec */
 const MAX_DESCRIPTION_LENGTH = 1024;
 
+/** Max compact routing-card length kept in the always-visible catalog. */
+const MAX_ROUTING_CARD_LENGTH = 200;
+
 const IGNORE_FILE_NAMES = [".gitignore", ".ignore", ".fdignore"];
 
 type IgnoreMatcher = ReturnType<typeof ignore>;
@@ -68,13 +71,30 @@ function addIgnoreRules(ig: IgnoreMatcher, dir: string, rootDir: string): void {
 export interface SkillFrontmatter {
 	name?: string;
 	description?: string;
+	when?: unknown;
+	does?: unknown;
+	notFor?: unknown;
 	"disable-model-invocation"?: boolean;
 	[key: string]: unknown;
 }
 
+export interface SkillRoutingCard {
+	when: string[];
+	does: string;
+	notFor?: string[];
+}
+
+export type SkillCatalogEntry =
+	| ({ name: string } & SkillRoutingCard)
+	| {
+			name: string;
+			description: string;
+	  };
+
 export interface Skill {
 	name: string;
 	description: string;
+	routing?: SkillRoutingCard;
 	filePath: string;
 	baseDir: string;
 	sourceInfo: SourceInfo;
@@ -125,6 +145,53 @@ function validateDescription(description: string | undefined): string[] {
 	}
 
 	return errors;
+}
+
+function routingList(
+	value: unknown,
+	field: "when" | "notFor",
+	required: boolean,
+): { items?: string[]; error?: string } {
+	if (value === undefined && !required) return {};
+	if (!Array.isArray(value) || value.length === 0) {
+		return { error: `${field} must be a non-empty string array` };
+	}
+	const items = value.map((item) => (typeof item === "string" ? item.trim() : ""));
+	if (items.some((item) => item.length === 0)) {
+		return { error: `${field} must contain only non-empty strings` };
+	}
+	return { items: [...new Set(items)] };
+}
+
+function parseRoutingCard(
+	name: string,
+	frontmatter: SkillFrontmatter,
+): { routing?: SkillRoutingCard; errors: string[] } {
+	const hasRouting =
+		frontmatter.when !== undefined || frontmatter.does !== undefined || frontmatter.notFor !== undefined;
+	if (!hasRouting) return { errors: [] };
+
+	const errors: string[] = [];
+	const when = routingList(frontmatter.when, "when", true);
+	if (when.error) errors.push(when.error);
+	const does = typeof frontmatter.does === "string" ? frontmatter.does.trim() : "";
+	if (!does) errors.push("does must be a non-empty string");
+	const notFor = routingList(frontmatter.notFor, "notFor", false);
+	if (notFor.error) errors.push(notFor.error);
+	if (errors.length > 0 || !when.items) return { errors };
+
+	const routing: SkillRoutingCard = {
+		when: when.items,
+		does,
+		...(notFor.items ? { notFor: notFor.items } : {}),
+	};
+	const length = Array.from(JSON.stringify({ name, ...routing })).length;
+	if (length > MAX_ROUTING_CARD_LENGTH) {
+		return {
+			errors: [`routing card exceeds ${MAX_ROUTING_CARD_LENGTH} characters (${length})`],
+		};
+	}
+	return { routing, errors };
 }
 
 export interface LoadSkillsFromDirOptions {
@@ -307,10 +374,19 @@ function loadSkillFromFile(
 			return { skill: null, diagnostics };
 		}
 
+		const routingResult = parseRoutingCard(name, frontmatter);
+		for (const error of routingResult.errors) {
+			diagnostics.push({ type: "warning", message: error, path: filePath });
+		}
+		if (routingResult.errors.length > 0) {
+			return { skill: null, diagnostics };
+		}
+
 		return {
 			skill: {
 				name,
 				description: frontmatter.description,
+				routing: routingResult.routing,
 				filePath,
 				baseDir: skillDir,
 				sourceInfo: createSkillSourceInfo(filePath, skillDir, source),
@@ -343,11 +419,13 @@ function visibleSkillsInStableOrder(skills: Skill[]): Skill[] {
 		.sort((left, right) => left.name.localeCompare(right.name));
 }
 
+export function skillCatalogEntry(skill: Skill): SkillCatalogEntry {
+	if (skill.routing) return { name: skill.name, ...skill.routing };
+	return { name: skill.name, description: skill.description };
+}
+
 export function skillCatalogRevision(skills: Skill[]): string {
-	const catalog = visibleSkillsInStableOrder(skills).map((skill) => ({
-		name: skill.name,
-		description: skill.description,
-	}));
+	const catalog = visibleSkillsInStableOrder(skills).map(skillCatalogEntry);
 	return createHash("sha256").update(JSON.stringify(catalog)).digest("hex");
 }
 
@@ -368,9 +446,12 @@ export function formatSkillsForPrompt(skills: Skill[], options: FormatSkillsForP
 
 	const loadToolName = options.loadToolName ?? "read";
 	const includeLocations = options.includeLocations ?? loadToolName === "read";
-	const catalogTag = options.includeRevision
-		? `<available_skills revision="sha256:${skillCatalogRevision(visibleSkills)}">`
-		: "<available_skills>";
+	const compactRoutingCards = !includeLocations && visibleSkills.every((skill) => skill.routing !== undefined);
+	const catalogAttributes = [
+		...(options.includeRevision ? [`revision="sha256:${skillCatalogRevision(visibleSkills)}"`] : []),
+		...(compactRoutingCards ? ['format="routing-card-jsonl"'] : []),
+	];
+	const catalogTag = `<available_skills${catalogAttributes.length ? ` ${catalogAttributes.join(" ")}` : ""}>`;
 	const lines = ["\n\nThe following skills provide specialized instructions for specific tasks."];
 	if (options.searchToolName) {
 		lines.push(
@@ -378,24 +459,51 @@ export function formatSkillsForPrompt(skills: Skill[], options: FormatSkillsForP
 		);
 	}
 	if (loadToolName === "read") {
-		lines.push("Use the read tool to load a skill's file when the task matches its description.");
+		lines.push("Use the read tool to load a skill's file when the task matches its catalog entry.");
 		lines.push(
 			"When a skill file references a relative path, resolve it against the skill directory (parent of SKILL.md / dirname of the path) and use that absolute path in tool commands.",
 		);
 	} else {
 		lines.push(`Use the ${loadToolName} tool with the exact skill name before following that skill's instructions.`);
-		lines.push("Do not guess or reconstruct a skill body from its catalog description.");
+		lines.push("Do not guess or reconstruct a skill body from its routing card.");
+	}
+	if (compactRoutingCards) {
+		lines.push(
+			"Each JSON line contains name, when[], does, and optional notFor[]; load a skill when any when condition matches and no notFor condition excludes the task.",
+		);
 	}
 	lines.push("", catalogTag);
 
-	for (const skill of visibleSkills) {
-		lines.push("  <skill>");
-		lines.push(`    <name>${escapeXml(skill.name)}</name>`);
-		lines.push(`    <description>${escapeXml(skill.description)}</description>`);
-		if (includeLocations) {
-			lines.push(`    <location>${escapeXml(skill.filePath)}</location>`);
+	if (compactRoutingCards) {
+		for (const skill of visibleSkills) {
+			lines.push(JSON.stringify(skillCatalogEntry(skill)));
 		}
-		lines.push("  </skill>");
+	} else {
+		for (const skill of visibleSkills) {
+			lines.push("  <skill>");
+			lines.push(`    <name>${escapeXml(skill.name)}</name>`);
+			if (skill.routing) {
+				lines.push("    <when>");
+				for (const condition of skill.routing.when) {
+					lines.push(`      <condition>${escapeXml(condition)}</condition>`);
+				}
+				lines.push("    </when>");
+				lines.push(`    <does>${escapeXml(skill.routing.does)}</does>`);
+				if (skill.routing.notFor) {
+					lines.push("    <notFor>");
+					for (const exclusion of skill.routing.notFor) {
+						lines.push(`      <condition>${escapeXml(exclusion)}</condition>`);
+					}
+					lines.push("    </notFor>");
+				}
+			} else {
+				lines.push(`    <description>${escapeXml(skill.description)}</description>`);
+			}
+			if (includeLocations) {
+				lines.push(`    <location>${escapeXml(skill.filePath)}</location>`);
+			}
+			lines.push("  </skill>");
+		}
 	}
 
 	lines.push("</available_skills>");

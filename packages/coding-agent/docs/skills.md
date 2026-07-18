@@ -13,6 +13,7 @@ Pi implements the [Agent Skills standard](https://agentskills.io/specification),
 - [Skill Commands](#skill-commands)
 - [Skill Structure](#skill-structure)
 - [Frontmatter](#frontmatter)
+- [Structured Routing Cards](#structured-routing-cards)
 - [Validation](#validation)
 - [Example](#example)
 - [Skill Repositories](#skill-repositories)
@@ -63,8 +64,8 @@ For project-level Claude Code skills, add to `.pi/settings.json`:
 
 ## How Skills Work
 
-1. At startup, pi scans skill locations and extracts names and descriptions
-2. The system prompt includes available skills in XML format per the [specification](https://agentskills.io/integrate-skills)
+1. At startup, pi scans skill locations and extracts catalog metadata
+2. The system prompt includes descriptions in the standard XML form, or compact structured routing cards when a managed catalog provides them
 3. When a task matches, the agent uses `read` to load the full SKILL.md (models don't always do this; use prompting or `/skill:name` to force it)
 4. The agent follows the instructions, using relative paths to reference scripts and assets
 
@@ -142,6 +143,9 @@ Per the [Agent Skills specification](https://agentskills.io/specification#frontm
 |-------|----------|-------------|
 | `name` | Yes | Max 64 chars. Lowercase a-z, 0-9, hyphens. Unlike the standard, Pi does not require this to match the parent directory because that standard requirement is suboptimal for shared skill directories. |
 | `description` | Yes | Max 1024 chars. What the skill does and when to use it. |
+| `when` | No | Non-empty string array of alternative task conditions. Requires `does`. |
+| `does` | No | One concise statement of the skill's responsibility and result. Requires `when`. |
+| `notFor` | No | Non-empty string array used to exclude easily confused tasks. Requires `when` and `does`. |
 | `license` | No | License name or reference to bundled file. |
 | `compatibility` | No | Max 500 chars. Environment requirements. |
 | `metadata` | No | Arbitrary key-value mapping. |
@@ -173,6 +177,30 @@ Poor:
 description: Helps with PDFs.
 ```
 
+## Structured Routing Cards
+
+Managed catalogs can split routing metadata into the exact fields the model
+needs before loading a Skill body:
+
+```yaml
+---
+name: memory-review
+description: Compatibility description for Agent Skills consumers.
+when:
+  - The user asks to review a memory draft
+  - The user asks to roll back an applied memory draft
+does: Review and apply memory drafts through the governed workflow.
+notFor:
+  - Ordinary memory search
+---
+```
+
+`description` remains required for Agent Skills compatibility but is omitted
+from the model-facing entry when the structured card is valid. With a
+controlled loader such as `skill_load`, structured entries are rendered as
+JSONL containing only `name`, `when`, `does`, and optional `notFor`. Each card
+must fit within 200 characters so the always-visible catalog stays bounded.
+
 ## Validation
 
 Pi validates skills against the Agent Skills standard. Most issues produce warnings but still load the skill:
@@ -184,6 +212,8 @@ Pi validates skills against the Agent Skills standard. Most issues produce warni
 Unknown frontmatter fields are ignored.
 
 **Exception:** Skills with missing description are not loaded.
+Skills that declare any structured routing field are also skipped when the card
+is partial, contains empty values, or exceeds the 200-character catalog budget.
 
 Name collisions (same name from different locations) warn and keep the first skill found.
 
