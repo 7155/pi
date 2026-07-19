@@ -280,3 +280,49 @@ describe("active-turn message queue", () => {
 		});
 	});
 });
+
+describe("manual compaction context refresh", () => {
+	it("reports when the compaction hook already refreshed Session memory", async () => {
+		const productSession = Object.create(PiProductSession.prototype) as PiProductSession;
+		const mutable = productSession as unknown as Record<string, unknown>;
+		Object.assign(mutable, {
+			sessionContextRefreshRevision: 0,
+			session: {
+				isIdle: true,
+				compact: vi.fn(async () => {
+					mutable.sessionContextRefreshRevision = 1;
+					return {
+						summary: "压缩摘要",
+						firstKeptEntryId: "entry-1",
+						tokensBefore: 1200,
+						estimatedTokensAfter: 400,
+					};
+				}),
+			},
+		});
+
+		await expect(productSession.compact()).resolves.toMatchObject({
+			summary: "压缩摘要",
+			contextRefreshApplied: true,
+		});
+	});
+
+	it("reports a missed refresh so the product gateway can use its fallback", async () => {
+		const productSession = Object.create(PiProductSession.prototype) as PiProductSession;
+		Object.assign(productSession as unknown as Record<string, unknown>, {
+			sessionContextRefreshRevision: 0,
+			session: {
+				isIdle: true,
+				compact: vi.fn(async () => ({
+					summary: "压缩摘要",
+					firstKeptEntryId: "entry-1",
+					tokensBefore: 1200,
+				})),
+			},
+		});
+
+		await expect(productSession.compact()).resolves.toMatchObject({
+			contextRefreshApplied: false,
+		});
+	});
+});

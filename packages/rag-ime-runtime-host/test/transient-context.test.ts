@@ -4,6 +4,7 @@ import {
 	formatLocalTimestamp,
 	injectRuntimeContext,
 	injectTransientContext,
+	replaceRuntimeSessionContext,
 	TRANSIENT_CONTEXT_ENVELOPE_PREFIX,
 } from "../src/transient-context.ts";
 
@@ -67,6 +68,76 @@ describe("transient context", () => {
 		expect(first).not.toEqual(second);
 		expect(first).toContain(":30:45");
 		expect(second).toContain(":31:46");
+	});
+
+	it("replaces managed blocks on the next turn instead of duplicating compacted context", () => {
+		const compacted = injectRuntimeContext(
+			"基础角色提示词",
+			{
+				sessionContext: "压缩后的旧注入",
+				transientContext: "上一轮工具证据",
+			},
+			new Date("2026-07-18T15:30:45.000Z"),
+		);
+		const nextTurn = injectRuntimeContext(
+			compacted,
+			{
+				sessionContext: "压缩后的当前记忆",
+				transientContext: "本轮工具证据",
+			},
+			new Date("2026-07-18T15:31:46.000Z"),
+		);
+
+		expect(nextTurn).not.toContain("压缩后的旧注入");
+		expect(nextTurn).not.toContain("上一轮工具证据");
+		expect(nextTurn.match(/type="session_memory"/g)).toHaveLength(1);
+		expect(nextTurn.match(/type="turn_context"/g)).toHaveLength(1);
+		expect(nextTurn).toContain("压缩后的当前记忆");
+		expect(nextTurn).toContain("本轮工具证据");
+		expect(nextTurn).toContain(":31:46");
+	});
+
+	it("atomically replaces Session memory after compaction without duplicating turn context", () => {
+		const before = injectRuntimeContext(
+			"基础角色提示词",
+			{
+				sessionContext: "旧 Session 记忆",
+				transientContext: "本轮工具证据",
+			},
+			new Date("2026-07-18T15:30:45.000Z"),
+		);
+		const after = replaceRuntimeSessionContext(before, "压缩后 Session 记忆", new Date("2026-07-18T15:31:46.000Z"));
+
+		expect(after).not.toContain("旧 Session 记忆");
+		expect(after).toContain("压缩后 Session 记忆");
+		expect(after).toContain("本轮工具证据");
+		expect(after.match(/type="session_memory"/g)).toHaveLength(1);
+		expect(after.match(/type="turn_context"/g)).toHaveLength(1);
+		expect(after).toContain(":31:46");
+	});
+
+	it("repairs duplicate legacy Session blocks while replacing compaction context", () => {
+		const duplicate = [
+			"基础角色提示词",
+			'<rag-ime-context type="session_memory" current_time="2026-07-18T15:30:45+08:00">',
+			"旧记忆一",
+			"</rag-ime-context>",
+			'<rag-ime-context type="turn_context" current_time="2026-07-18T15:30:45+08:00">',
+			"当前回合证据",
+			"</rag-ime-context>",
+			'<rag-ime-context type="session_memory" current_time="2026-07-18T15:30:45+08:00">',
+			"旧记忆二",
+			"</rag-ime-context>",
+		].join("\n");
+
+		const repaired = replaceRuntimeSessionContext(duplicate, "唯一的新记忆", new Date("2026-07-18T15:31:46.000Z"));
+
+		expect(repaired).not.toContain("旧记忆一");
+		expect(repaired).not.toContain("旧记忆二");
+		expect(repaired.match(/type="session_memory"/g)).toHaveLength(1);
+		expect(repaired.match(/type="turn_context"/g)).toHaveLength(1);
+		expect(repaired).toContain("唯一的新记忆");
+		expect(repaired).toContain("当前回合证据");
 	});
 
 	it("rejects malformed envelopes instead of storing them as user text", () => {

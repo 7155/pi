@@ -55,6 +55,7 @@ import type {
 	SessionBeforeForkResult,
 	SessionBeforeSwitchResult,
 	SessionBeforeTreeResult,
+	SessionCompactEventResult,
 	SessionShutdownEvent,
 	ToolCallEvent,
 	ToolCallEventResult,
@@ -154,7 +155,9 @@ type RunnerEmitResult<TEvent extends RunnerEmitEvent> = TEvent extends { type: "
 			? SessionBeforeCompactResult | undefined
 			: TEvent extends { type: "session_before_tree" }
 				? SessionBeforeTreeResult | undefined
-				: undefined;
+				: TEvent extends { type: "session_compact" }
+					? SessionCompactEventResult | undefined
+					: undefined;
 
 export type ExtensionErrorListener = (error: ExtensionError) => void;
 
@@ -757,8 +760,15 @@ export class ExtensionRunner {
 	}
 
 	async emit<TEvent extends RunnerEmitEvent>(event: TEvent): Promise<RunnerEmitResult<TEvent>> {
-		const ctx = this.createContext();
-		let result: SessionBeforeEventResult | undefined;
+		const baseContext = this.createContext();
+		let currentSystemPrompt = event.type === "session_compact" ? baseContext.getSystemPrompt() : undefined;
+		const ctx =
+			event.type === "session_compact"
+				? Object.assign(Object.create(Object.getPrototypeOf(baseContext)), baseContext, {
+						getSystemPrompt: () => currentSystemPrompt ?? "",
+					})
+				: baseContext;
+		let result: SessionBeforeEventResult | SessionCompactEventResult | undefined;
 
 		for (const ext of this.extensions) {
 			const handlers = ext.handlers.get(event.type);
@@ -772,6 +782,12 @@ export class ExtensionRunner {
 						result = handlerResult as SessionBeforeEventResult;
 						if (result.cancel) {
 							return result as RunnerEmitResult<TEvent>;
+						}
+					} else if (event.type === "session_compact" && handlerResult) {
+						const compactResult = handlerResult as SessionCompactEventResult;
+						if (typeof compactResult.systemPrompt === "string") {
+							currentSystemPrompt = compactResult.systemPrompt;
+							result = { systemPrompt: currentSystemPrompt };
 						}
 					}
 				} catch (err) {

@@ -983,4 +983,41 @@ describe("ExtensionRunner", () => {
 			expect(errors[0].error).toContain("header handler boom");
 		});
 	});
+
+	describe("session_compact", () => {
+		it("composes refreshed system prompts for the automatic retry", async () => {
+			fs.writeFileSync(
+				path.join(extensionsDir, "a-context.ts"),
+				`export default function(pi) {
+					pi.on("session_compact", (_event, ctx) => ({
+						systemPrompt: ctx.getSystemPrompt() + "\\nfirst refresh",
+					}));
+				}`,
+			);
+			fs.writeFileSync(
+				path.join(extensionsDir, "b-context.ts"),
+				`export default function(pi) {
+					pi.on("session_compact", (_event, ctx) => ({
+						systemPrompt: ctx.getSystemPrompt() + "\\nsecond refresh",
+					}));
+				}`,
+			);
+			const loaded = await discoverAndLoadExtensions([], tempDir, tempDir);
+			const runner = new ExtensionRunner(loaded.extensions, loaded.runtime, tempDir, sessionManager, modelRegistry);
+			runner.bindCore(extensionActions, {
+				...extensionContextActions,
+				getSystemPrompt: () => "base prompt",
+			});
+
+			const result = await runner.emit({
+				type: "session_compact",
+				compactionEntry: {} as never,
+				fromExtension: false,
+				reason: "overflow",
+				willRetry: true,
+			});
+
+			expect(result?.systemPrompt).toBe("base prompt\nfirst refresh\nsecond refresh");
+		});
+	});
 });

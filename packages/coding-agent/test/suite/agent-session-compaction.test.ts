@@ -127,6 +127,43 @@ describe("AgentSession compaction characterization", () => {
 		expect(harness.session.messages[0]?.role).toBe("compactionSummary");
 	});
 
+	it("applies a post-compaction system prompt returned by an extension", async () => {
+		const harness = await createHarness({
+			settings: { compaction: { keepRecentTokens: 1 } },
+			extensionFactories: [
+				(pi) => {
+					pi.on("session_before_compact", async (event) => ({
+						compaction: {
+							summary: "summary for prompt refresh",
+							firstKeptEntryId: event.preparation.firstKeptEntryId,
+							tokensBefore: event.preparation.tokensBefore,
+							details: {},
+						},
+					}));
+					pi.on("session_compact", async (_event, ctx) => ({
+						systemPrompt: `${ctx.getSystemPrompt()}\nrefreshed after compaction`,
+					}));
+				},
+			],
+		});
+		harnesses.push(harness);
+
+		await harness.session.prompt("one");
+		await harness.session.prompt("two");
+		await harness.session.compact();
+
+		expect(harness.session.systemPrompt).toContain("refreshed after compaction");
+		let providerSystemPrompt = "";
+		harness.setResponses([
+			(context) => {
+				providerSystemPrompt = context.systemPrompt ?? "";
+				return fauxAssistantMessage("continued with refreshed context");
+			},
+		]);
+		await harness.session.prompt("continue after compaction");
+		expect(providerSystemPrompt).toContain("refreshed after compaction");
+	});
+
 	it("throws when compacting without a model", async () => {
 		const harness = await createHarness();
 		harnesses.push(harness);
@@ -155,7 +192,16 @@ describe("AgentSession compaction characterization", () => {
 	});
 
 	it("auto-compacts with a custom streamFn when registry auth is absent", async () => {
-		const harness = await createHarness({ withConfiguredAuth: false });
+		const harness = await createHarness({
+			withConfiguredAuth: false,
+			extensionFactories: [
+				(pi) => {
+					pi.on("session_compact", async (_event, ctx) => ({
+						systemPrompt: `${ctx.getSystemPrompt()}\nauto refresh`,
+					}));
+				},
+			],
+		});
 		harnesses.push(harness);
 		seedCompactableSession(harness);
 		const getStreamCallCount = useSummaryStreamFn(harness, "auto summary from custom stream");
@@ -168,6 +214,27 @@ describe("AgentSession compaction characterization", () => {
 		expect(compactionEntries).toHaveLength(1);
 		expect(compactionEnd?.result?.estimatedTokensAfter).toBeGreaterThan(0);
 		expect(getStreamCallCount()).toBe(1);
+		expect(harness.session.systemPrompt).toContain("auto refresh");
+		let providerSystemPrompt = "";
+		harness.session.agent.streamFn = (model, context) => {
+			providerSystemPrompt = context.systemPrompt ?? "";
+			const stream = createAssistantMessageEventStream();
+			queueMicrotask(() => {
+				stream.push({
+					type: "done",
+					reason: "stop",
+					message: {
+						...fauxAssistantMessage("continued after automatic compaction"),
+						api: model.api,
+						provider: model.provider,
+						model: model.id,
+					},
+				});
+			});
+			return stream;
+		};
+		await harness.session.agent.prompt("continue after automatic compaction");
+		expect(providerSystemPrompt).toContain("auto refresh");
 	});
 
 	it("cancels in-progress manual compaction when abortCompaction is called", async () => {

@@ -599,6 +599,11 @@ export interface SessionCompactEvent {
 	willRetry: boolean;
 }
 
+/** Allows post-compaction extensions to refresh the prompt used by an automatic retry. */
+export interface SessionCompactEventResult {
+	systemPrompt?: string;
+}
+
 /** Fired before an extension runtime is torn down due to quit, reload, or session replacement. */
 export interface SessionShutdownEvent {
 	type: "session_shutdown";
@@ -1181,7 +1186,7 @@ export interface ExtensionAPI {
 		event: "session_before_compact",
 		handler: ExtensionHandler<SessionBeforeCompactEvent, SessionBeforeCompactResult>,
 	): void;
-	on(event: "session_compact", handler: ExtensionHandler<SessionCompactEvent>): void;
+	on(event: "session_compact", handler: ExtensionHandler<SessionCompactEvent, SessionCompactEventResult>): void;
 	on(event: "session_shutdown", handler: ExtensionHandler<SessionShutdownEvent>): void;
 	on(event: "session_before_tree", handler: ExtensionHandler<SessionBeforeTreeEvent, SessionBeforeTreeResult>): void;
 	on(event: "session_tree", handler: ExtensionHandler<SessionTreeEvent>): void;

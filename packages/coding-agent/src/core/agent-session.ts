@@ -1876,13 +1876,17 @@ export class AgentSession {
 				| undefined;
 
 			if (this._extensionRunner && savedCompactionEntry) {
-				await this._extensionRunner.emit({
+				const extensionResult = await this._extensionRunner.emit({
 					type: "session_compact",
 					compactionEntry: savedCompactionEntry,
 					fromExtension,
 					reason: "manual",
 					willRetry: false,
 				});
+				if (extensionResult?.systemPrompt !== undefined) {
+					this._baseSystemPrompt = extensionResult.systemPrompt;
+					this.agent.state.systemPrompt = extensionResult.systemPrompt;
+				}
 			}
 
 			const compactionResult: CompactionResult = {
@@ -2155,13 +2159,17 @@ export class AgentSession {
 				| undefined;
 
 			if (this._extensionRunner && savedCompactionEntry) {
-				await this._extensionRunner.emit({
+				const extensionResult = await this._extensionRunner.emit({
 					type: "session_compact",
 					compactionEntry: savedCompactionEntry,
 					fromExtension,
 					reason,
 					willRetry,
 				});
+				if (extensionResult?.systemPrompt !== undefined) {
+					this._baseSystemPrompt = extensionResult.systemPrompt;
+					this.agent.state.systemPrompt = extensionResult.systemPrompt;
+				}
 			}
 
 			const result: CompactionResult = {

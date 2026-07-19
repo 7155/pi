@@ -26,7 +26,7 @@ export interface BackendToolCatalogDiff {
 	metadataChanged: string[];
 }
 
-interface ToolGatewayResponse {
+export interface ToolGatewayResponse {
 	ok: boolean;
 	result?: Record<string, unknown>;
 	approval?: Record<string, unknown>;
@@ -217,7 +217,7 @@ export interface BackendToolBridgeOptions {
 	): Promise<boolean>;
 }
 
-async function gatewayRequest(
+export async function requestProductGateway(
 	options: BackendToolBridgeOptions,
 	path: string,
 	body: Record<string, unknown>,
@@ -248,7 +248,7 @@ async function executeGatewayTool(
 	args: unknown,
 	signal: AbortSignal | undefined,
 ): Promise<{ content: Array<{ type: "text"; text: string }>; details: unknown }> {
-	const payload = await gatewayRequest(
+	const payload = await requestProductGateway(
 		options,
 		"execute",
 		{
@@ -286,7 +286,7 @@ async function executeGatewayTool(
 		const approved = await options.waitForDecision("approval", approvalId, result, signal);
 		let resolved: Record<string, unknown> = approval;
 		try {
-			const lookup = await gatewayRequest(
+			const lookup = await requestProductGateway(
 				options,
 				"approval-result",
 				{

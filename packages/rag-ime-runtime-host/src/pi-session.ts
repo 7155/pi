@@ -16,6 +16,7 @@ import { PiDebugContextRecorder } from "./debug-context.ts";
 import { createDiscoveryToolsExtension, diffSkillCatalog, runtimeSkillCatalogRevision } from "./discovery-tools.ts";
 import { PROTOCOL_VERSION, type RuntimeEventEnvelope, RuntimeProtocolError } from "./protocol.ts";
 import { TOOL_LOAD_TOOL_NAME } from "./runtime-tool-names.ts";
+import { createSessionContextRefreshExtension } from "./session-context-refresh.ts";
 import type { PooledSession } from "./session-pool.ts";
 import { applySkillRoutingCardCatalog, type SkillRoutingCardCatalog } from "./skill-routing-cards.ts";
 import {
@@ -260,6 +261,24 @@ function publicSessionModel(model: Model<Api>): Record<string, unknown> {
 	};
 }
 
+function recallMessageText(message: Record<string, unknown>): string {
+	const content = message.content;
+	if (typeof content === "string") return content.trim().slice(0, 1200);
+	if (!Array.isArray(content)) return "";
+	return content
+		.filter(
+			(block): block is Record<string, unknown> =>
+				typeof block === "object" &&
+				block !== null &&
+				!Array.isArray(block) &&
+				(block.type === "text" || block.type === "output_text"),
+		)
+		.map((block) => String(block.text ?? "").trim())
+		.filter(Boolean)
+		.join("\n")
+		.slice(0, 1200);
+}
+
 export class PiProductSession implements PooledSession {
 	readonly externalSessionId: string;
 	readonly cwd: string;
@@ -276,6 +295,7 @@ export class PiProductSession implements PooledSession {
 	private sequence = 0;
 	private activeTurn: ActiveTurn | undefined;
 	private sessionContext = "";
+	private sessionContextRefreshRevision = 0;
 	private transientContext = "";
 	private latestCompaction: PublicCompactionState | undefined;
 	private readonly pendingDecisions = new Map<
@@ -360,6 +380,17 @@ export class PiProductSession implements PooledSession {
 					registry,
 				}),
 				createBackendToolExtension(backendBridge),
+				createSessionContextRefreshExtension({
+					bridge: backendBridge,
+					getSessionContext: () => productSession?.sessionContext ?? "",
+					setSessionContext: (value) => {
+						if (productSession) {
+							productSession.sessionContext = value.trim();
+							productSession.sessionContextRefreshRevision += 1;
+						}
+					},
+					getRecentMessages: () => productSession?.recentMessagesForContext() ?? [],
+				}),
 				createTransientContextExtension(() => ({
 					sessionContext: productSession?.sessionContext ?? "",
 					transientContext: productSession?.transientContext ?? "",
@@ -590,6 +621,16 @@ export class PiProductSession implements PooledSession {
 			latestCompaction: this.latestCompaction,
 			updatedAtMs: Date.now(),
 		};
+	}
+
+	private recentMessagesForContext(): Array<{ role: "user" | "assistant"; text: string }> {
+		const result: Array<{ role: "user" | "assistant"; text: string }> = [];
+		for (const message of this.session.messages) {
+			if (message.role !== "user" && message.role !== "assistant") continue;
+			const text = recallMessageText(message as unknown as Record<string, unknown>);
+			if (text) result.push({ role: message.role, text });
+		}
+		return result.slice(-8);
 	}
 
 	private notice(payload: Record<string, unknown>): void {
@@ -878,7 +919,12 @@ export class PiProductSession implements PooledSession {
 		if (!this.session.isIdle) {
 			throw new RuntimeProtocolError("SESSION_BUSY", "Session must be idle before compaction");
 		}
-		return this.session.compact(customInstructions);
+		const refreshRevisionBefore = this.sessionContextRefreshRevision;
+		const result = await this.session.compact(customInstructions);
+		return {
+			...result,
+			contextRefreshApplied: this.sessionContextRefreshRevision > refreshRevisionBefore,
+		};
 	}
 
 	async setModel(provider: string, modelId: string): Promise<Record<string, unknown>> {
