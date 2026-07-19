@@ -48,7 +48,7 @@ export const RUNTIME_PRIMITIVE_CAPABILITIES = Object.freeze({
 		bashProcess: true,
 		continuationTimer: true,
 	}),
-	roomTypes: false,
+	roomTypes: true,
 });
 
 export interface RuntimeHostOptions {
@@ -132,6 +132,14 @@ function optionalTimeoutMs(params: Record<string, unknown>): number {
 	return value;
 }
 
+function requiredGeneration(params: Record<string, unknown>): number {
+	const value = params.generation;
+	if (typeof value !== "number" || !Number.isSafeInteger(value) || value < 0) {
+		throw new RuntimeProtocolError("INVALID_PARAMS", "generation must be a non-negative safe integer");
+	}
+	return value;
+}
+
 function isInside(root: string, candidate: string): boolean {
 	const child = relative(root, candidate);
 	return child === "" || (!child.startsWith(`..${sep}`) && child !== ".." && !pathIsAbsolute(child));
@@ -158,6 +166,7 @@ export class RagImeRuntimeHost {
 	private readonly options: RuntimeHostOptions;
 	private readonly allowedWorkspaceRoots: string[];
 	private readonly completions = new Map<string, AbortController>();
+	private readonly roomReceipts = new Map<string, Record<string, unknown>>();
 
 	private constructor(options: RuntimeHostOptions, modelRuntime: ModelRuntime) {
 		this.options = options;
@@ -555,6 +564,52 @@ export class RagImeRuntimeHost {
 			}
 			case "session.close":
 				return { closed: await this.sessions.close(requiredSessionId(params)) };
+			case "room.dispatch": {
+				const sessionId = requiredSessionId(params);
+				const dispatchId = requiredString(params, "dispatchId", 240);
+				const rootId = requiredString(params, "rootId", 240);
+				const generation = requiredGeneration(params);
+				const idempotencyKey = requiredString(params, "idempotencyKey", 512);
+				const receiptKey = `${rootId}\u001f${idempotencyKey}`;
+				const existing = this.roomReceipts.get(receiptKey);
+				if (existing) return { ...existing, duplicate: true };
+				const accepted = await this.session(params).dispatchRoom({
+					message: requiredString(params, "message", 1_000_000),
+					dispatchId,
+					rootId,
+					generation,
+				});
+				const receipt = {
+					schemaVersion: "wisdom-weasel.room-runtime-receipt.v1",
+					receiptKind: "dispatch_accepted",
+					status: "accepted",
+					rootId,
+					dispatchId,
+					generation,
+					sessionId,
+					...accepted,
+				};
+				this.roomReceipts.set(receiptKey, receipt);
+				return receipt;
+			}
+			case "room.cancel": {
+				const sessionId = requiredSessionId(params);
+				const rootId = requiredString(params, "rootId", 240);
+				const generation = requiredGeneration(params);
+				const target = this.session(params);
+				const cancelled = target.cancelRoom(rootId, generation);
+				if (cancelled.abortRequired) await target.abort();
+				return {
+					schemaVersion: "wisdom-weasel.room-runtime-receipt.v1",
+					receiptKind: "cancel_applied",
+					status: "applied",
+					rootId,
+					generation,
+					sessionId,
+					cancelledContinuationIds: cancelled.cancelledIds,
+					activeRunAborted: cancelled.abortRequired,
+				};
+			}
 			case "approval.resolve":
 				return {
 					requestId: this.session(params).resolveDecision(

@@ -334,6 +334,7 @@ export class PiProductSession implements PooledSession {
 	private unsubscribe: (() => void) | undefined;
 	private sequence = 0;
 	private activeTurn: ActiveTurn | undefined;
+	private activeRoom: { rootId: string; generation: number } | undefined;
 	private sessionContext = "";
 	private sessionContextRefreshRevision = 0;
 	private transientContext = "";
@@ -774,6 +775,7 @@ export class PiProductSession implements PooledSession {
 		});
 		if (event.type === "agent_settled") {
 			this.activeTurn = undefined;
+			this.activeRoom = undefined;
 			this.transientContext = "";
 		}
 	}
@@ -1126,6 +1128,33 @@ export class PiProductSession implements PooledSession {
 			turnId: turn.turnId,
 			clientMessageId: options.clientMessageId,
 			messageQueue: this.messageQueue(),
+		};
+	}
+
+	async dispatchRoom(options: {
+		message: string;
+		dispatchId: string;
+		rootId: string;
+		generation: number;
+	}): Promise<Record<string, unknown>> {
+		if (!this.activeTurn || this.session.isIdle) {
+			const turn = await this.prompt({ message: options.message });
+			this.activeRoom = { rootId: options.rootId, generation: options.generation };
+			return { delivery: "prompt", turnId: turn.turnId };
+		}
+		const continuation = await this.session.followUp(options.message, undefined, {
+			correlationId: options.rootId,
+			cancelGeneration: options.generation,
+			idempotencyKey: options.dispatchId,
+		});
+		return { delivery: "followUp", turnId: this.activeTurn.turnId, continuationId: continuation.id };
+	}
+
+	cancelRoom(rootId: string, generation: number): { cancelledIds: string[]; abortRequired: boolean } {
+		const byCorrelation = this.session.cancelContinuation({ correlationId: rootId }, "room_cancel");
+		return {
+			cancelledIds: byCorrelation.cancelledIds,
+			abortRequired: this.activeRoom?.rootId === rootId && this.activeRoom.generation <= generation,
 		};
 	}
 

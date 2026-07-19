@@ -91,6 +91,22 @@ describe("runtime protocol", () => {
 				params: { sessionId: "source", requestId: "ui-1", response: { confirmed: true } },
 			}),
 		).toMatchObject({ id: "request-11", method: "ui.resolve" });
+		expect(
+			parseRuntimeRequest({
+				protocolVersion: PROTOCOL_VERSION,
+				id: "request-12",
+				method: "room.dispatch",
+				params: { sessionId: "target" },
+			}),
+		).toMatchObject({ id: "request-12", method: "room.dispatch" });
+		expect(
+			parseRuntimeRequest({
+				protocolVersion: PROTOCOL_VERSION,
+				id: "request-13",
+				method: "room.cancel",
+				params: { sessionId: "target" },
+			}),
+		).toMatchObject({ id: "request-13", method: "room.cancel" });
 	});
 
 	it("rejects unknown or unversioned requests", () => {
