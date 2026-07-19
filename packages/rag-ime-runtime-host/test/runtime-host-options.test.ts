@@ -2,7 +2,19 @@ import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { homedir, tmpdir } from "node:os";
 import { delimiter, join, resolve } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { runtimeHostOptionsFromEnvironment } from "../src/runtime-host.ts";
+import { RUNTIME_PRIMITIVE_CAPABILITIES, runtimeHostOptionsFromEnvironment } from "../src/runtime-host.ts";
+
+describe("runtime host primitive capabilities", () => {
+	it("advertises only the product-neutral primitives available in this release", () => {
+		expect(RUNTIME_PRIMITIVE_CAPABILITIES).toEqual({
+			continuationEnvelope: "1",
+			cancelScope: "1",
+			sessionContinuationQueue: false,
+			sessionCancelOperationRegistry: false,
+			roomTypes: false,
+		});
+	});
+});
 
 describe("runtime host managed skills", () => {
 	afterEach(() => vi.unstubAllEnvs());

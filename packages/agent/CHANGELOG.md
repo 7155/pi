@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Added
+
+- Added product-neutral structured continuation queue and cancellation scope primitives for runtime integrations.
+
 ## [0.80.7] - 2026-07-14
 
 ### Added

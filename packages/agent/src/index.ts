@@ -42,5 +42,7 @@ export * from "./harness/utils/shell-output.ts";
 export * from "./harness/utils/truncate.ts";
 // Proxy utilities
 export * from "./proxy.ts";
+// Product-neutral lifecycle primitives
+export * from "./runtime-primitives.ts";
 // Types
 export * from "./types.ts";

@@ -33,6 +33,14 @@ const COMPLETION_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,199}$/;
 const THINKING_LEVELS = new Set<ModelThinkingLevel>(["off", "minimal", "low", "medium", "high", "xhigh", "max"]);
 const STATELESS_THINKING_LEVELS = new Set<ModelThinkingLevel>(["off", "low"]);
 
+export const RUNTIME_PRIMITIVE_CAPABILITIES = Object.freeze({
+	continuationEnvelope: "1",
+	cancelScope: "1",
+	sessionContinuationQueue: false,
+	sessionCancelOperationRegistry: false,
+	roomTypes: false,
+});
+
 export interface RuntimeHostOptions {
 	agentDir: string;
 	sessionDir: string;
@@ -239,6 +247,7 @@ export class RagImeRuntimeHost {
 						activeTurnMessaging: true,
 						statelessCompletion: true,
 						transientContext: true,
+						runtimePrimitives: RUNTIME_PRIMITIVE_CAPABILITIES,
 					},
 				};
 			case "health":
