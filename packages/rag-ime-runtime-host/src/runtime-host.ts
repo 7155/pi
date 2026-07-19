@@ -140,6 +140,27 @@ function requiredGeneration(params: Record<string, unknown>): number {
 	return value;
 }
 
+function optionalRoomCapability(params: Record<string, unknown>): Record<string, unknown> | undefined {
+	const value = params.roomCapability;
+	if (value === undefined || value === null) return undefined;
+	if (typeof value !== "object" || Array.isArray(value)) {
+		throw new RuntimeProtocolError("INVALID_PARAMS", "roomCapability must be an object");
+	}
+	const record = value as Record<string, unknown>;
+	for (const key of ["manifestId", "promptCompileReceiptId", "promptPlanHash"] as const) {
+		if (typeof record[key] !== "string" || !record[key]) {
+			throw new RuntimeProtocolError("INVALID_PARAMS", `roomCapability.${key} is required`);
+		}
+	}
+	if (typeof record.manifestHash !== "string" || !/^[a-f0-9]{64}$/u.test(record.manifestHash)) {
+		throw new RuntimeProtocolError("INVALID_PARAMS", "roomCapability.manifestHash must be sha256 hex");
+	}
+	if (typeof record.capabilityEpoch !== "number" || !Number.isSafeInteger(record.capabilityEpoch) || record.capabilityEpoch < 0) {
+		throw new RuntimeProtocolError("INVALID_PARAMS", "roomCapability.capabilityEpoch is invalid");
+	}
+	return structuredClone(record);
+}
+
 function isInside(root: string, candidate: string): boolean {
 	const child = relative(root, candidate);
 	return child === "" || (!child.startsWith(`..${sep}`) && child !== ".." && !pathIsAbsolute(child));
@@ -443,6 +464,7 @@ export class RagImeRuntimeHost {
 						modelId,
 						thinkingLevel: thinking as ModelThinkingLevel | undefined,
 						toolManifest: params.toolManifest ?? [],
+						roomCapability: optionalRoomCapability(params),
 						toolGatewayUrl: this.options.toolGatewayUrl,
 						toolGatewayToken: this.options.toolGatewayToken,
 						systemPrompt: optionalString(params, "systemPrompt", 64_000),
@@ -493,6 +515,7 @@ export class RagImeRuntimeHost {
 							modelId: profile.modelId,
 							thinkingLevel: profile.thinkingLevel,
 							toolManifest: profile.toolManifest,
+							roomCapability: profile.roomCapability,
 							toolGatewayUrl: this.options.toolGatewayUrl,
 							toolGatewayToken: this.options.toolGatewayToken,
 							systemPrompt: profile.systemPrompt,

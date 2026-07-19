@@ -21,7 +21,7 @@ describe("runtime host primitive capabilities", () => {
 				bashProcess: true,
 				continuationTimer: true,
 			},
-			roomTypes: false,
+			roomTypes: true,
 		});
 	});
 });

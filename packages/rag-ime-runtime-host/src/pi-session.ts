@@ -53,6 +53,7 @@ export interface PiSessionOpenOptions {
 	modelId?: string;
 	thinkingLevel?: NonNullable<CreateAgentSessionOptions["thinkingLevel"]>;
 	toolManifest?: unknown;
+	roomCapability?: Record<string, unknown>;
 	toolGatewayUrl?: string;
 	toolGatewayToken?: string;
 	systemPrompt?: string;
@@ -81,6 +82,7 @@ export interface PiForkRuntimeProfile {
 	modelId?: string;
 	thinkingLevel?: NonNullable<CreateAgentSessionOptions["thinkingLevel"]>;
 	toolManifest: BackendToolManifest[];
+	roomCapability?: Record<string, unknown>;
 	systemPrompt: string;
 	noContextFiles: boolean;
 	piSkillsEnabled: boolean;
@@ -155,7 +157,11 @@ export function restoreBackendToolDisclosures(registry: BackendToolRegistry, ses
 		const details = objectRecord(message.details);
 		const loadedTool = objectRecord(details?.tool);
 		const loadedName = typeof loadedTool?.name === "string" ? loadedTool.name : "";
-		if (registry.get(loadedName)) restored.add(loadedName);
+		if (registry.get(loadedName)) {
+			restored.add(loadedName);
+			const governed = objectRecord(details?.governedReceipt);
+			if (typeof governed?.receiptId === "string") registry.recordLoadReceipt(loadedName, governed.receiptId);
+		}
 	}
 	for (const name of restored) registry.disclose(name);
 	return [...restored].sort();
@@ -326,6 +332,7 @@ export class PiProductSession implements PooledSession {
 	readonly noContextFiles: boolean;
 	readonly piSkillsEnabled: boolean;
 	readonly codexSkillsEnabled: boolean;
+	readonly roomCapability?: Record<string, unknown>;
 	private readonly session: AgentSession;
 	private readonly resourceLoader: DefaultResourceLoader;
 	private readonly settingsManager: SettingsManager;
@@ -366,6 +373,7 @@ export class PiProductSession implements PooledSession {
 		this.noContextFiles = options.noContextFiles ?? false;
 		this.piSkillsEnabled = options.piSkillsEnabled ?? false;
 		this.codexSkillsEnabled = options.codexSkillsEnabled ?? false;
+		this.roomCapability = options.roomCapability ? structuredClone(options.roomCapability) : undefined;
 		this.session = session;
 		this.toolRegistry = registry;
 		this.resourceLoader = resourceLoader;
@@ -404,6 +412,7 @@ export class PiProductSession implements PooledSession {
 			registry,
 			gatewayUrl: options.toolGatewayUrl,
 			gatewayToken: options.toolGatewayToken,
+			roomCapability: options.roomCapability,
 			waitForDecision: (kind, targetId, details, signal) => {
 				if (!productSession) throw new Error("Product session decision bridge is not ready");
 				return productSession.waitForDecision(kind, targetId, details, signal);
@@ -429,6 +438,7 @@ export class PiProductSession implements PooledSession {
 				createDiscoveryToolsExtension({
 					getResourceLoader,
 					registry,
+					gateway: backendBridge,
 				}),
 				createBackendToolExtension(backendBridge),
 				createSessionContextRefreshExtension({
@@ -996,6 +1006,7 @@ export class PiProductSession implements PooledSession {
 			modelId: this.session.model?.id,
 			thinkingLevel: this.session.thinkingLevel,
 			toolManifest: this.toolRegistry.list(),
+			roomCapability: this.roomCapability ? structuredClone(this.roomCapability) : undefined,
 			systemPrompt: this.session.systemPrompt,
 			noContextFiles: this.noContextFiles,
 			piSkillsEnabled: this.piSkillsEnabled,

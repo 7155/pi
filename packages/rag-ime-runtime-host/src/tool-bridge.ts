@@ -42,6 +42,7 @@ interface GatewayFetchResponse {
 export class BackendToolRegistry {
 	private manifest: BackendToolManifest[] = [];
 	private disclosedNames = new Set<string>();
+	private loadReceiptIds = new Map<string, string>();
 
 	list(): BackendToolManifest[] {
 		return structuredClone(this.manifest);
@@ -65,6 +66,16 @@ export class BackendToolRegistry {
 
 	isDisclosed(name: string): boolean {
 		return this.disclosedNames.has(name);
+	}
+
+	recordLoadReceipt(name: string, receiptId: string): void {
+		if (!this.get(name)) throw new RuntimeProtocolError("TOOL_NOT_FOUND", `Unknown product tool: ${name}`);
+		if (!receiptId) throw new RuntimeProtocolError("INVALID_TOOL_RECEIPT", "tool_load receipt id is required");
+		this.loadReceiptIds.set(name, receiptId);
+	}
+
+	loadReceipt(name: string): string | undefined {
+		return this.loadReceiptIds.get(name);
 	}
 
 	revision(): string {
@@ -128,6 +139,7 @@ export class BackendToolRegistry {
 			})
 			.sort((left, right) => left.name.localeCompare(right.name));
 		this.disclosedNames = new Set([...this.disclosedNames].filter((name) => names.has(name)));
+		this.loadReceiptIds = new Map([...this.loadReceiptIds].filter(([name]) => names.has(name)));
 		this.manifest = manifest;
 		return this.list();
 	}
@@ -209,6 +221,7 @@ export interface BackendToolBridgeOptions {
 	registry: BackendToolRegistry;
 	gatewayUrl?: string;
 	gatewayToken?: string;
+	roomCapability?: Record<string, unknown>;
 	waitForDecision?(
 		kind: "approval" | "review",
 		targetId: string,
@@ -257,6 +270,8 @@ async function executeGatewayTool(
 			toolCallId,
 			tool: tool.name,
 			args,
+			...(options.roomCapability ? { roomCapability: options.roomCapability } : {}),
+			...(options.registry.loadReceipt(tool.name) ? { loadReceiptId: options.registry.loadReceipt(tool.name) } : {}),
 		},
 		signal,
 	);

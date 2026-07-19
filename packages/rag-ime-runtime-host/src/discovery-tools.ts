@@ -15,7 +15,13 @@ import {
 	TOOL_LOAD_TOOL_NAME,
 	TOOL_SEARCH_TOOL_NAME,
 } from "./runtime-tool-names.ts";
-import { type BackendToolManifest, type BackendToolRegistry, backendToolSchemaRevision } from "./tool-bridge.ts";
+import {
+	type BackendToolBridgeOptions,
+	type BackendToolManifest,
+	type BackendToolRegistry,
+	backendToolSchemaRevision,
+	requestProductGateway,
+} from "./tool-bridge.ts";
 
 const DEFAULT_RESULT_LIMIT = 8;
 const MAX_RESULT_LIMIT = 20;
@@ -95,6 +101,7 @@ export interface DiscoveryToolsOptions {
 	getResourceLoader(): ResourceLoader;
 	registry: BackendToolRegistry;
 	includeToolSearch?: boolean;
+	gateway?: BackendToolBridgeOptions;
 }
 
 export interface BackendToolRouteEntry {
@@ -356,12 +363,21 @@ export function createDiscoveryToolsExtension(options: DiscoveryToolsOptions): I
 					description: "Search the product tool catalog by name or description without loading parameter schemas.",
 					promptSnippet: "Search the product tool catalog, then use tool_load before calling a result",
 					parameters: TOOL_SEARCH_PARAMETERS,
-					execute: async (_toolCallId, args) => {
-						const result = searchBackendTools(
+					execute: async (toolCallId, args, signal) => {
+						let result = searchBackendTools(
 							options.registry.list(),
 							args as { query?: unknown; limit?: unknown },
 							options.registry.revision(),
 						);
+						if (options.gateway?.roomCapability) {
+							const governed = await requestProductGateway(options.gateway, "search", {
+								sessionId: options.gateway.sessionId,
+								receiptId: `search:${toolCallId}`,
+								query: typeof (args as { query?: unknown }).query === "string" ? (args as { query: string }).query : "",
+								createdAtMs: Date.now(),
+							}, signal);
+							result = governed.result ?? result;
+						}
 						return {
 							content: [{ type: "text", text: JSON.stringify(result) }],
 							details: result,
@@ -375,8 +391,20 @@ export function createDiscoveryToolsExtension(options: DiscoveryToolsOptions): I
 						"Disclose one exact product tool schema to the Provider only when its parameters are needed.",
 					promptSnippet: "Disclose one exact tool schema returned by tool_search before calling it",
 					parameters: TOOL_LOAD_PARAMETERS,
-					execute: async (_toolCallId, args) => {
+					execute: async (toolCallId, args, signal) => {
 						const loaded = loadBackendTool(options.registry, args as { name?: unknown });
+						let governedReceipt: Record<string, unknown> | undefined;
+						if (options.gateway?.roomCapability) {
+							const governed = await requestProductGateway(options.gateway, "load", {
+								sessionId: options.gateway.sessionId,
+								receiptId: `load:${toolCallId}`,
+								toolName: loaded.tool.name,
+								createdAtMs: Date.now(),
+							}, signal);
+							governedReceipt = governed.result;
+							const receiptId = typeof governedReceipt?.receiptId === "string" ? governedReceipt.receiptId : "";
+							options.registry.recordLoadReceipt(loaded.tool.name, receiptId);
+						}
 						const alreadyDisclosed = options.registry.isDisclosed(loaded.tool.name);
 						options.registry.disclose(loaded.tool.name);
 						const activeTools = new Set(pi.getActiveTools());
@@ -405,6 +433,7 @@ export function createDiscoveryToolsExtension(options: DiscoveryToolsOptions): I
 							disclosed: true,
 							alreadyDisclosed,
 							nextCall,
+							...(governedReceipt ? { governedReceipt } : {}),
 						};
 						return {
 							content: [{ type: "text", text: JSON.stringify(providerResult) }],
