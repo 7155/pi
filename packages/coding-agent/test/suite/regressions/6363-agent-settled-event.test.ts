@@ -99,6 +99,76 @@ describe("regression #6363: agent settled event and idle waiting", () => {
 		});
 	});
 
+	it("lists, selectively cancels, and wakes delayed structured continuations", async () => {
+		const harness = await createHarness();
+		harnesses.push(harness);
+		harness.setResponses([fauxAssistantMessage("ready"), fauxAssistantMessage("continued")]);
+		await harness.session.prompt("start");
+
+		await harness.session.followUp("duplicate text", undefined, {
+			id: "by-id",
+			correlationId: "correlation-a",
+			idempotencyKey: "by-id",
+			notBefore: Date.now() + 10_000,
+		});
+		await harness.session.followUp("duplicate text", undefined, {
+			id: "by-correlation",
+			correlationId: "correlation-b",
+			idempotencyKey: "by-correlation",
+			notBefore: Date.now() + 10_000,
+		});
+		expect(harness.session.cancelContinuation({ id: "by-id" }).cancelledIds).toEqual(["by-id"]);
+		expect(harness.session.getFollowUpMessages()).toEqual(["duplicate text"]);
+		expect(harness.session.cancelContinuation({ correlationId: "correlation-b" }).cancelledIds).toEqual([
+			"by-correlation",
+		]);
+		await harness.session.followUp("cancel by generation", undefined, {
+			id: "by-generation",
+			idempotencyKey: "by-generation",
+			cancelGeneration: 0,
+			notBefore: Date.now() + 10_000,
+		});
+		expect(harness.session.cancelContinuation({ generation: 0 }).cancelledIds).toEqual(["by-generation"]);
+
+		await harness.session.followUp("timer delivery", undefined, {
+			id: "timer",
+			idempotencyKey: "timer",
+			notBefore: Date.now() + 20,
+		});
+		expect(harness.session.listContinuations().find((item) => item.id === "timer")?.state).toBe("pending");
+		await harness.session.waitForIdle();
+
+		expect(getUserTexts(harness)).toEqual(["start", "timer delivery"]);
+		expect(harness.session.listContinuations()).toEqual(
+			expect.arrayContaining([
+				expect.objectContaining({ id: "by-id", state: "cancelled" }),
+				expect.objectContaining({ id: "by-correlation", state: "cancelled" }),
+				expect.objectContaining({ id: "by-generation", state: "cancelled" }),
+				expect.objectContaining({ id: "timer", state: "completed", attempt: 1, cancelGeneration: 1 }),
+			]),
+		);
+	});
+
+	it("global abort cancels a delayed continuation before its timer fires", async () => {
+		const harness = await createHarness();
+		harnesses.push(harness);
+		harness.setResponses([fauxAssistantMessage("ready")]);
+		await harness.session.prompt("start");
+		await harness.session.followUp("must not run", undefined, {
+			id: "delayed-abort",
+			idempotencyKey: "delayed-abort",
+			notBefore: Date.now() + 10_000,
+		});
+
+		await harness.session.abort();
+
+		expect(harness.session.isIdle).toBe(true);
+		expect(harness.session.listContinuations()).toContainEqual(
+			expect.objectContaining({ id: "delayed-abort", state: "cancelled", terminalReason: "user_abort" }),
+		);
+		expect(getUserTexts(harness)).toEqual(["start"]);
+	});
+
 	it("extension command waitForIdle waits for session-level settlement", async () => {
 		let releaseTool = () => {};
 		const released = new Promise<void>((resolve) => {

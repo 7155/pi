@@ -82,8 +82,20 @@ describe("ContinuationQueue", () => {
 		queue.enqueue(continuation());
 		queue.enqueue(continuation({ id: "other", correlationId: "correlation-2", idempotencyKey: "other" }));
 
-		expect(queue.cancelCorrelation("correlation-1", "user_stop")).toBe(1);
+		expect(queue.cancelCorrelation("correlation-1", "user_stop").cancelledIds).toEqual(["continuation-1"]);
 		expect(queue.drain({ now: 100, cancelGeneration: 0, limit: 10 }).map((item) => item.id)).toEqual(["other"]);
+	});
+
+	it("completes leases exactly once and supports selective cancellation", () => {
+		const queue = new ContinuationQueue<string>();
+		queue.enqueue(continuation());
+		queue.enqueue(continuation({ id: "same-generation", idempotencyKey: "same-generation" }));
+		const [leased] = queue.drain({ now: 100, cancelGeneration: 0, limit: 1 });
+
+		expect(queue.complete(leased!.id)).toBe(true);
+		expect(queue.complete(leased!.id)).toBe(false);
+		expect(queue.cancelById(leased!.id, "too_late").cancelledIds).toEqual([]);
+		expect(queue.cancelGeneration(0, "generation_stopped").cancelledIds).toEqual(["same-generation"]);
 	});
 });
 

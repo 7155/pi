@@ -5,6 +5,8 @@
 ### Added
 
 - Added product-neutral structured continuation queue and cancellation scope primitives for runtime integrations.
+- Wired `Agent.steer()` and `Agent.followUp()` to structured continuation envelopes with generation fencing,
+  idempotency-key deduplication, selective cancellation, and delayed wakeups.
 
 ## [0.80.7] - 2026-07-14
 

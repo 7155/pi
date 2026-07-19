@@ -17,10 +17,12 @@ import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { basename, dirname } from "node:path";
 import type {
 	Agent,
+	AgentContinuation,
 	AgentEvent,
 	AgentMessage,
 	AgentState,
 	AgentTool,
+	ContinuationOptions,
 	PrepareNextTurnContext,
 	ThinkingLevel,
 } from "@earendil-works/pi-agent-core";
@@ -305,9 +307,10 @@ export class AgentSession {
 	private _resolveIdleWait: (() => void) | undefined;
 
 	/** Tracks pending steering messages for UI display. Removed when delivered. */
-	private _steeringMessages: string[] = [];
+	private _steeringMessages: Array<{ id: string; text: string }> = [];
 	/** Tracks pending follow-up messages for UI display. Removed when delivered. */
-	private _followUpMessages: string[] = [];
+	private _followUpMessages: Array<{ id: string; text: string }> = [];
+	private readonly _continuationIdByMessage = new WeakMap<object, string>();
 	/** Messages queued to be included with the next user prompt as context ("asides"). */
 	private _pendingNextTurnMessages: CustomMessage[] = [];
 
@@ -386,6 +389,9 @@ export class AgentSession {
 		// Always subscribe to agent events for internal handling
 		// (session persistence, extensions, auto-compaction, retry logic)
 		this._unsubscribeAgent = this.agent.subscribe(this._handleAgentEvent);
+		this.agent.onContinuationReady = () => {
+			if (!this._isAgentRunActive) void this._runAgentContinuation();
+		};
 		this._installAgentToolHooks();
 		this._installAgentNextTurnRefresh();
 
@@ -547,8 +553,8 @@ export class AgentSession {
 	private _emitQueueUpdate(): void {
 		this._emit({
 			type: "queue_update",
-			steering: [...this._steeringMessages],
-			followUp: [...this._followUpMessages],
+			steering: this._steeringMessages.map((item) => item.text),
+			followUp: this._followUpMessages.map((item) => item.text),
 		});
 	}
 
@@ -562,7 +568,7 @@ export class AgentSession {
 	}
 
 	private _resolveIdleWaitIfIdle(): void {
-		if (this._isAgentRunActive || !this._resolveIdleWait) {
+		if (!this.isIdle || !this._resolveIdleWait) {
 			return;
 		}
 		const resolve = this._resolveIdleWait;
@@ -600,16 +606,21 @@ export class AgentSession {
 		// This ensures the UI sees the updated queue state
 		if (event.type === "message_start" && event.message.role === "user") {
 			this._overflowRecoveryAttempted = false;
+			const continuationId = this._continuationIdByMessage.get(event.message);
 			const messageText = this._getUserMessageText(event.message);
 			if (messageText) {
 				// Check steering queue first
-				const steeringIndex = this._steeringMessages.indexOf(messageText);
+				const steeringIndex = this._steeringMessages.findIndex((item) =>
+					continuationId ? item.id === continuationId : item.text === messageText,
+				);
 				if (steeringIndex !== -1) {
 					this._steeringMessages.splice(steeringIndex, 1);
 					this._emitQueueUpdate();
 				} else {
 					// Check follow-up queue
-					const followUpIndex = this._followUpMessages.indexOf(messageText);
+					const followUpIndex = this._followUpMessages.findIndex((item) =>
+						continuationId ? item.id === continuationId : item.text === messageText,
+					);
 					if (followUpIndex !== -1) {
 						this._followUpMessages.splice(followUpIndex, 1);
 						this._emitQueueUpdate();
@@ -891,7 +902,7 @@ export class AgentSession {
 
 	/** Whether the session has no active agent run, retry, auto-compaction, or queued continuation. */
 	get isIdle(): boolean {
-		return !this._isAgentRunActive;
+		return !this._isAgentRunActive && !this.agent.hasQueuedMessages();
 	}
 
 	/** Current effective system prompt (includes any per-turn extension modifications) */
@@ -1092,6 +1103,27 @@ export class AgentSession {
 				await this.agent.continue();
 			}
 		} finally {
+			unregisterProvider();
+			this._systemPromptOverride = undefined;
+			this._flushPendingBashMessages();
+			await this._emitAgentSettled(this._settledReceipt(scope));
+			if (this._cancelScope === scope) this._cancelScope = undefined;
+		}
+	}
+
+	private async _runAgentContinuation(): Promise<void> {
+		if (this._isAgentRunActive || !this.agent.hasQueuedMessages()) return;
+		const scope = this._beginCancelScope();
+		const unregisterTimer = this._registerCancelOperation("continuation-timer", "continuation_timer", () => {
+			this.agent.cancelActiveContinuationGeneration("user_abort");
+		});
+		const unregisterProvider = this._registerCancelOperation("provider", "provider", () => this.agent.abort());
+		this._isAgentRunActive = true;
+		try {
+			await this.agent.continue();
+			while (await this._handlePostAgentRun()) await this.agent.continue();
+		} finally {
+			unregisterTimer();
 			unregisterProvider();
 			this._systemPromptOverride = undefined;
 			this._flushPendingBashMessages();
@@ -1402,7 +1434,7 @@ export class AgentSession {
 	 * @param images Optional image attachments to include with the message
 	 * @throws Error if text is an extension command
 	 */
-	async steer(text: string, images?: ImageContent[]): Promise<void> {
+	async steer(text: string, images?: ImageContent[], continuation?: ContinuationOptions): Promise<AgentContinuation> {
 		// Check for extension commands (cannot be queued)
 		if (text.startsWith("/")) {
 			this._throwIfExtensionCommand(text);
@@ -1412,7 +1444,7 @@ export class AgentSession {
 		let expandedText = this._expandSkillCommand(text);
 		expandedText = expandPromptTemplate(expandedText, [...this.promptTemplates]);
 
-		await this._queueSteer(expandedText, images);
+		return await this._queueSteer(expandedText, images, continuation);
 	}
 
 	/**
@@ -1422,7 +1454,11 @@ export class AgentSession {
 	 * @param images Optional image attachments to include with the message
 	 * @throws Error if text is an extension command
 	 */
-	async followUp(text: string, images?: ImageContent[]): Promise<void> {
+	async followUp(
+		text: string,
+		images?: ImageContent[],
+		continuation?: ContinuationOptions,
+	): Promise<AgentContinuation> {
 		// Check for extension commands (cannot be queued)
 		if (text.startsWith("/")) {
 			this._throwIfExtensionCommand(text);
@@ -1432,41 +1468,65 @@ export class AgentSession {
 		let expandedText = this._expandSkillCommand(text);
 		expandedText = expandPromptTemplate(expandedText, [...this.promptTemplates]);
 
-		await this._queueFollowUp(expandedText, images);
+		return await this._queueFollowUp(expandedText, images, continuation);
 	}
 
 	/**
 	 * Internal: Queue a steering message (already expanded, no extension command check).
 	 */
-	private async _queueSteer(text: string, images?: ImageContent[]): Promise<void> {
-		this._steeringMessages.push(text);
-		this._emitQueueUpdate();
+	private async _queueSteer(
+		text: string,
+		images?: ImageContent[],
+		continuation?: ContinuationOptions,
+	): Promise<AgentContinuation> {
 		const content: (TextContent | ImageContent)[] = [{ type: "text", text }];
 		if (images) {
 			content.push(...images);
 		}
-		this.agent.steer({
-			role: "user",
-			content,
-			timestamp: Date.now(),
-		});
+		const existingIds = new Set(this.agent.listContinuations().map((item) => item.id));
+		const admitted = this.agent.steer(
+			{
+				role: "user",
+				content,
+				timestamp: Date.now(),
+			},
+			continuation,
+		);
+		if (!existingIds.has(admitted.id)) {
+			this._steeringMessages.push({ id: admitted.id, text });
+			this._continuationIdByMessage.set(admitted.payload, admitted.id);
+			this._emitQueueUpdate();
+		}
+		return admitted;
 	}
 
 	/**
 	 * Internal: Queue a follow-up message (already expanded, no extension command check).
 	 */
-	private async _queueFollowUp(text: string, images?: ImageContent[]): Promise<void> {
-		this._followUpMessages.push(text);
-		this._emitQueueUpdate();
+	private async _queueFollowUp(
+		text: string,
+		images?: ImageContent[],
+		continuation?: ContinuationOptions,
+	): Promise<AgentContinuation> {
 		const content: (TextContent | ImageContent)[] = [{ type: "text", text }];
 		if (images) {
 			content.push(...images);
 		}
-		this.agent.followUp({
-			role: "user",
-			content,
-			timestamp: Date.now(),
-		});
+		const existingIds = new Set(this.agent.listContinuations().map((item) => item.id));
+		const admitted = this.agent.followUp(
+			{
+				role: "user",
+				content,
+				timestamp: Date.now(),
+			},
+			continuation,
+		);
+		if (!existingIds.has(admitted.id)) {
+			this._followUpMessages.push({ id: admitted.id, text });
+			this._continuationIdByMessage.set(admitted.payload, admitted.id);
+			this._emitQueueUpdate();
+		}
+		return admitted;
 	}
 
 	/**
@@ -1578,8 +1638,8 @@ export class AgentSession {
 	 * @returns Object with steering and followUp arrays
 	 */
 	clearQueue(): { steering: string[]; followUp: string[] } {
-		const steering = [...this._steeringMessages];
-		const followUp = [...this._followUpMessages];
+		const steering = this._steeringMessages.map((item) => item.text);
+		const followUp = this._followUpMessages.map((item) => item.text);
 		this._steeringMessages = [];
 		this._followUpMessages = [];
 		this.agent.clearAllQueues();
@@ -1592,14 +1652,43 @@ export class AgentSession {
 		return this._steeringMessages.length + this._followUpMessages.length;
 	}
 
+	listContinuations(): AgentContinuation[] {
+		return this.agent.listContinuations();
+	}
+
+	cancelContinuation(
+		selector: { id?: string; correlationId?: string; generation?: number },
+		reason = "rpc_cancel",
+	): { cancelledIds: string[] } {
+		const receipt = this.agent.cancelContinuation(selector, reason);
+		this._applyContinuationCancellation(receipt);
+		return receipt;
+	}
+
+	private _applyContinuationCancellation(receipt: { cancelledIds: string[] }): void {
+		if (receipt.cancelledIds.length > 0) {
+			const cancelled = new Set(receipt.cancelledIds);
+			const activeIds = new Set(
+				this.agent
+					.listContinuations()
+					.filter((item) => item.state === "pending" && !cancelled.has(item.id))
+					.map((item) => item.id),
+			);
+			this._steeringMessages = this._steeringMessages.filter((item) => activeIds.has(item.id));
+			this._followUpMessages = this._followUpMessages.filter((item) => activeIds.has(item.id));
+			this._emitQueueUpdate();
+		}
+		this._resolveIdleWaitIfIdle();
+	}
+
 	/** Get pending steering messages (read-only) */
 	getSteeringMessages(): readonly string[] {
-		return this._steeringMessages;
+		return this._steeringMessages.map((item) => item.text);
 	}
 
 	/** Get pending follow-up messages (read-only) */
 	getFollowUpMessages(): readonly string[] {
-		return this._followUpMessages;
+		return this._followUpMessages.map((item) => item.text);
 	}
 
 	get resourceLoader(): ResourceLoader {
@@ -1611,6 +1700,7 @@ export class AgentSession {
 	 */
 	async abort(): Promise<void> {
 		await this._cancelScope?.cancel("user_abort");
+		this._applyContinuationCancellation(this.agent.cancelActiveContinuationGeneration("user_abort"));
 		this.abortRetry();
 		this.agent.abort();
 		await this.waitForIdle();

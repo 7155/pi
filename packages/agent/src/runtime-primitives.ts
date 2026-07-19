@@ -36,6 +36,10 @@ export interface ContinuationQueueSnapshot<TPayload> {
 	items: ContinuationEnvelope<TPayload>[];
 }
 
+export interface ContinuationCancelReceipt {
+	cancelledIds: string[];
+}
+
 function validateEnvelope<TPayload>(envelope: ContinuationEnvelope<TPayload>): void {
 	for (const [name, value] of [
 		["id", envelope.id],
@@ -108,8 +112,7 @@ export class ContinuationQueue<TPayload = unknown> {
 		}
 
 		eligible.sort(
-			(left, right) =>
-				right.priority - left.priority || left.createdAt - right.createdAt || left.id.localeCompare(right.id),
+			(left, right) => right.priority - left.priority || left.createdAt - right.createdAt,
 		);
 		return eligible.slice(0, options.limit).map((item) => {
 			item.state = "leased";
@@ -118,19 +121,42 @@ export class ContinuationQueue<TPayload = unknown> {
 		});
 	}
 
-	cancelCorrelation(correlationId: string, reason: string): number {
-		let count = 0;
-		for (const item of this.items.values()) {
-			if (item.correlationId !== correlationId || item.state !== "pending") continue;
-			item.state = "cancelled";
-			item.terminalReason = reason;
-			count += 1;
-		}
-		return count;
+	complete(id: string): boolean {
+		const item = this.items.get(id);
+		if (!item || item.state !== "leased") return false;
+		item.state = "completed";
+		return true;
+	}
+
+	cancelById(id: string, reason: string): ContinuationCancelReceipt {
+		return this.cancelWhere((item) => item.id === id, reason);
+	}
+
+	cancelCorrelation(correlationId: string, reason: string): ContinuationCancelReceipt {
+		return this.cancelWhere((item) => item.correlationId === correlationId, reason);
+	}
+
+	cancelGeneration(generation: number, reason: string): ContinuationCancelReceipt {
+		return this.cancelWhere((item) => item.cancelGeneration === generation, reason);
 	}
 
 	snapshot(): ContinuationQueueSnapshot<TPayload> {
 		return { items: [...this.items.values()].map((item) => ({ ...item })) };
+	}
+
+	private cancelWhere(
+		predicate: (item: ContinuationEnvelope<TPayload>) => boolean,
+		reason: string,
+	): ContinuationCancelReceipt {
+		if (!reason.trim()) throw new Error("cancel reason must be a non-empty string");
+		const cancelledIds: string[] = [];
+		for (const item of this.items.values()) {
+			if (!predicate(item) || (item.state !== "pending" && item.state !== "leased")) continue;
+			item.state = "cancelled";
+			item.terminalReason = reason;
+			cancelledIds.push(item.id);
+		}
+		return { cancelledIds };
 	}
 }
 

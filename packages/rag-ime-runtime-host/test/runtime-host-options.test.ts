@@ -9,17 +9,17 @@ describe("runtime host primitive capabilities", () => {
 		expect(RUNTIME_PRIMITIVE_CAPABILITIES).toEqual({
 			continuationEnvelope: "1",
 			cancelScope: "1",
-			sessionContinuationQueue: false,
-			sessionCancelOperationRegistry: false,
+			sessionContinuationQueue: true,
+			sessionCancelOperationRegistry: true,
 			sessionCancelOperations: {
 				provider: true,
 				tool: true,
 				retrySleep: true,
 				manualCompaction: true,
 				autoCompaction: true,
-				branchSummary: false,
+				branchSummary: true,
 				bashProcess: true,
-				continuationTimer: false,
+				continuationTimer: true,
 			},
 			roomTypes: false,
 		});

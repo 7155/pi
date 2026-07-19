@@ -288,7 +288,12 @@ describe("AgentSession concurrent prompt guard", () => {
 		await session.abort();
 		await firstPrompt.catch(() => {});
 
-		expect(sawSteeringMessage).toBe(true);
+		// Global abort fences queued continuations as well as the active Provider call.
+		expect(sawSteeringMessage).toBe(false);
+		expect(session.pendingMessageCount).toBe(0);
+		expect(session.listContinuations()).toContainEqual(
+			expect.objectContaining({ state: "cancelled", terminalReason: "user_abort" }),
+		);
 	});
 
 	it("should allow prompt() after previous completes", async () => {

@@ -415,13 +415,13 @@ export async function runRpcMode(runtimeHost: AgentSessionRuntime): Promise<neve
 			}
 
 			case "steer": {
-				await session.steer(command.message, command.images);
-				return success(id, "steer");
+				const continuation = await session.steer(command.message, command.images, command.continuation);
+				return success(id, "steer", continuation);
 			}
 
 			case "follow_up": {
-				await session.followUp(command.message, command.images);
-				return success(id, "follow_up");
+				const continuation = await session.followUp(command.message, command.images, command.continuation);
+				return success(id, "follow_up", continuation);
 			}
 
 			case "abort": {
@@ -459,6 +459,21 @@ export async function runRpcMode(runtimeHost: AgentSessionRuntime): Promise<neve
 					runtimeLifecycle: session.getRuntimeLifecycleSnapshot(),
 				};
 				return success(id, "get_state", state);
+			}
+
+			case "list_continuations":
+				return success(id, "list_continuations", session.listContinuations());
+
+			case "cancel_continuation": {
+				const data = session.cancelContinuation(
+					{
+						id: command.continuationId,
+						correlationId: command.correlationId,
+						generation: command.generation,
+					},
+					command.reason ?? "rpc_cancel",
+				);
+				return success(id, "cancel_continuation", data);
 			}
 
 			// =================================================================

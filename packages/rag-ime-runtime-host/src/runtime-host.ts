@@ -36,17 +36,17 @@ const STATELESS_THINKING_LEVELS = new Set<ModelThinkingLevel>(["off", "low"]);
 export const RUNTIME_PRIMITIVE_CAPABILITIES = Object.freeze({
 	continuationEnvelope: "1",
 	cancelScope: "1",
-	sessionContinuationQueue: false,
-	sessionCancelOperationRegistry: false,
+	sessionContinuationQueue: true,
+	sessionCancelOperationRegistry: true,
 	sessionCancelOperations: Object.freeze({
 		provider: true,
 		tool: true,
 		retrySleep: true,
 		manualCompaction: true,
 		autoCompaction: true,
-		branchSummary: false,
+		branchSummary: true,
 		bashProcess: true,
-		continuationTimer: false,
+		continuationTimer: true,
 	}),
 	roomTypes: false,
 });
