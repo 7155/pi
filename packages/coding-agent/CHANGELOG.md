@@ -13,6 +13,7 @@
 ### Added
 
 - Added run-scoped cancellation receipts and provider, tool, and retry operation registration to `AgentSession` and RPC state.
+- Added cancellation-scope registration for manual and automatic compaction, branch summarization, and standalone bash execution.
 - Added compact Skill routing cards with `when[]`, `does`, and optional `notFor[]` metadata for bounded managed catalogs.
 - Added `ModelRuntime` as the canonical async SDK and internal model/auth facade while preserving the synchronous extension-facing `ModelRegistry` API. `ModelRuntime.create()` accepts any pi-ai `CredentialStore` through its `credentials` option.
 - Added provider-owned `/login` discovery directly from registered pi-ai providers, including ambient auth status and informational links.

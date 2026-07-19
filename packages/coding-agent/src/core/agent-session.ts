@@ -1127,6 +1127,21 @@ export class AgentSession {
 		};
 	}
 
+	private _beginOperationScope(kind: string): { scope: CancelScope; owned: boolean } {
+		if (this._cancelScope && !this._cancelScope.signal.aborted) {
+			return { scope: this._cancelScope, owned: false };
+		}
+		const scope = this._beginCancelScope();
+		this._cancelOperationCounts.set(kind, 0);
+		return { scope, owned: true };
+	}
+
+	private _finishOperationScope(scope: CancelScope, owned: boolean): void {
+		if (!owned) return;
+		this._lastSettledReceipt = this._settledReceipt(scope);
+		if (this._cancelScope === scope) this._cancelScope = undefined;
+	}
+
 	private async _handlePostAgentRun(): Promise<boolean> {
 		const msg = this._lastAssistantMessage;
 		this._lastAssistantMessage = undefined;
@@ -1849,7 +1864,11 @@ export class AgentSession {
 	async compact(customInstructions?: string): Promise<CompactionResult> {
 		this._disconnectFromAgent();
 		await this.abort();
+		const operationScope = this._beginOperationScope("manual_compaction");
 		this._compactionAbortController = new AbortController();
+		const unregisterCompaction = this._registerCancelOperation("manual-compaction", "manual_compaction", () =>
+			this._compactionAbortController?.abort(),
+		);
 		this._emit({ type: "compaction_start", reason: "manual" });
 
 		try {
@@ -1983,7 +2002,9 @@ export class AgentSession {
 			});
 			throw error;
 		} finally {
+			unregisterCompaction();
 			this._compactionAbortController = undefined;
+			this._finishOperationScope(operationScope.scope, operationScope.owned);
 			this._reconnectToAgent();
 		}
 	}
@@ -2111,6 +2132,7 @@ export class AgentSession {
 	private async _runAutoCompaction(reason: "overflow" | "threshold", willRetry: boolean): Promise<boolean> {
 		const settings = this.settingsManager.getCompactionSettings();
 		let started = false;
+		let unregisterAutoCompaction = () => {};
 
 		try {
 			if (!this.model) {
@@ -2139,6 +2161,9 @@ export class AgentSession {
 
 			this._emit({ type: "compaction_start", reason });
 			this._autoCompactionAbortController = new AbortController();
+			unregisterAutoCompaction = this._registerCancelOperation("auto-compaction", "auto_compaction", () =>
+				this._autoCompactionAbortController?.abort(),
+			);
 			started = true;
 
 			let extensionCompaction: CompactionResult | undefined;
@@ -2276,6 +2301,7 @@ export class AgentSession {
 			}
 			return false;
 		} finally {
+			unregisterAutoCompaction();
 			this._autoCompactionAbortController = undefined;
 		}
 	}
@@ -2801,6 +2827,10 @@ export class AgentSession {
 		options?: { excludeFromContext?: boolean; operations?: BashOperations },
 	): Promise<BashResult> {
 		this._bashAbortController = new AbortController();
+		const operationScope = this._beginOperationScope("bash_process");
+		const unregisterBash = this._registerCancelOperation("bash-process", "bash_process", () =>
+			this._bashAbortController?.abort(),
+		);
 
 		// Apply command prefix if configured (e.g., "shopt -s expand_aliases" for alias support)
 		const prefix = this.settingsManager.getShellCommandPrefix();
@@ -2821,7 +2851,9 @@ export class AgentSession {
 			this.recordBashResult(command, result, options);
 			return result;
 		} finally {
+			unregisterBash();
 			this._bashAbortController = undefined;
+			this._finishOperationScope(operationScope.scope, operationScope.owned);
 		}
 	}
 
@@ -2965,6 +2997,10 @@ export class AgentSession {
 
 		// Set up abort controller for summarization
 		this._branchSummaryAbortController = new AbortController();
+		const operationScope = this._beginOperationScope("branch_summary");
+		const unregisterBranchSummary = this._registerCancelOperation("branch-summary", "branch_summary", () =>
+			this._branchSummaryAbortController?.abort(),
+		);
 
 		try {
 			let extensionSummary: { summary: string; details?: unknown } | undefined;
@@ -3103,7 +3139,9 @@ export class AgentSession {
 
 			return { editorText, cancelled: false, summaryEntry };
 		} finally {
+			unregisterBranchSummary();
 			this._branchSummaryAbortController = undefined;
+			this._finishOperationScope(operationScope.scope, operationScope.owned);
 		}
 	}
 
