@@ -1,8 +1,7 @@
 import { existsSync, readdirSync } from "node:fs";
 import { mkdir, realpath, rm, stat } from "node:fs/promises";
 import { homedir } from "node:os";
-import { delimiter, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
-import { fileURLToPath } from "node:url";
+import { delimiter, join, isAbsolute as pathIsAbsolute, relative, resolve, sep } from "node:path";
 import {
 	type Api,
 	type Context,
@@ -21,12 +20,12 @@ import {
 	type RuntimeRequest,
 } from "./protocol.ts";
 import { BoundedSessionPool } from "./session-pool.ts";
-import { decodeRuntimePrompt } from "./transient-context.ts";
 import {
 	codexPluginSkillCatalogNames,
 	loadSkillRoutingCardCatalog,
 	type SkillRoutingCardCatalog,
 } from "./skill-routing-cards.ts";
+import { decodeRuntimePrompt } from "./transient-context.ts";
 
 const HOST_VERSION = "1.0.0";
 const SESSION_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,199}$/;
@@ -109,7 +108,7 @@ function optionalTimeoutMs(params: Record<string, unknown>): number {
 
 function isInside(root: string, candidate: string): boolean {
 	const child = relative(root, candidate);
-	return child === "" || (!child.startsWith(`..${sep}`) && child !== ".." && !isAbsolute(child));
+	return child === "" || (!child.startsWith(`..${sep}`) && child !== ".." && !pathIsAbsolute(child));
 }
 
 function publicModel(model: ReturnType<ModelRuntime["getModels"]>[number]): Record<string, unknown> {

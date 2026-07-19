@@ -1,0 +1,226 @@
+import { afterEach, describe, expect, it, vi } from "vitest";
+import { createLifecycleHookController } from "../src/lifecycle-hooks.ts";
+
+type Handler = (event: unknown, context?: unknown) => unknown;
+
+function fetchBody(mock: unknown, index: number): Record<string, unknown> {
+	const calls = (mock as { mock: { calls: unknown[][] } }).mock.calls;
+	const init = calls[index]?.[1] as { body?: unknown } | undefined;
+	return JSON.parse(String(init?.body)) as Record<string, unknown>;
+}
+
+describe("lifecycle hooks", () => {
+	afterEach(() => vi.unstubAllGlobals());
+
+	it("delivers governed next-turn context and emits bounded lifecycle events", async () => {
+		const fetchMock = vi
+			.fn()
+			.mockResolvedValueOnce({
+				ok: true,
+				status: 200,
+				json: async () => ({
+					ok: true,
+					result: {
+						nextTurnContext: "## 项目收尾\n仅在存在稳定事实时调用记忆工具；无事实则跳过。",
+						idleDelayMs: 60_000,
+					},
+				}),
+			})
+			.mockResolvedValue({
+				ok: true,
+				status: 200,
+				json: async () => ({ ok: true, result: { idleDelayMs: 60_000 } }),
+			});
+		vi.stubGlobal("fetch", fetchMock);
+		const handlers = new Map<string, Handler>();
+		let idleCallback: (() => void) | undefined;
+		const controller = createLifecycleHookController({
+			bridge: {
+				sessionId: "agent:hooks",
+				registry: {} as never,
+				gatewayUrl: "http://127.0.0.1:8766/api/agent/tool/execute",
+				gatewayToken: "token",
+			},
+			now: () => new Date("2026-07-19T02:00:00.000Z"),
+			setTimer: ((callback: () => void) => {
+				idleCallback = callback;
+				return 1;
+			}) as unknown as typeof setTimeout,
+			clearTimer: (() => undefined) as typeof clearTimeout,
+		});
+		controller.extension({
+			on: (name: string, handler: Handler) => handlers.set(name, handler),
+		} as never);
+
+		const start = (await handlers.get("before_agent_start")?.({
+			prompt: "完成插件前端",
+			systemPrompt: "基础提示词",
+		})) as { systemPrompt?: string };
+		expect(start.systemPrompt).toContain('type="lifecycle_hook"');
+		expect(start.systemPrompt).toContain("无事实则跳过");
+		const firstBody = fetchBody(fetchMock, 0);
+		expect(firstBody.eventType).toBe("session_start");
+		expect(firstBody.eventId).toMatch(/^lifecycle:session_start:[a-f0-9]{40}$/);
+		expect(firstBody.payload).not.toHaveProperty("prompt");
+		expect(firstBody.payload.promptSha256).toMatch(/^[a-f0-9]{64}$/);
+
+		await handlers.get("turn_end")?.({
+			turnIndex: 0,
+			message: { content: [{ type: "text", text: "已完成实现。" }] },
+			toolResults: [],
+		});
+		expect(idleCallback).toBeTypeOf("function");
+		idleCallback?.();
+		await vi.waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(3));
+		const idleBody = fetchBody(fetchMock, 2);
+		expect(idleBody.eventType).toBe("idle");
+		expect(idleBody.payload).toMatchObject({
+			auditOnly: true,
+			facts: [],
+			reason: "no_governed_fact_candidate",
+		});
+	});
+
+	it("reports tool failures without replacing the original result", async () => {
+		const fetchMock = vi.fn(async () => ({
+			ok: true,
+			status: 200,
+			json: async () => ({ ok: true, result: {} }),
+		}));
+		vi.stubGlobal("fetch", fetchMock);
+		const handlers = new Map<string, Handler>();
+		const controller = createLifecycleHookController({
+			bridge: {
+				sessionId: "agent:failed-tool",
+				registry: {} as never,
+				gatewayUrl: "http://127.0.0.1:8766/api/agent/tool/execute",
+			},
+		});
+		controller.extension({
+			on: (name: string, handler: Handler) => handlers.set(name, handler),
+		} as never);
+
+		const result = await handlers.get("tool_result")?.({
+			toolName: "workspace_shell",
+			toolCallId: "tool-1",
+			input: { command: "private command" },
+			content: [
+				{
+					type: "text",
+					text: "command failed: /Users/undo/private --token secret-token",
+				},
+			],
+			isError: true,
+		});
+		expect(result).toBeUndefined();
+		const body = fetchBody(fetchMock, 0);
+		expect(body.eventType).toBe("tool_failed");
+		expect(body.payload).not.toHaveProperty("input");
+		expect(body.payload).not.toHaveProperty("toolCallId");
+		expect(body.payload.inputSha256).toMatch(/^[a-f0-9]{64}$/);
+		expect(body.payload.toolCallIdSha256).toMatch(/^[a-f0-9]{64}$/);
+		expect(body.payload.errorSummary).toBe("Tool error details redacted by Runtime Host.");
+		expect(body.payload.errorSha256).toMatch(/^[a-f0-9]{64}$/);
+		expect(JSON.stringify(body)).not.toContain("private command");
+		expect(JSON.stringify(body)).not.toContain("/Users/undo/private");
+		expect(JSON.stringify(body)).not.toContain("secret-token");
+		expect(body.payload.facts).toEqual([
+			{
+				text: "workspace_shell failed; raw error details were redacted.",
+				evidence: `tool-error-sha256:${body.payload.errorSha256}`,
+			},
+		]);
+		await handlers.get("tool_result")?.({
+			toolName: "workspace_shell",
+			toolCallId: "tool-1",
+			input: { command: "private command" },
+			content: [{ type: "text", text: "command failed: /Users/undo/private --token secret-token" }],
+			isError: true,
+		});
+		expect(fetchBody(fetchMock, 1).eventId).toBe(body.eventId);
+	});
+
+	it("retries the same stable completion event before the next available hook request", async () => {
+		const fetchMock = vi
+			.fn()
+			.mockRejectedValueOnce(new Error("sidecar unavailable"))
+			.mockResolvedValue({
+				ok: true,
+				status: 200,
+				json: async () => ({ ok: true, result: {} }),
+			});
+		vi.stubGlobal("fetch", fetchMock);
+		const handlers = new Map<string, Handler>();
+		const controller = createLifecycleHookController({
+			bridge: {
+				sessionId: "agent:retry",
+				registry: {} as never,
+				gatewayUrl: "http://127.0.0.1:8766/api/agent/tool/execute",
+			},
+		});
+		controller.extension({
+			on: (name: string, handler: Handler) => handlers.set(name, handler),
+		} as never);
+
+		await controller.projectComplete({
+			completionKey: "goal:retry",
+			plan: { id: "plan:retry", title: "Retry delivery", status: "completed", revision: 1 },
+			goal: {},
+		});
+		await handlers.get("before_agent_start")?.({ prompt: "continue", systemPrompt: "base" });
+
+		expect(fetchMock).toHaveBeenCalledTimes(3);
+		const failedBody = fetchBody(fetchMock, 0);
+		const retriedBody = fetchBody(fetchMock, 1);
+		expect(failedBody.eventType).toBe("project_complete");
+		expect(retriedBody.eventType).toBe("project_complete");
+		expect(retriedBody.eventId).toBe(failedBody.eventId);
+		expect(fetchBody(fetchMock, 2).eventType).toBe("session_start");
+	});
+
+	it("turns a durable Goal completion audit into review facts, not a direct memory write", async () => {
+		const fetchMock = vi.fn(async () => ({
+			ok: true,
+			status: 200,
+			json: async () => ({ ok: true, result: { action: "memory_review_suggestion" } }),
+		}));
+		vi.stubGlobal("fetch", fetchMock);
+		const controller = createLifecycleHookController({
+			bridge: {
+				sessionId: "agent:complete",
+				registry: {} as never,
+				gatewayUrl: "http://127.0.0.1:8766/api/agent/tool/execute",
+			},
+		});
+
+		await controller.projectComplete({
+			completionKey: "goal:delivery",
+			plan: {
+				id: "plan:delivery",
+				title: "Deliver workflow suite",
+				status: "completed",
+				revision: 8,
+			},
+			goal: {
+				completionAudit: {
+					auditId: "audit-1",
+					summary: "All six workflows passed production verification.",
+					evidence: [{ reference: "commit:abc123" }, { reference: "test:runtime-host" }],
+				},
+			},
+		});
+
+		const body = fetchBody(fetchMock, 0);
+		expect(body.eventType).toBe("project_complete");
+		expect(body.payload.facts).toEqual([
+			{
+				text: "All six workflows passed production verification.",
+				evidence: "commit:abc123, test:runtime-host",
+			},
+			{
+				text: "Completed plan: Deliver workflow suite",
+				evidence: "workflow:plan:delivery@8",
+			},
+		]);
+	});
+});

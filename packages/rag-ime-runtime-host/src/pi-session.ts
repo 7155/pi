@@ -14,6 +14,7 @@ import {
 } from "@earendil-works/pi-coding-agent";
 import { PiDebugContextRecorder } from "./debug-context.ts";
 import { createDiscoveryToolsExtension, diffSkillCatalog, runtimeSkillCatalogRevision } from "./discovery-tools.ts";
+import { createLifecycleHookController } from "./lifecycle-hooks.ts";
 import { PROTOCOL_VERSION, type RuntimeEventEnvelope, RuntimeProtocolError } from "./protocol.ts";
 import { TOOL_LOAD_TOOL_NAME } from "./runtime-tool-names.ts";
 import { createSessionContextRefreshExtension } from "./session-context-refresh.ts";
@@ -28,6 +29,7 @@ import {
 	diffBackendToolCatalog,
 } from "./tool-bridge.ts";
 import { createTransientContextExtension } from "./transient-context.ts";
+import { createWorkflowControlExtension } from "./workflow-control.ts";
 
 export interface PiSessionOpenOptions {
 	externalSessionId: string;
@@ -364,6 +366,7 @@ export class PiProductSession implements PooledSession {
 			...(options.piSkillsEnabled ? options.piSkillPaths : []),
 			...(options.codexSkillsEnabled ? options.codexSkillPaths : []),
 		];
+		const lifecycleHooks = createLifecycleHookController({ bridge: backendBridge });
 		resourceLoader = new DefaultResourceLoader({
 			cwd: options.cwd,
 			agentDir: options.agentDir,
@@ -391,6 +394,11 @@ export class PiProductSession implements PooledSession {
 					},
 					getRecentMessages: () => productSession?.recentMessagesForContext() ?? [],
 				}),
+				createWorkflowControlExtension({
+					bridge: backendBridge,
+					onProjectComplete: (details) => lifecycleHooks.projectComplete(details),
+				}),
+				lifecycleHooks.extension,
 				createTransientContextExtension(() => ({
 					sessionContext: productSession?.sessionContext ?? "",
 					transientContext: productSession?.transientContext ?? "",
