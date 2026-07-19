@@ -47,6 +47,8 @@ interface PluginState {
 	enabled: boolean;
 	activeDigest?: string;
 	installs: PluginInstallRecord[];
+	/** Previous active versions in activation order, newest last. */
+	activationHistory?: string[];
 }
 
 export interface InstalledPlugin {
@@ -58,6 +60,7 @@ export interface InstalledPlugin {
 	digest: string;
 	enabled: boolean;
 	installedVersions: Array<{ version: string; digest: string; installedAt: string }>;
+	rollbackTarget?: { version: string; digest: string; installedAt: string };
 }
 
 interface ScannedPlugin {
@@ -133,6 +136,24 @@ function parseManifest(value: unknown): PluginManifest {
 		entry,
 		permissions: permissions as string[] | undefined,
 	};
+}
+
+function rollbackRecord(state: PluginState): PluginInstallRecord | undefined {
+	const history = state.activationHistory ?? [];
+	for (let index = history.length - 1; index >= 0; index -= 1) {
+		const digest = history[index];
+		const record = state.installs.find(
+			(candidate) => candidate.digest === digest && candidate.digest !== state.activeDigest,
+		);
+		if (record) return record;
+	}
+	// Legacy v1 state did not persist activation history. Use its immutable
+	// install order once, then the first guarded rollback writes an empty
+	// history instead of allowing version toggling.
+	if (state.activationHistory === undefined) {
+		return [...state.installs].reverse().find((record) => record.digest !== state.activeDigest);
+	}
+	return undefined;
 }
 
 async function atomicWrite(path: string, content: string): Promise<void> {
@@ -374,6 +395,7 @@ export class ManagedPluginManager {
 			if (!state?.activeDigest) continue;
 			const active = state.installs.find((record) => record.digest === state.activeDigest);
 			if (!active) continue;
+			const rollback = rollbackRecord(state);
 			result.push({
 				id: state.id,
 				name: active.manifest.name,
@@ -387,6 +409,13 @@ export class ManagedPluginManager {
 					digest: record.digest,
 					installedAt: record.installedAt,
 				})),
+				rollbackTarget: rollback
+					? {
+							version: rollback.manifest.version,
+							digest: rollback.digest,
+							installedAt: rollback.installedAt,
+						}
+					: undefined,
 			});
 		}
 		return result.sort((left, right) => left.id.localeCompare(right.id));
@@ -440,12 +469,21 @@ export class ManagedPluginManager {
 		const previous = await this.readState(manifest.id);
 		const installs = previous?.installs.filter((record) => record.digest !== digest) ?? [];
 		installs.push({ manifest, digest, directory, installedAt: new Date().toISOString() });
+		const activationHistory = [...(previous?.activationHistory ?? [])];
+		if (
+			previous?.activeDigest &&
+			previous.activeDigest !== digest &&
+			activationHistory.at(-1) !== previous.activeDigest
+		) {
+			activationHistory.push(previous.activeDigest);
+		}
 		const state: PluginState = {
 			schemaVersion: STATE_SCHEMA_VERSION,
 			id: manifest.id,
 			enabled: options.enable ?? previous?.enabled ?? false,
 			activeDigest: digest,
 			installs,
+			activationHistory,
 		};
 		await this.writeState(state);
 		await this.syncActiveEntry(state);
@@ -483,16 +521,44 @@ export class ManagedPluginManager {
 		});
 	}
 
-	async rollback(pluginId: string, approvalToken?: string): Promise<InstalledPlugin> {
+	async rollback(
+		pluginId: string,
+		approvalToken: string | undefined,
+		expectedActiveDigest: string | undefined,
+		targetDigest: string | undefined,
+	): Promise<InstalledPlugin> {
 		return this.mutate(pluginId, approvalToken, (state) => {
-			const previous = [...state.installs].reverse().find((record) => record.digest !== state.activeDigest);
+			if (!expectedActiveDigest || !targetDigest) {
+				throw new RuntimeProtocolError(
+					"PLUGIN_ROLLBACK_GUARD_REQUIRED",
+					"Rollback requires the reviewed active and target digests",
+				);
+			}
+			if (state.activeDigest !== expectedActiveDigest) {
+				throw new RuntimeProtocolError(
+					"PLUGIN_STATE_CHANGED",
+					"Plugin active version changed after rollback preview",
+					{ expected: expectedActiveDigest, actual: state.activeDigest },
+				);
+			}
+			const previous = rollbackRecord(state);
 			if (!previous) {
 				throw new RuntimeProtocolError(
 					"PLUGIN_ROLLBACK_UNAVAILABLE",
 					`No previous install for plugin: ${pluginId}`,
 				);
 			}
+			if (previous.digest !== targetDigest) {
+				throw new RuntimeProtocolError("PLUGIN_STATE_CHANGED", "Plugin rollback target changed after preview", {
+					expected: targetDigest,
+					actual: previous.digest,
+				});
+			}
 			state.activeDigest = previous.digest;
+			state.activationHistory = [...(state.activationHistory ?? [])];
+			while (state.activationHistory.at(-1) === previous.digest) {
+				state.activationHistory.pop();
+			}
 		});
 	}
 }

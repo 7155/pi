@@ -124,12 +124,9 @@ describe("lifecycle hooks", () => {
 		expect(JSON.stringify(body)).not.toContain("private command");
 		expect(JSON.stringify(body)).not.toContain("/Users/undo/private");
 		expect(JSON.stringify(body)).not.toContain("secret-token");
-		expect(body.payload.facts).toEqual([
-			{
-				text: "workspace_shell failed; raw error details were redacted.",
-				evidence: `tool-error-sha256:${body.payload.errorSha256}`,
-			},
-		]);
+		expect(body.payload.facts).toEqual([]);
+		expect(body.payload.auditOnly).toBe(true);
+		expect(body.payload.reason).toBe("tool_failure_is_not_a_durable_memory_fact");
 		await handlers.get("tool_result")?.({
 			toolName: "workspace_shell",
 			toolCallId: "tool-1",

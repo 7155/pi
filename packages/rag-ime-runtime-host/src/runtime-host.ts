@@ -588,6 +588,8 @@ export class RagImeRuntimeHost {
 				const plugin = await this.plugins.rollback(
 					requiredString(params, "pluginId", 64),
 					optionalString(params, "approvalToken", 1024),
+					requiredString(params, "expectedActiveDigest", 64),
+					requiredString(params, "targetDigest", 64),
 				);
 				await this.reloadPlugins();
 				return plugin;

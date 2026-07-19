@@ -58,6 +58,17 @@ function bounded(value: string, maximum: number): string {
 	return value.trim().slice(0, maximum);
 }
 
+function redactSensitiveText(value: string, maximum: number): string {
+	return bounded(value, maximum)
+		.replace(/\b(?:sk|ghp|github_pat)_[A-Za-z0-9_-]{8,}\b/gu, "[redacted-token]")
+		.replace(/\bBearer\s+[A-Za-z0-9._~+/=-]{8,}\b/giu, "Bearer [redacted-token]")
+		.replace(
+			/\b(?:api[_-]?key|access[_-]?token|password|passwd|secret)\b\s*[:=]\s*[^\s,;]+/giu,
+			"[redacted-credential]",
+		)
+		.replace(/\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\b/gu, "[redacted-jwt]");
+}
+
 function digest(value: unknown): string {
 	return createHash("sha256").update(JSON.stringify(value)).digest("hex");
 }
@@ -245,12 +256,14 @@ export function createLifecycleHookController(options: LifecycleHookOptions): Li
 		});
 
 		pi.on("turn_end", async (event: TurnEndEvent) => {
+			const assistantSummary = textFromContent(asRecord(event.message).content);
 			try {
 				const result = await send(
 					"turn_end",
 					{
 						turnIndex: event.turnIndex,
-						assistantSummary: textFromContent(asRecord(event.message).content),
+						assistantSummaryLength: assistantSummary.length,
+						assistantSummarySha256: digest(assistantSummary),
 						toolResultCount: event.toolResults.length,
 						failedToolCount: event.toolResults.filter((item) => item.isError).length,
 					},
@@ -263,7 +276,7 @@ export function createLifecycleHookController(options: LifecycleHookOptions): Li
 		});
 
 		pi.on("session_compact", async (event, ctx) => {
-			const summary = bounded(event.compactionEntry.summary, 800);
+			const summary = redactSensitiveText(event.compactionEntry.summary, 800);
 			try {
 				await send(
 					"compaction",
@@ -304,12 +317,9 @@ export function createLifecycleHookController(options: LifecycleHookOptions): Li
 						inputSha256: digest(event.input),
 						errorSha256,
 						errorSummary: "Tool error details redacted by Runtime Host.",
-						facts: [
-							{
-								text: `${safeToolName} failed; raw error details were redacted.`,
-								evidence: `tool-error-sha256:${errorSha256}`,
-							},
-						],
+						auditOnly: true,
+						reason: "tool_failure_is_not_a_durable_memory_fact",
+						facts: [],
 					},
 					{ toolCallIdSha256, errorSha256 },
 				);

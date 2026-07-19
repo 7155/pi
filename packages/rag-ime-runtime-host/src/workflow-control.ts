@@ -152,6 +152,14 @@ export function createWorkflowControlExtension(options: WorkflowControlOptions):
 	let initializedCompletionState = false;
 	let goalActive = false;
 	let activeTurnId = "";
+	let activeUsageReport:
+		| {
+				turnId: string;
+				idempotencyKey: string;
+				tokenDelta: number;
+				elapsedDeltaMs: number;
+		  }
+		| undefined;
 
 	async function fetchState(
 		path: "workflow-state" | "goal-usage",
@@ -188,6 +196,7 @@ export function createWorkflowControlExtension(options: WorkflowControlOptions):
 		pi.on("before_agent_start", async (event) => {
 			turnStartedAtMs = Date.now();
 			activeTurnId = `turn:${randomUUID()}`;
+			activeUsageReport = undefined;
 			try {
 				const snapshot = await fetchState("workflow-state", {
 					sessionId: options.bridge.sessionId,
@@ -214,13 +223,16 @@ export function createWorkflowControlExtension(options: WorkflowControlOptions):
 			const { tokenDelta } = lastAssistantUsage(event.messages);
 			const turnId = activeTurnId;
 			if (!turnId) return;
+			activeUsageReport ??= {
+				turnId,
+				idempotencyKey: `goal-usage:${turnId}`,
+				tokenDelta,
+				elapsedDeltaMs: turnStartedAtMs > 0 ? Math.max(0, Date.now() - turnStartedAtMs) : 0,
+			};
 			try {
 				const snapshot = await fetchState("goal-usage", {
 					sessionId: options.bridge.sessionId,
-					turnId,
-					idempotencyKey: `goal-usage:${turnId}`,
-					tokenDelta,
-					elapsedDeltaMs: turnStartedAtMs > 0 ? Math.max(0, Date.now() - turnStartedAtMs) : 0,
+					...activeUsageReport,
 				});
 				const goal = asRecord(snapshot.goal);
 				goalActive = goal.configured === true && text(goal.status) === "active";
