@@ -57,6 +57,11 @@ describe("regression #6363: agent settled event and idle waiting", () => {
 
 		expect(harness.eventsOfType("agent_end").map((event) => event.willRetry)).toEqual([true, false]);
 		expect(harness.eventsOfType("agent_settled")).toHaveLength(1);
+		expect(harness.eventsOfType("agent_settled")[0]?.receipt).toMatchObject({
+			aborted: false,
+			pendingOperations: 0,
+			operationCounts: { provider: 1, retry_sleep: 1 },
+		});
 		expect(extensionEvents).toEqual(["agent_end", "agent_end", "agent_settled:true"]);
 		expect(publicEvents).toEqual(["agent_settled"]);
 	});
@@ -87,6 +92,11 @@ describe("regression #6363: agent settled event and idle waiting", () => {
 		expect(harness.eventsOfType("agent_end")).toHaveLength(2);
 		expect(harness.eventsOfType("agent_settled")).toHaveLength(1);
 		expect(settledIdleStates).toEqual([true]);
+		expect(harness.eventsOfType("agent_settled")[0]?.receipt).toMatchObject({
+			aborted: false,
+			pendingOperations: 0,
+			operationCounts: { provider: 1 },
+		});
 	});
 
 	it("extension command waitForIdle waits for session-level settlement", async () => {
@@ -154,5 +164,41 @@ describe("regression #6363: agent settled event and idle waiting", () => {
 
 		expect(commandResults).toEqual([true]);
 		expect(harness.eventsOfType("agent_settled")).toHaveLength(1);
+	});
+
+	it("propagates abort through the run scope and reports drained tool operations", async () => {
+		let markStarted = () => {};
+		const started = new Promise<void>((resolve) => {
+			markStarted = resolve;
+		});
+		const abortableTool: AgentTool = {
+			name: "abortable",
+			label: "Abortable",
+			description: "Wait for cancellation",
+			parameters: Type.Object({}),
+			execute: async (_toolCallId, _params, signal) => {
+				markStarted();
+				await new Promise<void>((resolve) => {
+					if (signal?.aborted) resolve();
+					else signal?.addEventListener("abort", () => resolve(), { once: true });
+				});
+				return { content: [{ type: "text", text: "cancelled" }], details: {} };
+			},
+		};
+		const harness = await createHarness({ tools: [abortableTool] });
+		harnesses.push(harness);
+		harness.setResponses([fauxAssistantMessage(fauxToolCall("abortable", {}), { stopReason: "toolUse" })]);
+
+		const prompt = harness.session.prompt("start");
+		await started;
+		await harness.session.abort();
+		await prompt;
+
+		expect(harness.eventsOfType("agent_settled")[0]?.receipt).toMatchObject({
+			aborted: true,
+			generation: 1,
+			pendingOperations: 0,
+			operationCounts: { provider: 1, tool: 1 },
+		});
 	});
 });

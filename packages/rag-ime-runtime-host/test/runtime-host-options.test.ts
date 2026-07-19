@@ -11,6 +11,16 @@ describe("runtime host primitive capabilities", () => {
 			cancelScope: "1",
 			sessionContinuationQueue: false,
 			sessionCancelOperationRegistry: false,
+			sessionCancelOperations: {
+				provider: true,
+				tool: true,
+				retrySleep: true,
+				manualCompaction: false,
+				autoCompaction: false,
+				branchSummary: false,
+				bashProcess: false,
+				continuationTimer: false,
+			},
 			roomTypes: false,
 		});
 	});

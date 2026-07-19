@@ -7,7 +7,7 @@
 
 import type { AgentMessage, ThinkingLevel } from "@earendil-works/pi-agent-core";
 import type { ImageContent, Model } from "@earendil-works/pi-ai";
-import type { SessionStats } from "../../core/agent-session.ts";
+import type { AgentSettledReceipt, SessionStats } from "../../core/agent-session.ts";
 import type { BashResult } from "../../core/bash-executor.ts";
 import type { CompactionResult } from "../../core/compaction/index.ts";
 import type { SessionEntry, SessionTreeNode } from "../../core/session-manager.ts";
@@ -104,6 +104,15 @@ export interface RpcSessionState {
 	autoCompactionEnabled: boolean;
 	messageCount: number;
 	pendingMessageCount: number;
+	runtimeLifecycle: {
+		activeScope: {
+			scopeId: string;
+			generation: number;
+			cancelled: boolean;
+			operations: Array<{ operationId: string; kind: string; registeredAt: number }>;
+		} | null;
+		lastSettledReceipt: AgentSettledReceipt | null;
+	};
 }
 
 // ============================================================================

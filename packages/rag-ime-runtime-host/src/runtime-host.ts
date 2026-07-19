@@ -38,6 +38,16 @@ export const RUNTIME_PRIMITIVE_CAPABILITIES = Object.freeze({
 	cancelScope: "1",
 	sessionContinuationQueue: false,
 	sessionCancelOperationRegistry: false,
+	sessionCancelOperations: Object.freeze({
+		provider: true,
+		tool: true,
+		retrySleep: true,
+		manualCompaction: false,
+		autoCompaction: false,
+		branchSummary: false,
+		bashProcess: false,
+		continuationTimer: false,
+	}),
 	roomTypes: false,
 });
 

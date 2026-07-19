@@ -24,6 +24,7 @@ import type {
 	PrepareNextTurnContext,
 	ThinkingLevel,
 } from "@earendil-works/pi-agent-core";
+import { CancelScope } from "@earendil-works/pi-agent-core";
 import type {
 	AssistantMessage,
 	AuthResult,
@@ -140,7 +141,7 @@ export type AgentSessionEvent =
 			messages: AgentMessage[];
 			willRetry: boolean;
 	  }
-	| { type: "agent_settled" }
+	| { type: "agent_settled"; receipt?: AgentSettledReceipt }
 	| {
 			type: "queue_update";
 			steering: readonly string[];
@@ -163,6 +164,14 @@ export type AgentSessionEvent =
 
 /** Listener function for agent session events */
 export type AgentSessionEventListener = (event: AgentSessionEvent) => void;
+
+export interface AgentSettledReceipt {
+	scopeId: string;
+	generation: number;
+	aborted: boolean;
+	pendingOperations: number;
+	operationCounts: Record<string, number>;
+}
 
 // ============================================================================
 // Types
@@ -313,6 +322,11 @@ export class AgentSession {
 	// Retry state
 	private _retryAbortController: AbortController | undefined = undefined;
 	private _retryAttempt = 0;
+	private _cancelScope: CancelScope | undefined;
+	private _cancelScopeSequence = 0;
+	private _cancelOperationCounts = new Map<string, number>();
+	private _toolCancelUnregister = new Map<string, () => void>();
+	private _lastSettledReceipt: AgentSettledReceipt | undefined;
 
 	// Bash execution state
 	private _bashAbortController: AbortController | undefined = undefined;
@@ -557,11 +571,12 @@ export class AgentSession {
 		resolve();
 	}
 
-	private async _emitAgentSettled(): Promise<void> {
+	private async _emitAgentSettled(receipt?: AgentSettledReceipt): Promise<void> {
 		this._isAgentRunActive = false;
+		this._lastSettledReceipt = receipt;
 		try {
 			await this._extensionRunner.emit({ type: "agent_settled" });
-			this._emit({ type: "agent_settled" });
+			this._emit({ type: "agent_settled", receipt });
 		} finally {
 			this._resolveIdleWaitIfIdle();
 		}
@@ -572,6 +587,15 @@ export class AgentSession {
 
 	/** Internal handler for agent events - shared by subscribe and reconnect */
 	private _handleAgentEvent = async (event: AgentEvent): Promise<void> => {
+		if (event.type === "tool_execution_start") {
+			this._toolCancelUnregister.set(
+				event.toolCallId,
+				this._registerCancelOperation(`tool:${event.toolCallId}`, "tool", () => this.agent.abort()),
+			);
+		} else if (event.type === "tool_execution_end") {
+			this._toolCancelUnregister.get(event.toolCallId)?.();
+			this._toolCancelUnregister.delete(event.toolCallId);
+		}
 		// When a user message starts, check if it's from either queue and remove it BEFORE emitting
 		// This ensures the UI sees the updated queue state
 		if (event.type === "message_start" && event.message.role === "user") {
@@ -1059,6 +1083,8 @@ export class AgentSession {
 	// =========================================================================
 
 	private async _runAgentPrompt(messages: AgentMessage | AgentMessage[]): Promise<void> {
+		const scope = this._beginCancelScope();
+		const unregisterProvider = this._registerCancelOperation("provider", "provider", () => this.agent.abort());
 		this._isAgentRunActive = true;
 		try {
 			await this.agent.prompt(messages);
@@ -1066,10 +1092,39 @@ export class AgentSession {
 				await this.agent.continue();
 			}
 		} finally {
+			unregisterProvider();
 			this._systemPromptOverride = undefined;
 			this._flushPendingBashMessages();
-			await this._emitAgentSettled();
+			await this._emitAgentSettled(this._settledReceipt(scope));
+			if (this._cancelScope === scope) this._cancelScope = undefined;
 		}
+	}
+
+	private _beginCancelScope(): CancelScope {
+		const scope = new CancelScope({
+			scopeId: `${this.sessionId}:run:${++this._cancelScopeSequence}`,
+		});
+		this._cancelScope = scope;
+		this._cancelOperationCounts = new Map();
+		return scope;
+	}
+
+	private _registerCancelOperation(operationId: string, kind: string, cancel: () => void | Promise<void>): () => void {
+		const scope = this._cancelScope;
+		if (!scope || scope.signal.aborted) return () => {};
+		this._cancelOperationCounts.set(kind, (this._cancelOperationCounts.get(kind) ?? 0) + 1);
+		return scope.register({ operationId, kind, cancel });
+	}
+
+	private _settledReceipt(scope: CancelScope): AgentSettledReceipt {
+		const snapshot = scope.snapshot();
+		return {
+			scopeId: snapshot.scopeId,
+			generation: snapshot.generation,
+			aborted: snapshot.cancelled,
+			pendingOperations: snapshot.operations.length,
+			operationCounts: Object.fromEntries(this._cancelOperationCounts),
+		};
 	}
 
 	private async _handlePostAgentRun(): Promise<boolean> {
@@ -1540,6 +1595,7 @@ export class AgentSession {
 	 * Abort current operation and wait for agent to become idle.
 	 */
 	async abort(): Promise<void> {
+		await this._cancelScope?.cancel("user_abort");
 		this.abortRetry();
 		this.agent.abort();
 		await this.waitForIdle();
@@ -1550,6 +1606,16 @@ export class AgentSession {
 			return;
 		}
 		await this._getIdleWaitPromise();
+	}
+
+	getRuntimeLifecycleSnapshot(): {
+		activeScope: ReturnType<CancelScope["snapshot"]> | null;
+		lastSettledReceipt: AgentSettledReceipt | null;
+	} {
+		return {
+			activeScope: this._cancelScope?.snapshot() ?? null,
+			lastSettledReceipt: this._lastSettledReceipt ?? null,
+		};
 	}
 
 	// =========================================================================
@@ -2669,6 +2735,9 @@ export class AgentSession {
 
 		// Wait with exponential backoff (abortable)
 		this._retryAbortController = new AbortController();
+		const unregisterRetry = this._registerCancelOperation("retry-sleep", "retry_sleep", () =>
+			this._retryAbortController?.abort(),
+		);
 		try {
 			await sleep(delayMs, this._retryAbortController.signal);
 		} catch {
@@ -2683,6 +2752,7 @@ export class AgentSession {
 			});
 			return false;
 		} finally {
+			unregisterRetry();
 			this._retryAbortController = undefined;
 		}
 
