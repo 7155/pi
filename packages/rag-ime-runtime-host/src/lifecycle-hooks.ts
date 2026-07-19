@@ -1,9 +1,12 @@
 import { createHash } from "node:crypto";
+import { chmod, mkdir, readFile, rename, unlink, writeFile } from "node:fs/promises";
+import { join } from "node:path";
 import type { ExtensionFactory, ToolResultEvent, TurnEndEvent } from "@earendil-works/pi-coding-agent";
 import { type BackendToolBridgeOptions, requestProductGateway } from "./tool-bridge.ts";
 
 const HOOK_BLOCK_PATTERN = /\n*<rag-ime-context type="lifecycle_hook"[^>]*>[\s\S]*?<\/rag-ime-context>\n*/gu;
 const DEFAULT_IDLE_DELAY_MS = 5 * 60 * 1000;
+const PENDING_STATE_SCHEMA_VERSION = "rag-ime.lifecycle-pending-events.v1";
 
 export type LifecycleEventType =
 	| "session_start"
@@ -23,6 +26,7 @@ interface LifecycleHookOptions {
 	now?: () => Date;
 	setTimer?: typeof setTimeout;
 	clearTimer?: typeof clearTimeout;
+	stateDirectory?: string;
 }
 
 interface LifecycleEventEnvelope extends Record<string, unknown> {
@@ -32,6 +36,12 @@ interface LifecycleEventEnvelope extends Record<string, unknown> {
 	eventType: LifecycleEventType;
 	occurredAtMs: number;
 	payload: Record<string, unknown>;
+}
+
+interface LifecyclePendingState {
+	schemaVersion: typeof PENDING_STATE_SCHEMA_VERSION;
+	sessionId: string;
+	events: LifecycleEventEnvelope[];
 }
 
 function asRecord(value: unknown): Record<string, unknown> {
@@ -75,6 +85,64 @@ function digest(value: unknown): string {
 
 function stableEventId(sessionId: string, eventType: LifecycleEventType, identity: unknown): string {
 	return `lifecycle:${eventType}:${digest({ sessionId, eventType, identity }).slice(0, 40)}`;
+}
+
+function lifecycleEventType(value: unknown): value is LifecycleEventType {
+	return (
+		value === "session_start" ||
+		value === "turn_end" ||
+		value === "compaction" ||
+		value === "project_complete" ||
+		value === "tool_failed" ||
+		value === "idle"
+	);
+}
+
+function pendingStateDirectory(explicit: string | undefined): string {
+	if (explicit !== undefined) return explicit.trim();
+	const configured = text(process.env.RAG_IME_PI_LIFECYCLE_STATE_DIR);
+	if (configured) return configured;
+	const sessionDirectory = text(process.env.RAG_IME_PI_SESSION_DIR);
+	return sessionDirectory ? join(sessionDirectory, ".lifecycle-hooks") : "";
+}
+
+function pendingStateFile(directory: string, sessionId: string): string {
+	return directory ? join(directory, `${digest(sessionId).slice(0, 40)}.json`) : "";
+}
+
+function isLifecycleEnvelope(value: unknown, sessionId: string): value is LifecycleEventEnvelope {
+	const envelope = asRecord(value);
+	return (
+		envelope.schemaVersion === "rag-ime.agent-lifecycle-event.v1" &&
+		text(envelope.eventId).startsWith("lifecycle:") &&
+		envelope.sessionId === sessionId &&
+		lifecycleEventType(envelope.eventType) &&
+		Number.isFinite(Number(envelope.occurredAtMs)) &&
+		typeof envelope.payload === "object" &&
+		envelope.payload !== null &&
+		!Array.isArray(envelope.payload)
+	);
+}
+
+function completedWorkflowDetails(event: ToolResultEvent): Record<string, unknown> | undefined {
+	if (event.isError || (event.toolName !== "agent_plan" && event.toolName !== "agent_goal")) return undefined;
+	const input = asRecord(event.input);
+	if ((text(input.op) || text(input.action)) !== "complete") return undefined;
+	const details = asRecord(event.details);
+	const plan = asRecord(details.plan);
+	const goal = asRecord(details.goal);
+	const completed = [
+		text(plan.status) === "completed" ? `plan:${text(plan.id) || text(plan.title)}` : "",
+		goal.configured === true && text(goal.status) === "completed"
+			? `goal:${text(goal.goalId) || text(goal.objective)}`
+			: "",
+	].filter(Boolean);
+	if (completed.length === 0) return undefined;
+	return {
+		completionKey: completed.join("|"),
+		plan,
+		goal,
+	};
 }
 
 function textFromContent(content: unknown): string {
@@ -147,9 +215,82 @@ export function createLifecycleHookController(options: LifecycleHookOptions): Li
 	let idleSequence = 0;
 	const pendingEvents = new Map<string, LifecycleEventEnvelope>();
 	const deliveredResults = new Map<string, Record<string, unknown>>();
+	const awaitingResults = new Set<string>();
+	const stateDirectory = pendingStateDirectory(options.stateDirectory);
+	const stateFile = pendingStateFile(stateDirectory, options.bridge.sessionId);
 	let activeFlush: Promise<void> | undefined;
+	let persistenceQueue: Promise<void> = Promise.resolve();
 	const schedule = options.setTimer ?? setTimeout;
 	const cancel = options.clearTimer ?? clearTimeout;
+
+	async function writePendingState(events: LifecycleEventEnvelope[]): Promise<void> {
+		if (!stateFile) return;
+		await mkdir(stateDirectory, { recursive: true, mode: 0o700 });
+		await chmod(stateDirectory, 0o700);
+		if (events.length === 0) {
+			try {
+				await unlink(stateFile);
+			} catch (error) {
+				if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+			}
+			return;
+		}
+		const state: LifecyclePendingState = {
+			schemaVersion: PENDING_STATE_SCHEMA_VERSION,
+			sessionId: options.bridge.sessionId,
+			events,
+		};
+		const temporary = `${stateFile}.tmp-${process.pid}-${Date.now()}`;
+		try {
+			await writeFile(temporary, `${JSON.stringify(state)}\n`, {
+				encoding: "utf8",
+				mode: 0o600,
+			});
+			await rename(temporary, stateFile);
+		} finally {
+			try {
+				await unlink(temporary);
+			} catch {
+				// A successful atomic rename already removed the temporary path.
+			}
+		}
+	}
+
+	function persistPending(): Promise<void> {
+		if (!stateFile) return Promise.resolve();
+		const snapshot = [...pendingEvents.values()];
+		const pending = persistenceQueue.catch(() => undefined).then(() => writePendingState(snapshot));
+		persistenceQueue = pending;
+		return pending;
+	}
+
+	async function restorePending(): Promise<number> {
+		if (!stateFile) return 0;
+		let serialized = "";
+		try {
+			serialized = await readFile(stateFile, "utf8");
+		} catch (error) {
+			if ((error as NodeJS.ErrnoException).code === "ENOENT") return 0;
+			throw error;
+		}
+		const state = asRecord(JSON.parse(serialized));
+		if (
+			state.schemaVersion !== PENDING_STATE_SCHEMA_VERSION ||
+			state.sessionId !== options.bridge.sessionId ||
+			!Array.isArray(state.events)
+		) {
+			throw new Error("Lifecycle pending state is invalid");
+		}
+		for (const event of state.events) {
+			if (!isLifecycleEnvelope(event, options.bridge.sessionId)) {
+				throw new Error("Lifecycle pending event is invalid");
+			}
+			pendingEvents.set(event.eventId, event);
+		}
+		return pendingEvents.size;
+	}
+
+	const restored = restorePending();
 
 	function clearIdle(): void {
 		if (idleTimer !== undefined) cancel(idleTimer);
@@ -157,6 +298,7 @@ export function createLifecycleHookController(options: LifecycleHookOptions): Li
 	}
 
 	async function flushPending(): Promise<void> {
+		await restored;
 		if (!options.bridge.gatewayUrl || pendingEvents.size === 0) return;
 		if (activeFlush) return activeFlush;
 		activeFlush = (async () => {
@@ -166,8 +308,9 @@ export function createLifecycleHookController(options: LifecycleHookOptions): Li
 					const result = asRecord(response.result);
 					const nextContext = bounded(text(result.nextTurnContext), 2_000);
 					if (nextContext) pendingContext = nextContext;
-					deliveredResults.set(eventId, result);
+					if (awaitingResults.has(eventId)) deliveredResults.set(eventId, result);
 					pendingEvents.delete(eventId);
+					await persistPending();
 				} catch {
 					// Preserve ordering and retry the same stable event on the next
 					// lifecycle opportunity instead of minting a duplicate event.
@@ -186,6 +329,7 @@ export function createLifecycleHookController(options: LifecycleHookOptions): Li
 		identity: unknown,
 	): Promise<Record<string, unknown>> {
 		if (!options.bridge.gatewayUrl) return {};
+		await restored;
 		const eventId = stableEventId(options.bridge.sessionId, eventType, identity);
 		if (!pendingEvents.has(eventId)) {
 			pendingEvents.set(eventId, {
@@ -196,12 +340,18 @@ export function createLifecycleHookController(options: LifecycleHookOptions): Li
 				occurredAtMs: Date.now(),
 				payload,
 			});
+			await persistPending();
 		}
-		await flushPending();
-		const result = deliveredResults.get(eventId);
-		if (!result) throw new Error(`Lifecycle event remains queued: ${eventId}`);
-		deliveredResults.delete(eventId);
-		return result;
+		awaitingResults.add(eventId);
+		try {
+			await flushPending();
+			const result = deliveredResults.get(eventId);
+			if (!result) throw new Error(`Lifecycle event remains queued: ${eventId}`);
+			deliveredResults.delete(eventId);
+			return result;
+		} finally {
+			awaitingResults.delete(eventId);
+		}
 	}
 
 	function scheduleIdle(delayValue: unknown): void {
@@ -225,6 +375,25 @@ export function createLifecycleHookController(options: LifecycleHookOptions): Li
 				{ idleSequence, delay },
 			).catch(() => undefined);
 		}, delay);
+	}
+
+	async function projectComplete(details: Record<string, unknown>): Promise<void> {
+		try {
+			const completionKey = bounded(text(details.completionKey), 400);
+			await send(
+				"project_complete",
+				{
+					completionKey,
+					plan: asRecord(details.plan),
+					goal: asRecord(details.goal),
+					facts: completionFacts(details),
+				},
+				{ completionKey },
+			);
+		} catch {
+			// The stable envelope was persisted before delivery and remains queued
+			// for startup or the next lifecycle opportunity.
+		}
 	}
 
 	const extension: ExtensionFactory = (pi) => {
@@ -304,7 +473,11 @@ export function createLifecycleHookController(options: LifecycleHookOptions): Li
 		});
 
 		pi.on("tool_result", async (event: ToolResultEvent) => {
-			if (!event.isError) return;
+			if (!event.isError) {
+				const completion = completedWorkflowDetails(event);
+				if (completion) await projectComplete(completion);
+				return;
+			}
 			const errorSha256 = digest(event.content);
 			const toolCallIdSha256 = digest(event.toolCallId);
 			const safeToolName = bounded(event.toolName, 128);
@@ -328,31 +501,25 @@ export function createLifecycleHookController(options: LifecycleHookOptions): Li
 			}
 		});
 
-		pi.on("session_shutdown", () => {
+		pi.on("session_shutdown", async () => {
 			clearIdle();
+			try {
+				await restored;
+				await persistPending();
+				await flushPending();
+			} catch {
+				// Atomic pending state remains the recovery source after shutdown.
+			}
 		});
 	};
 
+	void restored
+		.then((restoredEventCount) => (restoredEventCount > 0 ? flushPending() : undefined))
+		.catch(() => undefined);
+
 	return {
 		extension,
-		async projectComplete(details: Record<string, unknown>): Promise<void> {
-			try {
-				const completionKey = bounded(text(details.completionKey), 400);
-				await send(
-					"project_complete",
-					{
-						completionKey,
-						plan: asRecord(details.plan),
-						goal: asRecord(details.goal),
-						facts: completionFacts(details),
-					},
-					{ completionKey },
-				);
-			} catch {
-				// The stable envelope remains queued and is flushed before the
-				// next available lifecycle request.
-			}
-		},
+		projectComplete,
 	};
 }
 

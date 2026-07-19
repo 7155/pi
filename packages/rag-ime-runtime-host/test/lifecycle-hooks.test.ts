@@ -1,16 +1,26 @@
+import { mkdtempSync, readdirSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { createLifecycleHookController } from "../src/lifecycle-hooks.ts";
 
 type Handler = (event: unknown, context?: unknown) => unknown;
 
-function fetchBody(mock: unknown, index: number): Record<string, unknown> {
+function fetchBody(mock: unknown, index: number): Record<string, unknown> & { payload: Record<string, unknown> } {
 	const calls = (mock as { mock: { calls: unknown[][] } }).mock.calls;
 	const init = calls[index]?.[1] as { body?: unknown } | undefined;
-	return JSON.parse(String(init?.body)) as Record<string, unknown>;
+	const body = JSON.parse(String(init?.body)) as Record<string, unknown>;
+	if (!body.payload || typeof body.payload !== "object" || Array.isArray(body.payload)) {
+		throw new Error("Lifecycle request payload must be an object");
+	}
+	return body as Record<string, unknown> & { payload: Record<string, unknown> };
 }
 
 describe("lifecycle hooks", () => {
-	afterEach(() => vi.unstubAllGlobals());
+	afterEach(() => {
+		vi.unstubAllGlobals();
+		vi.unstubAllEnvs();
+	});
 
 	it("delivers governed next-turn context and emits bounded lifecycle events", async () => {
 		const fetchMock = vi
@@ -173,6 +183,114 @@ describe("lifecycle hooks", () => {
 		expect(retriedBody.eventType).toBe("project_complete");
 		expect(retriedBody.eventId).toBe(failedBody.eventId);
 		expect(fetchBody(fetchMock, 2).eventType).toBe("session_start");
+	});
+
+	it("restores a failed lifecycle event after Runtime restart and retries the same event id", async () => {
+		const stateDirectory = mkdtempSync(join(tmpdir(), "pi-lifecycle-pending-"));
+		try {
+			vi.stubEnv("RAG_IME_PI_LIFECYCLE_STATE_DIR", "");
+			vi.stubEnv("RAG_IME_PI_SESSION_DIR", stateDirectory);
+			const pendingDirectory = join(stateDirectory, ".lifecycle-hooks");
+			const fetchMock = vi
+				.fn()
+				.mockRejectedValueOnce(new Error("sidecar unavailable"))
+				.mockResolvedValue({
+					ok: true,
+					status: 200,
+					json: async () => ({ ok: true, result: {} }),
+				});
+			vi.stubGlobal("fetch", fetchMock);
+			const bridge = {
+				sessionId: "agent:restart-retry",
+				registry: {} as never,
+				gatewayUrl: "http://127.0.0.1:8766/api/agent/tool/execute",
+			};
+			const firstRuntime = createLifecycleHookController({ bridge });
+
+			await firstRuntime.projectComplete({
+				completionKey: "plan:restart-retry",
+				plan: {
+					id: "restart-retry",
+					title: "Persist lifecycle delivery",
+					status: "completed",
+					revision: 1,
+				},
+				goal: {},
+			});
+
+			expect(fetchMock).toHaveBeenCalledTimes(1);
+			expect(readdirSync(pendingDirectory)).toHaveLength(1);
+			const failed = fetchBody(fetchMock, 0);
+
+			createLifecycleHookController({ bridge });
+			await vi.waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(2));
+			const retried = fetchBody(fetchMock, 1);
+			expect(retried.eventType).toBe("project_complete");
+			expect(retried.eventId).toBe(failed.eventId);
+			await vi.waitFor(() => expect(readdirSync(pendingDirectory)).toEqual([]));
+
+			createLifecycleHookController({ bridge });
+			await new Promise((resolve) => setTimeout(resolve, 20));
+			expect(fetchMock).toHaveBeenCalledTimes(2);
+		} finally {
+			rmSync(stateDirectory, { recursive: true, force: true });
+		}
+	});
+
+	it("delivers agent_plan completion before the Session can close without an active Goal or next turn", async () => {
+		const stateDirectory = mkdtempSync(join(tmpdir(), "pi-lifecycle-close-"));
+		try {
+			const fetchMock = vi.fn(async () => ({
+				ok: true,
+				status: 200,
+				json: async () => ({ ok: true, result: {} }),
+			}));
+			vi.stubGlobal("fetch", fetchMock);
+			const handlers = new Map<string, Handler>();
+			const controller = createLifecycleHookController({
+				bridge: {
+					sessionId: "agent:complete-and-close",
+					registry: {} as never,
+					gatewayUrl: "http://127.0.0.1:8766/api/agent/tool/execute",
+				},
+				stateDirectory,
+			});
+			controller.extension({
+				on: (name: string, handler: Handler) => handlers.set(name, handler),
+			} as never);
+
+			await handlers.get("tool_result")?.({
+				toolName: "agent_plan",
+				toolCallId: "tool-complete",
+				input: { op: "complete" },
+				content: [{ type: "text", text: "completed" }],
+				details: {
+					plan: {
+						id: "plan:close",
+						title: "Complete and close",
+						status: "completed",
+						revision: 3,
+					},
+				},
+				isError: false,
+			});
+			await handlers.get("session_shutdown")?.({ reason: "quit" });
+
+			expect(fetchMock).toHaveBeenCalledTimes(1);
+			const body = fetchBody(fetchMock, 0);
+			expect(body.eventType).toBe("project_complete");
+			expect(body.payload.completionKey).toBe("plan:plan:close");
+			expect(body.payload.goal).toEqual({});
+			expect(body.payload.facts).toEqual([
+				{
+					text: "Completed plan: Complete and close",
+					evidence: "workflow:plan:close@3",
+				},
+			]);
+			expect(readdirSync(stateDirectory)).toEqual([]);
+		} finally {
+			rmSync(stateDirectory, { recursive: true, force: true });
+		}
 	});
 
 	it("turns a durable Goal completion audit into review facts, not a direct memory write", async () => {

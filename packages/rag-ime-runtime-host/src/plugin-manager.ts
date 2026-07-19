@@ -507,16 +507,49 @@ export class ManagedPluginManager {
 		return (await this.list()).find((plugin) => plugin.id === pluginId)!;
 	}
 
-	async enable(pluginId: string, approvalToken?: string): Promise<InstalledPlugin> {
+	private requireToggleGuard(
+		state: PluginState,
+		expectedActiveDigest: string | undefined,
+		expectedEnabled: boolean | undefined,
+	): void {
+		if (!expectedActiveDigest || typeof expectedEnabled !== "boolean") {
+			throw new RuntimeProtocolError(
+				"PLUGIN_MUTATION_GUARD_REQUIRED",
+				"Enable/disable requires the reviewed active digest and enabled state",
+			);
+		}
+		if (state.activeDigest !== expectedActiveDigest || state.enabled !== expectedEnabled) {
+			throw new RuntimeProtocolError("PLUGIN_STATE_CHANGED", "Plugin state changed after enable/disable preview", {
+				expectedActiveDigest,
+				actualActiveDigest: state.activeDigest,
+				expectedEnabled,
+				actualEnabled: state.enabled,
+			});
+		}
+	}
+
+	async enable(
+		pluginId: string,
+		approvalToken: string | undefined,
+		expectedActiveDigest: string | undefined,
+		expectedEnabled: boolean | undefined,
+	): Promise<InstalledPlugin> {
 		return this.mutate(pluginId, approvalToken, (state) => {
+			this.requireToggleGuard(state, expectedActiveDigest, expectedEnabled);
 			if (!state.activeDigest)
 				throw new RuntimeProtocolError("PLUGIN_NOT_FOUND", `Plugin has no install: ${pluginId}`);
 			state.enabled = true;
 		});
 	}
 
-	async disable(pluginId: string, approvalToken?: string): Promise<InstalledPlugin> {
+	async disable(
+		pluginId: string,
+		approvalToken: string | undefined,
+		expectedActiveDigest: string | undefined,
+		expectedEnabled: boolean | undefined,
+	): Promise<InstalledPlugin> {
 		return this.mutate(pluginId, approvalToken, (state) => {
+			this.requireToggleGuard(state, expectedActiveDigest, expectedEnabled);
 			state.enabled = false;
 		});
 	}

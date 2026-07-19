@@ -77,6 +77,14 @@ function optionalBoolean(params: Record<string, unknown>, key: string, fallback 
 	return value;
 }
 
+function requiredBoolean(params: Record<string, unknown>, key: string): boolean {
+	const value = params[key];
+	if (typeof value !== "boolean") {
+		throw new RuntimeProtocolError("INVALID_PARAMS", `${key} must be a boolean`);
+	}
+	return value;
+}
+
 function sessionIdParam(params: Record<string, unknown>, key: string): string {
 	const sessionId = requiredString(params, key, 200);
 	if (!SESSION_ID_PATTERN.test(sessionId)) {
@@ -544,6 +552,16 @@ export class RagImeRuntimeHost {
 						params.reviewed === true,
 					),
 				};
+			case "ui.resolve": {
+				const response = params.response;
+				if (typeof response !== "object" || response === null || Array.isArray(response)) {
+					throw new RuntimeProtocolError("INVALID_PARAMS", "response must be an object");
+				}
+				return this.session(params).resolveUI(
+					requiredString(params, "requestId", 240),
+					response as Record<string, unknown>,
+				);
+			}
 			case "tools.list":
 				return { tools: this.session(params).listTools() };
 			case "tools.sync":
@@ -572,6 +590,8 @@ export class RagImeRuntimeHost {
 				const plugin = await this.plugins.enable(
 					requiredString(params, "pluginId", 64),
 					optionalString(params, "approvalToken", 1024),
+					requiredString(params, "expectedActiveDigest", 64),
+					requiredBoolean(params, "expectedEnabled"),
 				);
 				await this.reloadPlugins();
 				return plugin;
@@ -580,6 +600,8 @@ export class RagImeRuntimeHost {
 				const plugin = await this.plugins.disable(
 					requiredString(params, "pluginId", 64),
 					optionalString(params, "approvalToken", 1024),
+					requiredString(params, "expectedActiveDigest", 64),
+					requiredBoolean(params, "expectedEnabled"),
 				);
 				await this.reloadPlugins();
 				return plugin;

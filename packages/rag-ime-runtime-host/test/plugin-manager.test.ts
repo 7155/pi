@@ -65,10 +65,39 @@ describe("managed plugin lifecycle", () => {
 		expect(rolledBack.version).toBe("1.0.0");
 		expect(rolledBack.rollbackTarget).toBeUndefined();
 		expect(await readFile(join(root, "installed", "active", "weather-helper.ts"), "utf8")).toContain(first.digest);
-		expect((await manager.disable("weather-helper", "approved-by-product")).enabled).toBe(false);
+		expect((await manager.disable("weather-helper", "approved-by-product", first.digest, true)).enabled).toBe(false);
 		await expect(readFile(join(root, "installed", "active", "weather-helper.ts"), "utf8")).rejects.toMatchObject({
 			code: "ENOENT",
 		});
+	});
+
+	it("binds enable and disable to the reviewed digest and enabled state", async () => {
+		const root = await mkdtemp(join(tmpdir(), "rag-ime-plugin-toggle-guards-"));
+		roots.push(root);
+		const manager = new ManagedPluginManager({
+			pluginsRoot: join(root, "installed"),
+			inboxRoot: join(root, "inbox"),
+			approvalToken: "approved-by-product",
+		});
+		const draft = await manager.createDraft({
+			draftId: "toggle-v1",
+			manifest: manifest("1.0.0"),
+			files: { "index.ts": "export default function () {}\n" },
+		});
+		await manager.install({
+			sourcePath: draft.sourcePath,
+			expectedDigest: draft.digest,
+			approvalToken: "approved-by-product",
+			enable: false,
+		});
+
+		await expect(
+			manager.enable("weather-helper", "approved-by-product", "0".repeat(64), false),
+		).rejects.toMatchObject({ code: "PLUGIN_STATE_CHANGED" });
+		await expect(manager.enable("weather-helper", "approved-by-product", draft.digest, true)).rejects.toMatchObject({
+			code: "PLUGIN_STATE_CHANGED",
+		});
+		expect((await manager.enable("weather-helper", "approved-by-product", draft.digest, false)).enabled).toBe(true);
 	});
 
 	it("binds rollback to the reviewed active and target digests", async () => {

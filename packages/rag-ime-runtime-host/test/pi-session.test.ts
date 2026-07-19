@@ -281,6 +281,35 @@ describe("active-turn message queue", () => {
 	});
 });
 
+describe("request-scoped UI resolution", () => {
+	it("resolves exactly the pending request id and acknowledges only after resolution", () => {
+		const productSession = Object.create(PiProductSession.prototype) as PiProductSession;
+		let resolved: boolean | undefined;
+		Object.assign(productSession as unknown as Record<string, unknown>, {
+			pendingUIRequests: new Map(),
+			pendingDecisions: new Map([
+				[
+					"review:run-1",
+					{
+						requestId: "ui-review-1",
+						resolve: (value: boolean) => {
+							resolved = value;
+						},
+						cleanup: () => {},
+					},
+				],
+			]),
+		});
+
+		expect(productSession.resolveUI("ui-review-1", { value: "是，继续审阅。" })).toEqual({
+			requestId: "ui-review-1",
+			resolved: true,
+		});
+		expect(resolved).toBe(true);
+		expect(() => productSession.resolveUI("ui-missing", { confirmed: true })).toThrow("UI request is not pending");
+	});
+});
+
 describe("manual compaction context refresh", () => {
 	it("reports when the compaction hook already refreshed Session memory", async () => {
 		const productSession = Object.create(PiProductSession.prototype) as PiProductSession;

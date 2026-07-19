@@ -83,6 +83,14 @@ describe("runtime protocol", () => {
 				params: { requestId: "surface-1" },
 			}),
 		).toMatchObject({ id: "request-10", method: "completion.cancel" });
+		expect(
+			parseRuntimeRequest({
+				protocolVersion: PROTOCOL_VERSION,
+				id: "request-11",
+				method: "ui.resolve",
+				params: { sessionId: "source", requestId: "ui-1", response: { confirmed: true } },
+			}),
+		).toMatchObject({ id: "request-11", method: "ui.resolve" });
 	});
 
 	it("rejects unknown or unversioned requests", () => {

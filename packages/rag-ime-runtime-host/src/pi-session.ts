@@ -7,10 +7,13 @@ import {
 	type CreateAgentSessionOptions,
 	createAgentSession,
 	DefaultResourceLoader,
+	type ExtensionUIContext,
+	type ExtensionUIDialogOptions,
 	type ModelRuntime,
 	type PromptOptions,
 	SessionManager,
 	SettingsManager,
+	type Theme,
 } from "@earendil-works/pi-coding-agent";
 import { PiDebugContextRecorder } from "./debug-context.ts";
 import { createDiscoveryToolsExtension, diffSkillCatalog, runtimeSkillCatalogRevision } from "./discovery-tools.ts";
@@ -281,6 +284,41 @@ function recallMessageText(message: Record<string, unknown>): string {
 		.slice(0, 1200);
 }
 
+function uiConfirmationValue(value: string): boolean {
+	const normalized = value.trim().toLowerCase();
+	const affirmative = [
+		"yes",
+		"y",
+		"true",
+		"confirm",
+		"confirmed",
+		"allow",
+		"approve",
+		"是",
+		"确认",
+		"同意",
+		"允许",
+		"批准",
+		"保留",
+	];
+	const negative = ["no", "n", "false", "cancel", "deny", "reject", "否", "取消", "不同意", "拒绝", "不允许", "删除"];
+	const matches = (candidate: string) =>
+		normalized === candidate || normalized.startsWith(`${candidate}，`) || normalized.startsWith(`${candidate},`);
+	if (affirmative.some(matches)) return true;
+	if (negative.some(matches)) return false;
+	throw new RuntimeProtocolError(
+		"INVALID_UI_RESPONSE",
+		"Confirm UI response must explicitly approve or reject the request",
+	);
+}
+
+const productManagedTheme = new Proxy({} as Theme, {
+	get: (_target, property) => {
+		if (property === "name") return "product-managed";
+		return (...args: unknown[]) => String(args.at(-1) ?? "");
+	},
+});
+
 export class PiProductSession implements PooledSession {
 	readonly externalSessionId: string;
 	readonly cwd: string;
@@ -303,6 +341,15 @@ export class PiProductSession implements PooledSession {
 	private readonly pendingDecisions = new Map<
 		string,
 		{ requestId: string; resolve(value: boolean): void; cleanup(): void }
+	>();
+	private readonly pendingUIRequests = new Map<
+		string,
+		{
+			method: "select" | "confirm" | "input" | "editor";
+			options?: string[];
+			resolve(response: Record<string, unknown>): void;
+			cancel(): void;
+		}
 	>();
 
 	private constructor(
@@ -448,6 +495,7 @@ export class PiProductSession implements PooledSession {
 		);
 		await created.session.bindExtensions({
 			mode: "rpc",
+			uiContext: productSession.extensionUIContext(),
 			onError: (error) => {
 				productSession.notice({
 					type: "extension_error",
@@ -458,6 +506,132 @@ export class PiProductSession implements PooledSession {
 			},
 		});
 		return productSession;
+	}
+
+	private extensionUIContext(): ExtensionUIContext {
+		return {
+			select: (title, options, opts) =>
+				this.requestUI(
+					"select",
+					{ title, options: [...options], timeout: opts?.timeout },
+					(response) =>
+						response.cancelled === true
+							? undefined
+							: typeof response.value === "string"
+								? response.value
+								: undefined,
+					undefined,
+					opts,
+				),
+			confirm: (title, message, opts) =>
+				this.requestUI(
+					"confirm",
+					{ title, message, timeout: opts?.timeout },
+					(response) =>
+						response.cancelled === true
+							? false
+							: typeof response.confirmed === "boolean"
+								? response.confirmed
+								: false,
+					false,
+					opts,
+				),
+			input: (title, placeholder, opts) =>
+				this.requestUI(
+					"input",
+					{ title, placeholder, timeout: opts?.timeout },
+					(response) =>
+						response.cancelled === true
+							? undefined
+							: typeof response.value === "string"
+								? response.value
+								: undefined,
+					undefined,
+					opts,
+				),
+			editor: (title, prefill) =>
+				this.requestUI(
+					"editor",
+					{ title, prefill, defaultValue: prefill },
+					(response) =>
+						response.cancelled === true
+							? undefined
+							: typeof response.value === "string"
+								? response.value
+								: undefined,
+					undefined,
+				),
+			notify: () => {},
+			onTerminalInput: () => () => {},
+			setStatus: () => {},
+			setWorkingMessage: () => {},
+			setWorkingVisible: () => {},
+			setWorkingIndicator: () => {},
+			setHiddenThinkingLabel: () => {},
+			setWidget: () => {},
+			setFooter: () => {},
+			setHeader: () => {},
+			setTitle: () => {},
+			custom: async () => undefined as never,
+			pasteToEditor: () => {},
+			setEditorText: () => {},
+			getEditorText: () => "",
+			addAutocompleteProvider: () => {},
+			setEditorComponent: () => {},
+			getEditorComponent: () => undefined,
+			get theme() {
+				return productManagedTheme;
+			},
+			getAllThemes: () => [],
+			getTheme: () => undefined,
+			setTheme: () => ({ success: false, error: "UI is managed by the product" }),
+			getToolsExpanded: () => false,
+			setToolsExpanded: () => {},
+		};
+	}
+
+	private requestUI<T>(
+		method: "select" | "confirm" | "input" | "editor",
+		payload: Record<string, unknown>,
+		parse: (response: Record<string, unknown>) => T,
+		defaultValue: T,
+		opts?: ExtensionUIDialogOptions,
+	): Promise<T> {
+		if (opts?.signal?.aborted) return Promise.resolve(defaultValue);
+		const requestId = randomUUID();
+		return new Promise<T>((resolveRequest) => {
+			let timeoutId: ReturnType<typeof setTimeout> | undefined;
+			const finish = (value: T) => {
+				if (timeoutId) clearTimeout(timeoutId);
+				opts?.signal?.removeEventListener("abort", cancel);
+				this.pendingUIRequests.delete(requestId);
+				resolveRequest(value);
+			};
+			const cancel = () => finish(defaultValue);
+			if (opts?.timeout) timeoutId = setTimeout(cancel, opts.timeout);
+			opts?.signal?.addEventListener("abort", cancel, { once: true });
+			const options = Array.isArray(payload.options) ? payload.options.map((value) => String(value)) : undefined;
+			this.pendingUIRequests.set(requestId, {
+				method,
+				options,
+				resolve: (response) => finish(parse(response)),
+				cancel,
+			});
+			this.emitEvent({
+				protocolVersion: PROTOCOL_VERSION,
+				event: "agent.event",
+				sessionId: this.externalSessionId,
+				turnId: this.activeTurn?.turnId,
+				clientMessageId: this.activeTurn?.clientMessageId,
+				sequence: ++this.sequence,
+				payload: {
+					type: "extension_ui_request",
+					id: requestId,
+					method,
+					...payload,
+				},
+			});
+		});
 	}
 
 	private waitForDecision(
@@ -509,6 +683,51 @@ export class PiProductSession implements PooledSession {
 			throw new RuntimeProtocolError("DECISION_NOT_PENDING", `${kind} decision is not pending: ${targetId}`);
 		pending.resolve(approved);
 		return pending.requestId;
+	}
+
+	resolveUI(requestId: string, response: Record<string, unknown>): Record<string, unknown> {
+		const uiRequest = this.pendingUIRequests.get(requestId);
+		if (uiRequest) {
+			if (uiRequest.method === "select" && response.cancelled !== true) {
+				if (typeof response.value !== "string") {
+					throw new RuntimeProtocolError("INVALID_UI_RESPONSE", "Select UI response must include a value");
+				}
+				if (uiRequest.options?.length && !uiRequest.options.includes(response.value)) {
+					throw new RuntimeProtocolError("INVALID_UI_RESPONSE", "Selected value was not offered");
+				}
+			}
+			if (
+				(uiRequest.method === "input" || uiRequest.method === "editor") &&
+				response.cancelled !== true &&
+				typeof response.value !== "string"
+			) {
+				throw new RuntimeProtocolError("INVALID_UI_RESPONSE", "Text UI response must include a value");
+			}
+			if (uiRequest.method === "confirm" && response.cancelled !== true && typeof response.confirmed !== "boolean") {
+				throw new RuntimeProtocolError("INVALID_UI_RESPONSE", "Confirm UI response must include confirmed");
+			}
+			uiRequest.resolve(response);
+			return { requestId, resolved: true };
+		}
+		const pending = [...this.pendingDecisions.values()].find((item) => item.requestId === requestId);
+		if (!pending) {
+			throw new RuntimeProtocolError("UI_REQUEST_NOT_PENDING", `UI request is not pending: ${requestId}`);
+		}
+		let confirmed: boolean;
+		if (response.cancelled === true) {
+			confirmed = false;
+		} else if (typeof response.confirmed === "boolean") {
+			confirmed = response.confirmed;
+		} else if (typeof response.value === "string") {
+			confirmed = uiConfirmationValue(response.value);
+		} else {
+			throw new RuntimeProtocolError(
+				"INVALID_UI_RESPONSE",
+				"Confirm UI response must include confirmed, value, or cancelled",
+			);
+		}
+		pending.resolve(confirmed);
+		return { requestId, resolved: true };
 	}
 
 	get isIdle(): boolean {
@@ -978,6 +1197,8 @@ export class PiProductSession implements PooledSession {
 	}
 
 	dispose(): void {
+		for (const pending of this.pendingUIRequests.values()) pending.cancel();
+		this.pendingUIRequests.clear();
 		for (const pending of this.pendingDecisions.values()) {
 			pending.cleanup();
 			pending.resolve(false);

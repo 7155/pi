@@ -26,6 +26,7 @@ export type RuntimeMethod =
 	| "session.close"
 	| "approval.resolve"
 	| "review.resolve"
+	| "ui.resolve"
 	| "plugins.list"
 	| "plugins.create"
 	| "plugins.validate"
@@ -159,6 +160,7 @@ const RUNTIME_METHODS = new Set<RuntimeMethod>([
 	"session.close",
 	"approval.resolve",
 	"review.resolve",
+	"ui.resolve",
 	"plugins.list",
 	"plugins.create",
 	"plugins.validate",
