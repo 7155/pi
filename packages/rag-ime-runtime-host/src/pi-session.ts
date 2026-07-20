@@ -899,6 +899,8 @@ export class PiProductSession implements PooledSession {
 			sequence: this.sequence,
 			toolCatalogRevision: this.toolRegistry.revision(),
 			toolSchemaRevision: backendToolSchemaRevision(this.toolRegistry.list()),
+			toolManifest: this.toolRegistry.list(),
+			roomCapability: this.roomCapability ? structuredClone(this.roomCapability) : undefined,
 			disclosedBackendTools: this.toolRegistry.disclosed().map((tool) => tool.name),
 			// Compatibility field for older control-center clients.
 			activeBackendTools: this.toolRegistry.disclosed().map((tool) => tool.name),
