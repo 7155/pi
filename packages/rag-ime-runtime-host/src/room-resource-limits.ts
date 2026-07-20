@@ -10,15 +10,18 @@ export interface RoomResourceLimits {
 	repairRemaining: number;
 }
 
-export function createRoomResourceLimitExtension(
-	authorizeToolCall: () => { allowed: boolean; reason?: string },
-): { name: string; factory: ExtensionFactory } {
+export function createRoomResourceLimitExtension(authorizeToolCall: () => { allowed: boolean; reason?: string }): {
+	name: string;
+	factory: ExtensionFactory;
+} {
 	return {
 		name: "rag-ime-room-resource-limits",
 		factory: (pi) => {
 			pi.on("tool_call", async () => {
 				const decision = authorizeToolCall();
-				return decision.allowed ? undefined : { block: true, reason: decision.reason ?? "Room tool limit exhausted" };
+				return decision.allowed
+					? undefined
+					: { block: true, reason: decision.reason ?? "Room tool limit exhausted" };
 			});
 		},
 	};

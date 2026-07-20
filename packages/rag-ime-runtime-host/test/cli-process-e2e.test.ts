@@ -1,9 +1,9 @@
-import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
+import { type ChildProcessWithoutNullStreams, spawn } from "node:child_process";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
-import { fileURLToPath } from "node:url";
 import { createInterface } from "node:readline";
+import { fileURLToPath } from "node:url";
 import { afterEach, describe, expect, it } from "vitest";
 
 const packageRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..");
@@ -113,8 +113,12 @@ describe("runtime host real JSONL process", () => {
 			message: "Inspect package.json and settle.",
 		});
 		expect(receipt.result).toMatchObject({ delivery: "prompt", receiptKind: "dispatch_accepted" });
-		await host.waitFor((message) => message.event === "agent.event" && message.payload?.type === "tool_execution_start");
-		await host.waitFor((message) => message.event === "agent.event" && message.payload?.type === "tool_execution_end");
+		await host.waitFor(
+			(message) => message.event === "agent.event" && message.payload?.type === "tool_execution_start",
+		);
+		await host.waitFor(
+			(message) => message.event === "agent.event" && message.payload?.type === "tool_execution_end",
+		);
 		await host.waitFor((message) => message.event === "agent.event" && message.payload?.type === "agent_settled");
 		expect(host.messages.some((message) => message.payload?.toolName === "read")).toBe(true);
 		await host.close();

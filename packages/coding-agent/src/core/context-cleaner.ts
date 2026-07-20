@@ -102,7 +102,9 @@ function summaryFor(type: string, data: Record<string, unknown>): string {
 			return title ? `卡片：${title}` : "卡片";
 		case "checklist": {
 			const items = Array.isArray(data.items) ? data.items : [];
-			const done = items.filter((item) => item && typeof item === "object" && Boolean((item as Record<string, unknown>).checked)).length;
+			const done = items.filter(
+				(item) => item && typeof item === "object" && Boolean((item as Record<string, unknown>).checked),
+			).length;
 			return `清单${title ? `：${title}` : ""}，${done}/${items.length} 完成`;
 		}
 		case "table": {
@@ -138,15 +140,16 @@ function normalizeBlock(value: unknown): CanonicalBlock | undefined {
 	const id = compact(raw.id, 160);
 	const originalType = compact(raw.type, 80);
 	if (!id || !originalType || originalType === "html_widget") return undefined;
-	const data = raw.data && typeof raw.data === "object" && !Array.isArray(raw.data)
-		? (raw.data as Record<string, unknown>)
-		: {};
+	const data =
+		raw.data && typeof raw.data === "object" && !Array.isArray(raw.data) ? (raw.data as Record<string, unknown>) : {};
 	if (!safeData(data) || byteLength(canonicalJson(raw)) > MAX_BLOCK_BYTES) return undefined;
 	const type = KNOWN_TYPES.has(originalType) ? originalType : "unknown";
 	const summaryData = type === "unknown" ? { originalType } : data;
 	const summary = summaryFor(type, summaryData);
 	if (!summary) return undefined;
-	const digest = createHash("sha256").update(canonicalJson({ type, data: summaryData })).digest("hex");
+	const digest = createHash("sha256")
+		.update(canonicalJson({ type, data: summaryData }))
+		.digest("hex");
 	return { id, type, summary, digest };
 }
 

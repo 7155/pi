@@ -17,10 +17,9 @@ export async function createDeterministicTestModelRuntime(): Promise<ModelRuntim
 		tokensPerSecond: process.env.RAG_IME_PI_DETERMINISTIC_SLOW === "1" ? 10 : undefined,
 	});
 	faux.setResponses([
-		fauxAssistantMessage(
-			fauxToolCall("read", { path: "package.json", limit: 4 }, { id: "deterministic-read" }),
-			{ stopReason: "toolUse" },
-		),
+		fauxAssistantMessage(fauxToolCall("read", { path: "package.json", limit: 4 }, { id: "deterministic-read" }), {
+			stopReason: "toolUse",
+		}),
 		fauxAssistantMessage("Room dispatch inspected the workspace and settled."),
 	]);
 	const model = faux.getModel();

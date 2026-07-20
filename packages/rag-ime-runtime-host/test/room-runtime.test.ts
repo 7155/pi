@@ -148,8 +148,15 @@ describe("Room runtime RPC", () => {
 				state: "terminated",
 			});
 			expect(Object.keys((cancelled as Record<string, any>).cancellationSurfaces)).toEqual([
-				"provider", "tool", "exec", "retry", "compaction", "branch_summary",
-				"timer", "continuation", "session",
+				"provider",
+				"tool",
+				"exec",
+				"retry",
+				"compaction",
+				"branch_summary",
+				"timer",
+				"continuation",
+				"session",
 			]);
 			expect(target.abort).toHaveBeenCalledTimes(1);
 		} finally {

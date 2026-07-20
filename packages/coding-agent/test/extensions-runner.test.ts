@@ -6,6 +6,7 @@ import { createModelRegistry } from "./model-runtime-test-utils.ts";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
+import type { Context, Model } from "@earendil-works/pi-ai";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { AuthStorage } from "../src/core/auth-storage.ts";
 import { createExtensionRuntime, discoverAndLoadExtensions, loadExtensions } from "../src/core/extensions/loader.ts";
@@ -997,14 +998,12 @@ describe("ExtensionRunner", () => {
 			fs.writeFileSync(path.join(extensionsDir, "provider-context.ts"), extCode);
 			const result = await discoverAndLoadExtensions([], tempDir, tempDir);
 			const runner = new ExtensionRunner(result.extensions, result.runtime, tempDir, sessionManager, modelRegistry);
-			const model = { provider: "test", id: "model", api: "openai-completions" } as never;
+			const model = { provider: "test", id: "model", api: "openai-completions" } as unknown as Model<any>;
 			const context = {
 				systemPrompt: "stable system",
 				messages: [{ role: "user", content: [{ type: "text", text: "hello" }], timestamp: 1 }],
-				tools: [
-					{ name: "read", description: "Read", parameters: { type: "object" }, execute: async () => undefined },
-				],
-			} as never;
+				tools: [{ name: "read", description: "Read", parameters: { type: "object" } }],
+			} as Context;
 
 			await runner.emitProviderContextInspection(model, context);
 

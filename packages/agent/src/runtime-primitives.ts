@@ -111,9 +111,7 @@ export class ContinuationQueue<TPayload = unknown> {
 			eligible.push(item);
 		}
 
-		eligible.sort(
-			(left, right) => right.priority - left.priority || left.createdAt - right.createdAt,
-		);
+		eligible.sort((left, right) => right.priority - left.priority || left.createdAt - right.createdAt);
 		return eligible.slice(0, options.limit).map((item) => {
 			item.state = "leased";
 			item.attempt += 1;

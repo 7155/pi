@@ -11,7 +11,6 @@ import {
 } from "@earendil-works/pi-ai";
 import { ModelRuntime } from "@earendil-works/pi-coding-agent";
 import { PiProductSession } from "./pi-session.ts";
-import type { RoomResourceLimits } from "./room-resource-limits.ts";
 import { ManagedPluginManager } from "./plugin-manager.ts";
 import {
 	PROTOCOL_NAME,
@@ -20,6 +19,7 @@ import {
 	RuntimeProtocolError,
 	type RuntimeRequest,
 } from "./protocol.ts";
+import type { RoomResourceLimits } from "./room-resource-limits.ts";
 import { BoundedSessionPool } from "./session-pool.ts";
 import {
 	codexPluginSkillCatalogNames,
@@ -156,7 +156,11 @@ function optionalRoomCapability(params: Record<string, unknown>): Record<string,
 	if (typeof record.manifestHash !== "string" || !/^[a-f0-9]{64}$/u.test(record.manifestHash)) {
 		throw new RuntimeProtocolError("INVALID_PARAMS", "roomCapability.manifestHash must be sha256 hex");
 	}
-	if (typeof record.capabilityEpoch !== "number" || !Number.isSafeInteger(record.capabilityEpoch) || record.capabilityEpoch < 0) {
+	if (
+		typeof record.capabilityEpoch !== "number" ||
+		!Number.isSafeInteger(record.capabilityEpoch) ||
+		record.capabilityEpoch < 0
+	) {
 		throw new RuntimeProtocolError("INVALID_PARAMS", "roomCapability.capabilityEpoch is invalid");
 	}
 	return structuredClone(record);
@@ -174,7 +178,11 @@ function optionalRoomProviderContext(params: Record<string, unknown>): Record<st
 			throw new RuntimeProtocolError("INVALID_PARAMS", `roomProviderContext.${key} is required`);
 		}
 	}
-	if (typeof record.throughSequence !== "number" || !Number.isSafeInteger(record.throughSequence) || record.throughSequence < 0) {
+	if (
+		typeof record.throughSequence !== "number" ||
+		!Number.isSafeInteger(record.throughSequence) ||
+		record.throughSequence < 0
+	) {
 		throw new RuntimeProtocolError("INVALID_PARAMS", "roomProviderContext.throughSequence is invalid");
 	}
 	return structuredClone(record);
@@ -205,8 +213,13 @@ function optionalRoomResourceLimits(params: Record<string, unknown>): RoomResour
 	const record = value as Record<string, unknown>;
 	const result = {} as RoomResourceLimits;
 	for (const key of [
-		"deadlineAtMs", "maxInputTokens", "maxOutputTokens", "maxToolCalls",
-		"maxToolCost", "retryRemaining", "repairRemaining",
+		"deadlineAtMs",
+		"maxInputTokens",
+		"maxOutputTokens",
+		"maxToolCalls",
+		"maxToolCost",
+		"retryRemaining",
+		"repairRemaining",
 	] as const) {
 		const entry = record[key];
 		if (typeof entry !== "number" || !Number.isSafeInteger(entry) || entry < 0) {
@@ -526,20 +539,20 @@ export class RagImeRuntimeHost {
 						roomCapability: optionalRoomCapability(params),
 						toolGatewayUrl: this.options.toolGatewayUrl,
 						toolGatewayToken: this.options.toolGatewayToken,
-							systemPrompt: optionalString(params, "systemPrompt", 64_000),
-							sessionContext: optionalString(params, "sessionContext", 256_000),
-							roomProviderContext: optionalRoomProviderContext(params),
-							roomSkillPolicy: optionalRoomSkillPolicy(params),
-							roomResourceLimits: optionalRoomResourceLimits(params),
-							noContextFiles: optionalBoolean(params, "noContextFiles"),
+						systemPrompt: optionalString(params, "systemPrompt", 64_000),
+						sessionContext: optionalString(params, "sessionContext", 256_000),
+						roomProviderContext: optionalRoomProviderContext(params),
+						roomSkillPolicy: optionalRoomSkillPolicy(params),
+						roomResourceLimits: optionalRoomResourceLimits(params),
+						noContextFiles: optionalBoolean(params, "noContextFiles"),
 						emitEvent: this.options.emitEvent,
 					}),
 				);
-					return {
-						snapshot: opened.session.snapshot(),
-						evictedSessionId: opened.evictedSessionId,
-						roomSkillLoad: opened.session.roomSkillLoadReceipt(),
-					};
+				return {
+					snapshot: opened.session.snapshot(),
+					evictedSessionId: opened.evictedSessionId,
+					roomSkillLoad: opened.session.roomSkillLoadReceipt(),
+				};
 			}
 			case "session.snapshot":
 				return this.session(params).snapshot();

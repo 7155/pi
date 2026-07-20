@@ -370,12 +370,20 @@ export function createDiscoveryToolsExtension(options: DiscoveryToolsOptions): I
 							options.registry.revision(),
 						);
 						if (options.gateway?.roomCapability) {
-							const governed = await requestProductGateway(options.gateway, "search", {
-								sessionId: options.gateway.sessionId,
-								receiptId: `search:${toolCallId}`,
-								query: typeof (args as { query?: unknown }).query === "string" ? (args as { query: string }).query : "",
-								createdAtMs: Date.now(),
-							}, signal);
+							const governed = await requestProductGateway(
+								options.gateway,
+								"search",
+								{
+									sessionId: options.gateway.sessionId,
+									receiptId: `search:${toolCallId}`,
+									query:
+										typeof (args as { query?: unknown }).query === "string"
+											? (args as { query: string }).query
+											: "",
+									createdAtMs: Date.now(),
+								},
+								signal,
+							);
 							result = governed.result ?? result;
 						}
 						return {
@@ -395,12 +403,17 @@ export function createDiscoveryToolsExtension(options: DiscoveryToolsOptions): I
 						const loaded = loadBackendTool(options.registry, args as { name?: unknown });
 						let governedReceipt: Record<string, unknown> | undefined;
 						if (options.gateway?.roomCapability) {
-							const governed = await requestProductGateway(options.gateway, "load", {
-								sessionId: options.gateway.sessionId,
-								receiptId: `load:${toolCallId}`,
-								toolName: loaded.tool.name,
-								createdAtMs: Date.now(),
-							}, signal);
+							const governed = await requestProductGateway(
+								options.gateway,
+								"load",
+								{
+									sessionId: options.gateway.sessionId,
+									receiptId: `load:${toolCallId}`,
+									toolName: loaded.tool.name,
+									createdAtMs: Date.now(),
+								},
+								signal,
+							);
 							governedReceipt = governed.result;
 							const receiptId = typeof governedReceipt?.receiptId === "string" ? governedReceipt.receiptId : "";
 							options.registry.recordLoadReceipt(loaded.tool.name, receiptId);
