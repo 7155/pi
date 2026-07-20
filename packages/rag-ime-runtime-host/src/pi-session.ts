@@ -16,7 +16,13 @@ import {
 	type Theme,
 } from "@earendil-works/pi-coding-agent";
 import { PiDebugContextRecorder } from "./debug-context.ts";
-import { createDiscoveryToolsExtension, diffSkillCatalog, runtimeSkillCatalogRevision } from "./discovery-tools.ts";
+import {
+	createDiscoveryToolsExtension,
+	diffSkillCatalog,
+	loadSkill,
+	runtimeSkillCatalogRevision,
+	searchSkills,
+} from "./discovery-tools.ts";
 import { createLifecycleHookController } from "./lifecycle-hooks.ts";
 import { PROTOCOL_VERSION, type RuntimeEventEnvelope, RuntimeProtocolError } from "./protocol.ts";
 import { TOOL_LOAD_TOOL_NAME } from "./runtime-tool-names.ts";
@@ -57,6 +63,9 @@ export interface PiSessionOpenOptions {
 	toolGatewayUrl?: string;
 	toolGatewayToken?: string;
 	systemPrompt?: string;
+	sessionContext?: string;
+	roomProviderContext?: Record<string, unknown>;
+	roomSkillPolicy?: Record<string, unknown>;
 	noContextFiles?: boolean;
 	emitEvent(event: RuntimeEventEnvelope): void;
 }
@@ -345,6 +354,8 @@ export class PiProductSession implements PooledSession {
 	private sessionContext = "";
 	private sessionContextRefreshRevision = 0;
 	private transientContext = "";
+	private roomProviderContext?: Record<string, unknown>;
+	private roomSkillLoad?: { text: string; details: Record<string, unknown> };
 	private latestCompaction: PublicCompactionState | undefined;
 	private readonly pendingDecisions = new Map<
 		string,
@@ -450,8 +461,9 @@ export class PiProductSession implements PooledSession {
 							productSession.sessionContextRefreshRevision += 1;
 						}
 					},
-					getRecentMessages: () => productSession?.recentMessagesForContext() ?? [],
-				}),
+						getRecentMessages: () => productSession?.recentMessagesForContext() ?? [],
+						getRoomSkillRecovery: () => productSession?.roomSkillLoadReceipt(),
+					}),
 				createWorkflowControlExtension({
 					bridge: backendBridge,
 					onProjectComplete: (details) => lifecycleHooks.projectComplete(details),
@@ -467,7 +479,23 @@ export class PiProductSession implements PooledSession {
 			noContextFiles: options.noContextFiles ?? false,
 			systemPrompt: options.systemPrompt,
 		});
-		await resourceLoader.reload();
+			await resourceLoader.reload();
+			let roomSkillLoad: { text: string; details: Record<string, unknown> } | undefined;
+			if (options.roomSkillPolicy) {
+				const skillId = String(options.roomSkillPolicy.skillId ?? "");
+				const skills = resourceLoader.getSkills().skills;
+				const search = searchSkills(skills, { query: skillId, limit: 20 });
+				const matches = Array.isArray(search.items)
+					? search.items.filter((item) => typeof item === "object" && item !== null && (item as { name?: unknown }).name === skillId)
+					: [];
+				if (matches.length !== 1) {
+					throw new RuntimeProtocolError("ROOM_SKILL_NOT_UNIQUE", `Required Room Skill is not unique: ${skillId}`);
+				}
+				roomSkillLoad = await loadSkill(skills, { name: skillId });
+				if (roomSkillLoad.details.contentRevision !== options.roomSkillPolicy.skillHash) {
+					throw new RuntimeProtocolError("ROOM_SKILL_HASH_MISMATCH", `Required Room Skill changed: ${skillId}`);
+				}
+			}
 		let model: Model<Api> | undefined;
 		if (options.provider || options.modelId) {
 			if (!options.provider || !options.modelId) {
@@ -496,15 +524,22 @@ export class PiProductSession implements PooledSession {
 		// every authorized tool routable while Provider schemas stay progressive.
 		created.session.setRegisteredToolExecutionEnabled(true);
 		applyBackendToolDisclosure(created.session, registry);
-		productSession = new PiProductSession(
+			productSession = new PiProductSession(
 			options,
 			created.session,
 			registry,
 			resourceLoader,
 			settingsManager,
-			debugContextRecorder,
-		);
-		await created.session.bindExtensions({
+				debugContextRecorder,
+			);
+			productSession.sessionContext = [options.sessionContext?.trim(), roomSkillLoad?.text]
+				.filter((value): value is string => Boolean(value))
+				.join("\n\n");
+			productSession.roomProviderContext = options.roomProviderContext
+				? structuredClone(options.roomProviderContext)
+				: undefined;
+			productSession.roomSkillLoad = roomSkillLoad;
+			await created.session.bindExtensions({
 			mode: "rpc",
 			uiContext: productSession.extensionUIContext(),
 			onError: (error) => {
@@ -736,7 +771,7 @@ export class PiProductSession implements PooledSession {
 				"INVALID_UI_RESPONSE",
 				"Confirm UI response must include confirmed, value, or cancelled",
 			);
-		}
+			}
 		pending.resolve(confirmed);
 		return { requestId, resolved: true };
 	}
@@ -900,11 +935,13 @@ export class PiProductSession implements PooledSession {
 			toolCatalogRevision: this.toolRegistry.revision(),
 			toolSchemaRevision: backendToolSchemaRevision(this.toolRegistry.list()),
 			toolManifest: this.toolRegistry.list(),
-			roomCapability: this.roomCapability ? structuredClone(this.roomCapability) : undefined,
+				roomCapability: this.roomCapability ? structuredClone(this.roomCapability) : undefined,
+				roomProviderContext: this.roomProviderContext ? structuredClone(this.roomProviderContext) : undefined,
 			disclosedBackendTools: this.toolRegistry.disclosed().map((tool) => tool.name),
 			// Compatibility field for older control-center clients.
 			activeBackendTools: this.toolRegistry.disclosed().map((tool) => tool.name),
-			skillCatalogRevision: runtimeSkillCatalogRevision(this.resourceLoader.getSkills().skills),
+				skillCatalogRevision: runtimeSkillCatalogRevision(this.resourceLoader.getSkills().skills),
+				roomSkillLoad: this.roomSkillLoadReceipt(),
 			piSkillsEnabled: this.piSkillsEnabled,
 			codexSkillsEnabled: this.codexSkillsEnabled,
 			messages: this.session.messages,
@@ -943,6 +980,14 @@ export class PiProductSession implements PooledSession {
 			editorText: result.editorText ?? target.text,
 			leafId: this.session.sessionManager.getLeafId() ?? "",
 			snapshot: this.snapshot(),
+		};
+	}
+
+	roomSkillLoadReceipt(): Record<string, unknown> | undefined {
+		if (!this.roomSkillLoad) return undefined;
+		return {
+			...structuredClone(this.roomSkillLoad.details),
+			loadReason: "stage_required",
 		};
 	}
 
@@ -1153,7 +1198,17 @@ export class PiProductSession implements PooledSession {
 		if (!this.activeTurn || this.session.isIdle) {
 			const turn = await this.prompt({ message: options.message });
 			this.activeRoom = { rootId: options.rootId, generation: options.generation };
-			return { delivery: "prompt", turnId: turn.turnId };
+			return {
+				delivery: "prompt",
+				turnId: turn.turnId,
+				roomSkillLoad: this.roomSkillLoadReceipt(),
+				providerContextReceipt: this.roomProviderContext
+					? {
+						...structuredClone(this.roomProviderContext),
+						providerRequestId: turn.turnId,
+					}
+					: undefined,
+			};
 		}
 		const continuation = await this.session.followUp(options.message, undefined, {
 			correlationId: options.rootId,

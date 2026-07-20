@@ -161,6 +161,40 @@ function optionalRoomCapability(params: Record<string, unknown>): Record<string,
 	return structuredClone(record);
 }
 
+function optionalRoomProviderContext(params: Record<string, unknown>): Record<string, unknown> | undefined {
+	const value = params.roomProviderContext;
+	if (value === undefined || value === null) return undefined;
+	if (typeof value !== "object" || Array.isArray(value)) {
+		throw new RuntimeProtocolError("INVALID_PARAMS", "roomProviderContext must be an object");
+	}
+	const record = value as Record<string, unknown>;
+	for (const key of ["journalId", "projectionHash"] as const) {
+		if (typeof record[key] !== "string" || !record[key]) {
+			throw new RuntimeProtocolError("INVALID_PARAMS", `roomProviderContext.${key} is required`);
+		}
+	}
+	if (typeof record.throughSequence !== "number" || !Number.isSafeInteger(record.throughSequence) || record.throughSequence < 0) {
+		throw new RuntimeProtocolError("INVALID_PARAMS", "roomProviderContext.throughSequence is invalid");
+	}
+	return structuredClone(record);
+}
+
+function optionalRoomSkillPolicy(params: Record<string, unknown>): Record<string, unknown> | undefined {
+	const value = params.roomSkillPolicy;
+	if (value === undefined || value === null) return undefined;
+	if (typeof value !== "object" || Array.isArray(value)) {
+		throw new RuntimeProtocolError("INVALID_PARAMS", "roomSkillPolicy must be an object");
+	}
+	const record = value as Record<string, unknown>;
+	if (record.selection !== "required" || typeof record.skillId !== "string" || !record.skillId) {
+		throw new RuntimeProtocolError("INVALID_PARAMS", "roomSkillPolicy must name one required Skill");
+	}
+	if (typeof record.skillHash !== "string" || !/^[a-f0-9]{64}$/u.test(record.skillHash)) {
+		throw new RuntimeProtocolError("INVALID_PARAMS", "roomSkillPolicy.skillHash must be sha256 hex");
+	}
+	return structuredClone(record);
+}
+
 function isInside(root: string, candidate: string): boolean {
 	const child = relative(root, candidate);
 	return child === "" || (!child.startsWith(`..${sep}`) && child !== ".." && !pathIsAbsolute(child));
@@ -467,12 +501,19 @@ export class RagImeRuntimeHost {
 						roomCapability: optionalRoomCapability(params),
 						toolGatewayUrl: this.options.toolGatewayUrl,
 						toolGatewayToken: this.options.toolGatewayToken,
-						systemPrompt: optionalString(params, "systemPrompt", 64_000),
-						noContextFiles: optionalBoolean(params, "noContextFiles"),
+							systemPrompt: optionalString(params, "systemPrompt", 64_000),
+							sessionContext: optionalString(params, "sessionContext", 256_000),
+							roomProviderContext: optionalRoomProviderContext(params),
+							roomSkillPolicy: optionalRoomSkillPolicy(params),
+							noContextFiles: optionalBoolean(params, "noContextFiles"),
 						emitEvent: this.options.emitEvent,
 					}),
 				);
-				return { snapshot: opened.session.snapshot(), evictedSessionId: opened.evictedSessionId };
+					return {
+						snapshot: opened.session.snapshot(),
+						evictedSessionId: opened.evictedSessionId,
+						roomSkillLoad: opened.session.roomSkillLoadReceipt(),
+					};
 			}
 			case "session.snapshot":
 				return this.session(params).snapshot();

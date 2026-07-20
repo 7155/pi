@@ -7,6 +7,7 @@ interface SessionContextRefreshOptions {
 	getSessionContext(): string;
 	setSessionContext(value: string): void;
 	getRecentMessages(): Array<{ role: "user" | "assistant"; text: string }>;
+	getRoomSkillRecovery(): Record<string, unknown> | undefined;
 }
 
 export function createSessionContextRefreshExtension(options: SessionContextRefreshOptions): ExtensionFactory {
@@ -16,6 +17,7 @@ export function createSessionContextRefreshExtension(options: SessionContextRefr
 		summary = "",
 	): Promise<string | undefined> {
 		if (!options.bridge.gatewayUrl) return undefined;
+		const roomSkillRecovery = options.getRoomSkillRecovery();
 		try {
 			const response = await requestProductGateway(
 				options.bridge,
@@ -27,6 +29,7 @@ export function createSessionContextRefreshExtension(options: SessionContextRefr
 					queryText,
 					summary,
 					recentMessages: options.getRecentMessages(),
+					roomSkillRecovery,
 				},
 				undefined,
 			);
@@ -34,7 +37,8 @@ export function createSessionContextRefreshExtension(options: SessionContextRefr
 			if (!context) return undefined;
 			options.setSessionContext(context);
 			return context;
-		} catch {
+		} catch (error) {
+			if (roomSkillRecovery) throw error;
 			// Retrieval is an enhancement. Keep the last valid Session context
 			// rather than failing a model turn when the Sidecar is unavailable.
 			return undefined;

@@ -1,4 +1,5 @@
-import { mkdtemp, rm } from "node:fs/promises";
+import { createHash } from "node:crypto";
+import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { ModelRuntime } from "@earendil-works/pi-coding-agent";
@@ -11,6 +12,65 @@ function request(id: string, method: RuntimeRequest["method"], params: Record<st
 }
 
 describe("Room runtime RPC", () => {
+	it("opens a governed Session with one exact native Skill and provider-only Room context", async () => {
+		const root = await mkdtemp(join(tmpdir(), "rag-ime-room-runtime-context-"));
+		const skillRoot = join(root, "skills", "room-test-driven-implementation");
+		const body = "Apply the bounded implementation workflow.";
+		await mkdir(skillRoot, { recursive: true });
+		await writeFile(
+			join(skillRoot, "SKILL.md"),
+			`---\nname: room-test-driven-implementation\ndescription: Implement safely.\n---\n${body}\n`,
+		);
+		const modelRuntime = await ModelRuntime.create({
+			authPath: join(root, "auth.json"),
+			modelsPath: null,
+			allowModelNetwork: false,
+		});
+		const host = await RagImeRuntimeHost.create({
+			agentDir: join(root, "agent"),
+			sessionDir: join(root, "sessions"),
+			pluginsRoot: join(root, "plugins"),
+			pluginInbox: join(root, "plugin-inbox"),
+			skillPaths: [skillRoot],
+			maxSessions: 2,
+			modelRuntime,
+			emitEvent: () => undefined,
+		});
+		try {
+			const opened = (await host.handle(
+				request("open", "session.open", {
+					sessionId: "session:governed",
+					cwd: root,
+					systemPrompt: "stable-layers-1-through-5",
+					sessionContext: "dynamic-room-tail",
+					roomProviderContext: {
+						journalId: "journal:1",
+						throughSequence: 1,
+						projectionHash: "a".repeat(64),
+					},
+					roomSkillPolicy: {
+						selection: "required",
+						skillId: "room-test-driven-implementation",
+						skillHash: createHash("sha256").update(body).digest("hex"),
+					},
+				}),
+			)) as Record<string, any>;
+
+			expect(opened.roomSkillLoad).toMatchObject({
+				name: "room-test-driven-implementation",
+				contentRevision: createHash("sha256").update(body).digest("hex"),
+				loadReason: "stage_required",
+			});
+			expect(opened.snapshot.roomProviderContext).toMatchObject({
+				journalId: "journal:1",
+				throughSequence: 1,
+			});
+		} finally {
+			await host.dispose();
+			await rm(root, { recursive: true, force: true });
+		}
+	});
+
 	it("negotiates typed Room delivery, deduplicates it, and applies targeted cancellation", async () => {
 		const root = await mkdtemp(join(tmpdir(), "rag-ime-room-runtime-"));
 		const modelRuntime = await ModelRuntime.create({
