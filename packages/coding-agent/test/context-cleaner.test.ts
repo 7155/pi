@@ -36,15 +36,17 @@ describe("agent block context cleaner", () => {
 
 	it("keeps invalid fences in Session but omits their raw payload from Provider context", () => {
 		const malformed = "```rag_ime_blocks\n{not json}\n```";
+		const truncated = 'before\n```rag_ime_blocks\n{"raw-secret":true';
 		const partial = envelope([
 			{ id: "ok", type: "card", data: { title: "ok" } },
 			{ id: "bad", type: "html_widget", data: { html: "<script>alert(1)</script>" } },
 		]);
-		for (const input of [malformed, partial]) {
+		for (const input of [malformed, partial, truncated]) {
 			const cleaned = cleanAgentBlockText(input);
 			expect(cleaned.text).toMatch(/^before\n|^\[无效内容块已省略 digest=sha256:[0-9a-f]{64}\]/);
 			expect(cleaned.text).not.toContain("not json");
 			expect(cleaned.text).not.toContain("<script>");
+			expect(cleaned.text).not.toContain("raw-secret");
 			expect(cleaned.receipt.omittedInvalidFenceCount).toBe(1);
 			expect(cleaned.receipt.preservedInvalidFenceCount).toBe(0);
 		}

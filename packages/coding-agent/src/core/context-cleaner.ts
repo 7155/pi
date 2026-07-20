@@ -1,6 +1,7 @@
 import { createHash } from "node:crypto";
 
 const BLOCK_FENCE = /```rag_ime_blocks[ \t]*\r?\n([\s\S]*?)\r?\n```/g;
+const TRUNCATED_BLOCK_FENCE = /```rag_ime_blocks[ \t]*\r?\n([\s\S]*)$/g;
 const MAX_ENVELOPE_BYTES = 256 * 1024;
 const MAX_BLOCK_BYTES = 64 * 1024;
 const MAX_BLOCKS = 16;
@@ -190,7 +191,7 @@ function renderReference(block: CanonicalBlock): string {
 export function cleanAgentBlockText(input: string): CleanedContextText {
 	let cleanedBlockCount = 0;
 	let omittedInvalidFenceCount = 0;
-	const text = input.replace(BLOCK_FENCE, (_match, json: string) => {
+	const completeFencesCleaned = input.replace(BLOCK_FENCE, (_match, json: string) => {
 		const blocks = parseEnvelope(json);
 		if (!blocks) {
 			omittedInvalidFenceCount += 1;
@@ -199,6 +200,11 @@ export function cleanAgentBlockText(input: string): CleanedContextText {
 		}
 		cleanedBlockCount += blocks.length;
 		return blocks.map(renderReference).join("\n");
+	});
+	const text = completeFencesCleaned.replace(TRUNCATED_BLOCK_FENCE, (_match, json: string) => {
+		omittedInvalidFenceCount += 1;
+		const digest = createHash("sha256").update(json, "utf8").digest("hex");
+		return `[无效内容块已省略 digest=sha256:${digest}]`;
 	});
 	const beforeBytes = byteLength(input);
 	const afterBytes = byteLength(text);
