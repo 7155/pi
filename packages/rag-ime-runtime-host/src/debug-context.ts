@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import type { Dirent } from "node:fs";
 import { mkdir, readdir, readFile, rename, stat, unlink, writeFile } from "node:fs/promises";
 import { join } from "node:path";
@@ -22,6 +23,21 @@ export interface PiDebugContextDelta {
 	removedMessageCount: number;
 	addedMessageCount: number;
 	addedMessages: unknown[];
+	prefixBytes: number;
+	prefixSha256: string;
+	currentBytes: number;
+	deltaBytes: number;
+	duplicateBytes: number;
+}
+
+export interface PiProviderRequestReceipt {
+	schemaVersion: "rag-ime.provider-request-receipt.v1";
+	index: number;
+	capturedAtMs: number;
+	model: Record<string, unknown>;
+	streamOptions: unknown;
+	payload?: unknown;
+	usage?: Record<string, number>;
 }
 
 export interface PiDebugModelCall {
@@ -31,6 +47,7 @@ export interface PiDebugModelCall {
 	updatedAtMs: number;
 	completedAtMs?: number;
 	contextMessages: unknown;
+	providerContext?: unknown;
 	contextDelta: PiDebugContextDelta;
 	providerExchanges: PiDebugProviderExchange[];
 	assistantMessage?: unknown;
@@ -65,7 +82,7 @@ export interface PiDebugToolBatch {
 }
 
 export interface PiDebugContextRecord {
-	schemaVersion: "rag-ime.pi-debug-context.v1";
+	schemaVersion: "rag-ime.context-inspection.v2";
 	sessionId: string;
 	turnId: string;
 	clientMessageId: string;
@@ -77,8 +94,25 @@ export interface PiDebugContextRecord {
 	model?: Record<string, unknown>;
 	activeTools: string[];
 	toolSchemas: Array<Record<string, unknown>>;
+	skillCatalog: Array<Record<string, unknown>>;
+	loadedSkillReceipts: Array<Record<string, unknown>>;
+	contributionRefs: Array<Record<string, unknown>>;
 	contextWindows: Array<{ index: number; capturedAtMs: number; messages: unknown }>;
 	providerRequests: Array<{ index: number; capturedAtMs: number; payload: unknown }>;
+	providerRequestReceipts: PiProviderRequestReceipt[];
+	cacheEvidence: Array<{
+		requestIndex: number;
+		prefixSha256: string;
+		prefixBytes: number;
+		deltaBytes: number;
+		duplicateBytes: number;
+		inputTokens: number;
+		outputTokens: number;
+		cacheReadTokens: number;
+		cacheWriteTokens: number;
+		capability: "reported" | "unsupported";
+		cacheHitProven: boolean;
+	}>;
 	modelCalls: PiDebugModelCall[];
 	toolExecutions: PiDebugToolExecution[];
 	toolBatches: PiDebugToolBatch[];
@@ -98,6 +132,7 @@ export interface PiDebugContextSummary {
 export interface PiDebugContextStorageOptions {
 	directory?: string;
 	maxBytes?: number;
+	contributionRefs?: Array<Record<string, unknown>>;
 }
 
 export interface PiDebugContextStorageStatus {
@@ -137,6 +172,9 @@ export class PiDebugContextRecorder {
 	private lastPersistedAtMs: number | undefined;
 	private runtimeTurnIndex: number | undefined;
 	private eventSequence = 0;
+	private providerCallSequence = 0;
+	private previousContextMessages: unknown;
+	private readonly contributionRefs: Array<Record<string, unknown>>;
 
 	constructor(
 		sessionId: string,
@@ -148,6 +186,7 @@ export class PiDebugContextRecorder {
 		this.storageDirectory = storage.directory?.trim() ?? "";
 		const requestedMax = Number.isFinite(storage.maxBytes) ? Math.floor(storage.maxBytes ?? 0) : 0;
 		this.storageMaxBytes = Math.min(MAX_STORAGE_BYTES, Math.max(1, requestedMax || MAX_STORAGE_BYTES));
+		this.contributionRefs = cloneForInspection(storage.contributionRefs ?? []) as Array<Record<string, unknown>>;
 		this.pendingPersistence = this.queueStorageTask(() => this.restorePersistedRecords());
 	}
 
@@ -165,22 +204,23 @@ export class PiDebugContextRecorder {
 					.map((tool) => ({
 						name: tool.name,
 						description: tool.description,
-						parameters: cloneForDebug(tool.parameters),
+						parameters: cloneForInspection(tool.parameters),
 						promptGuidelines: tool.promptGuidelines,
 					}));
 				this.runtimeTurnIndex = undefined;
 				this.eventSequence = 0;
 				this.records.delete(identity.turnId);
+				const promptOptions = event.systemPromptOptions as { skills?: Array<Record<string, unknown>> } | undefined;
 				this.records.set(identity.turnId, {
-					schemaVersion: "rag-ime.pi-debug-context.v1",
+					schemaVersion: "rag-ime.context-inspection.v2",
 					sessionId: this.sessionId,
 					turnId: identity.turnId,
 					clientMessageId: identity.clientMessageId ?? "",
 					capturedAtMs: now,
 					updatedAtMs: now,
-					prompt: event.prompt,
-					systemPrompt: event.systemPrompt,
-					systemPromptOptions: cloneForDebug(event.systemPromptOptions),
+					prompt: cloneForInspection(event.prompt) as string,
+					systemPrompt: cloneForInspection(event.systemPrompt) as string,
+					systemPromptOptions: cloneForInspection(event.systemPromptOptions),
 					model: context.model
 						? {
 								provider: context.model.provider,
@@ -193,8 +233,17 @@ export class PiDebugContextRecorder {
 						: undefined,
 					activeTools: [...activeTools],
 					toolSchemas,
+					skillCatalog: (promptOptions?.skills ?? []).map((skill) => ({
+						name: String(skill.name ?? ""),
+						description: String(skill.description ?? ""),
+						source: cloneForInspection(skill.sourceInfo),
+					})),
+					loadedSkillReceipts: [],
+					contributionRefs: structuredClone(this.contributionRefs),
 					contextWindows: [],
 					providerRequests: [],
+					providerRequestReceipts: [],
+					cacheEvidence: [],
 					modelCalls: [],
 					toolExecutions: [],
 					toolBatches: [],
@@ -211,9 +260,9 @@ export class PiDebugContextRecorder {
 				const record = this.current();
 				if (!record) return;
 				const now = Date.now();
-				const messages = cloneForDebug(event.messages);
-				const previous = record.modelCalls.at(-1);
-				const index = (previous?.index ?? 0) + 1;
+				const messages = cloneForInspection(event.messages);
+				const previousIndex = this.providerCallSequence || undefined;
+				const index = ++this.providerCallSequence;
 				record.contextWindows.push({ index, capturedAtMs: now, messages });
 				if (record.contextWindows.length > MAX_CALLS_PER_TURN) record.contextWindows.shift();
 				record.modelCalls.push({
@@ -222,10 +271,25 @@ export class PiDebugContextRecorder {
 					capturedAtMs: now,
 					updatedAtMs: now,
 					contextMessages: messages,
-					contextDelta: contextDelta(previous?.contextMessages, messages, previous?.index),
+					contextDelta: contextDelta(this.previousContextMessages, messages, previousIndex),
 					providerExchanges: [],
 				});
+				this.previousContextMessages = messages;
 				if (record.modelCalls.length > MAX_CALLS_PER_TURN) record.modelCalls.shift();
+				record.updatedAtMs = now;
+			});
+
+			(
+				pi as unknown as {
+					on(name: string, handler: (event: { context: unknown }) => void): void;
+				}
+			).on("provider_context_inspection", (event) => {
+				const record = this.current();
+				if (!record) return;
+				const now = Date.now();
+				const call = this.ensureModelCall(record, now);
+				call.providerContext = cloneForInspection(event.context);
+				call.updatedAtMs = now;
 				record.updatedAtMs = now;
 			});
 
@@ -233,8 +297,17 @@ export class PiDebugContextRecorder {
 				const record = this.current();
 				if (!record) return;
 				const now = Date.now();
-				const payload = cloneForDebug(event.payload);
-				const index = (record.providerRequests.at(-1)?.index ?? 0) + 1;
+				const index = (record.providerRequestReceipts.at(-1)?.index ?? 0) + 1;
+				record.providerRequestReceipts.push({
+					schemaVersion: "rag-ime.provider-request-receipt.v1",
+					index,
+					capturedAtMs: now,
+					model: structuredClone(record.model ?? {}),
+					streamOptions: {},
+					payload: cloneForInspection(event.payload),
+				});
+				if (record.providerRequestReceipts.length > MAX_CALLS_PER_TURN) record.providerRequestReceipts.shift();
+				const payload = cloneForInspection(event.payload);
 				record.providerRequests.push({ index, capturedAtMs: now, payload });
 				if (record.providerRequests.length > MAX_CALLS_PER_TURN) record.providerRequests.shift();
 				const call = this.ensureModelCall(record, now);
@@ -257,7 +330,7 @@ export class PiDebugContextRecorder {
 					call.providerExchanges.push(exchange);
 				}
 				exchange.status = event.status;
-				exchange.headers = cloneForDebug(event.headers) as Record<string, unknown>;
+				exchange.headers = cloneForInspection(event.headers) as Record<string, unknown>;
 				call.updatedAtMs = now;
 				record.updatedAtMs = now;
 				this.schedulePersist(250);
@@ -269,7 +342,29 @@ export class PiDebugContextRecorder {
 				if (!record) return;
 				const now = Date.now();
 				const call = this.ensureModelCall(record, now);
-				call.assistantMessage = cloneForDebug(event.message);
+				call.assistantMessage = cloneForInspection(event.message);
+				const usage = numericUsage((event.message as { usage?: unknown }).usage);
+				const request = record.providerRequestReceipts.at(-1);
+				if (request) request.usage = usage;
+				const delta = call.contextDelta;
+				record.cacheEvidence.push({
+					requestIndex: request?.index ?? call.index,
+					prefixSha256: delta.prefixSha256,
+					prefixBytes: delta.prefixBytes,
+					deltaBytes: delta.deltaBytes,
+					duplicateBytes: delta.duplicateBytes,
+					inputTokens: usage.input ?? 0,
+					outputTokens: usage.output ?? 0,
+					cacheReadTokens: usage.cacheRead ?? 0,
+					cacheWriteTokens: usage.cacheWrite ?? 0,
+					capability:
+						(usage.totalTokens ?? 0) > 0 ||
+						(usage.input ?? 0) + (usage.output ?? 0) + (usage.cacheRead ?? 0) + (usage.cacheWrite ?? 0) > 0
+							? "reported"
+							: "unsupported",
+					cacheHitProven: (usage.cacheRead ?? 0) > 0,
+				});
+				if (record.cacheEvidence.length > MAX_CALLS_PER_TURN) record.cacheEvidence.shift();
 				call.updatedAtMs = now;
 				record.updatedAtMs = now;
 				this.schedulePersist(250);
@@ -287,7 +382,7 @@ export class PiDebugContextRecorder {
 					runtimeTurnIndex: this.runtimeTurnIndex,
 					startedAtMs: now,
 					startSequence: ++this.eventSequence,
-					args: cloneForDebug(event.args),
+					args: cloneForInspection(event.args),
 					status: "running",
 					updates: [],
 				});
@@ -300,7 +395,7 @@ export class PiDebugContextRecorder {
 				const tool = record?.toolExecutions.find((item) => item.toolCallId === event.toolCallId);
 				if (!record || !tool) return;
 				const now = Date.now();
-				tool.updates.push({ capturedAtMs: now, partialResult: cloneForDebug(event.partialResult) });
+				tool.updates.push({ capturedAtMs: now, partialResult: cloneForInspection(event.partialResult) });
 				if (tool.updates.length > MAX_TOOL_UPDATES) tool.updates.shift();
 				this.refreshToolBatches(record, now);
 			});
@@ -312,9 +407,16 @@ export class PiDebugContextRecorder {
 				const now = Date.now();
 				tool.endedAtMs = now;
 				tool.endSequence = ++this.eventSequence;
-				tool.result = cloneForDebug(event.result);
+				tool.result = cloneForInspection(event.result);
 				tool.isError = event.isError;
 				tool.status = event.isError ? "failed" : "completed";
+				if (event.toolName === "skill_load" && !event.isError) {
+					const details = (event.result as { details?: unknown } | undefined)?.details;
+					const receipt = cloneForInspection(details);
+					if (receipt && typeof receipt === "object" && !Array.isArray(receipt)) {
+						record.loadedSkillReceipts.push(receipt as Record<string, unknown>);
+					}
+				}
 				this.refreshToolBatches(record, now);
 				this.schedulePersist(250);
 			});
@@ -334,7 +436,7 @@ export class PiDebugContextRecorder {
 
 	get(turnId?: string): PiDebugContextRecord | undefined {
 		const record = turnId ? this.records.get(turnId) : [...this.records.values()].at(-1);
-		return record ? (cloneForDebug(record) as PiDebugContextRecord) : undefined;
+		return record ? (cloneForInspection(record) as PiDebugContextRecord) : undefined;
 	}
 
 	list(): PiDebugContextSummary[] {
@@ -371,6 +473,8 @@ export class PiDebugContextRecorder {
 		this.records.clear();
 		this.runtimeTurnIndex = undefined;
 		this.eventSequence = 0;
+		this.providerCallSequence = 0;
+		this.previousContextMessages = undefined;
 	}
 
 	async flush(): Promise<void> {
@@ -579,7 +683,8 @@ function isDebugContextRecord(value: unknown): value is PiDebugContextRecord {
 	if (!value || typeof value !== "object" || Array.isArray(value)) return false;
 	const record = value as Record<string, unknown>;
 	return (
-		record.schemaVersion === "rag-ime.pi-debug-context.v1" &&
+		(record.schemaVersion === "rag-ime.context-inspection.v2" ||
+			record.schemaVersion === "rag-ime.pi-debug-context.v1") &&
 		typeof record.sessionId === "string" &&
 		typeof record.turnId === "string" &&
 		typeof record.capturedAtMs === "number"
@@ -640,12 +745,28 @@ function contextDelta(previousValue: unknown, currentValue: unknown, baseCallInd
 	) {
 		commonPrefixMessages += 1;
 	}
+	const previousBytes = Buffer.from(stableJson(previous));
+	const currentBytes = Buffer.from(stableJson(current));
+	let prefixBytes = 0;
+	while (
+		prefixBytes < previousBytes.length &&
+		prefixBytes < currentBytes.length &&
+		previousBytes[prefixBytes] === currentBytes[prefixBytes]
+	) {
+		prefixBytes += 1;
+	}
+	const prefixSha256 = createHash("sha256").update(currentBytes.subarray(0, prefixBytes)).digest("hex");
 	return {
 		baseCallIndex,
 		commonPrefixMessages,
 		removedMessageCount: previous.length - commonPrefixMessages,
 		addedMessageCount: current.length - commonPrefixMessages,
 		addedMessages: current.slice(commonPrefixMessages),
+		prefixBytes,
+		prefixSha256,
+		currentBytes: currentBytes.length,
+		deltaBytes: currentBytes.length - prefixBytes,
+		duplicateBytes: prefixBytes,
 	};
 }
 
@@ -657,21 +778,50 @@ function stableJson(value: unknown): string {
 	}
 }
 
-function cloneForDebug(value: unknown): unknown {
+function numericUsage(value: unknown): Record<string, number> {
+	if (!value || typeof value !== "object" || Array.isArray(value)) return {};
+	const result: Record<string, number> = {};
+	for (const key of ["input", "output", "cacheRead", "cacheWrite", "totalTokens"] as const) {
+		const item = (value as Record<string, unknown>)[key];
+		if (typeof item === "number" && Number.isFinite(item) && item >= 0) result[key] = item;
+	}
+	return result;
+}
+
+function redactInspectionString(value: string): string {
+	return value
+		.replace(/\bBearer\s+[A-Za-z0-9._~+/=-]+/giu, "Bearer [credential omitted]")
+		.replace(/\b(?:sk|rk|pk)-[A-Za-z0-9_-]{12,}\b/gu, "[credential omitted]");
+}
+
+function cloneForInspection(value: unknown): unknown {
 	let serialized: string;
 	try {
-		serialized = JSON.stringify(value, function debugReplacer(key, item) {
+		serialized = JSON.stringify(value, function inspectionReplacer(key, item) {
 			if (
-				/^(?:authorization|proxy-authorization|x-api-key|api[_-]?key|access[_-]?token|refresh[_-]?token|cookie|set-cookie)$/iu.test(
+				/^(?:authorization|proxy-authorization|x-api-key|api[_-]?key|access[_-]?token|refresh[_-]?token|cookie|set-cookie|password|secret)$/iu.test(
 					key,
 				)
 			) {
 				return "[credential omitted]";
 			}
+			if (/^(?:thinking|reasoning|analysis|encrypted[_-]?content)$/iu.test(key)) {
+				return undefined;
+			}
+			if (
+				item &&
+				typeof item === "object" &&
+				/^(?:thinking|reasoning|analysis|redacted_reasoning)$/iu.test(
+					String((item as { type?: unknown }).type ?? ""),
+				)
+			) {
+				return { type: String((item as { type?: unknown }).type ?? "hidden"), omitted: true };
+			}
 			if (typeof item === "bigint") return item.toString();
 			if (typeof item === "string" && /^data:[^;]+;base64,/iu.test(item)) {
 				return `[binary data omitted: ${item.length} chars]`;
 			}
+			if (typeof item === "string") return redactInspectionString(item);
 			return item;
 		});
 	} catch (error) {

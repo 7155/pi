@@ -1,4 +1,5 @@
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
+import { readFileSync } from "node:fs";
 import { resolve } from "node:path";
 import { type Api, getSupportedThinkingLevels, type Model } from "@earendil-works/pi-ai";
 import {
@@ -25,6 +26,7 @@ import {
 } from "./discovery-tools.ts";
 import { createLifecycleHookController } from "./lifecycle-hooks.ts";
 import { PROTOCOL_VERSION, type RuntimeEventEnvelope, RuntimeProtocolError } from "./protocol.ts";
+import { createRoomResourceLimitExtension, type RoomResourceLimits } from "./room-resource-limits.ts";
 import { TOOL_LOAD_TOOL_NAME } from "./runtime-tool-names.ts";
 import { createSessionContextRefreshExtension } from "./session-context-refresh.ts";
 import type { PooledSession } from "./session-pool.ts";
@@ -39,7 +41,6 @@ import {
 } from "./tool-bridge.ts";
 import { createTransientContextExtension } from "./transient-context.ts";
 import { createWorkflowControlExtension } from "./workflow-control.ts";
-import { createRoomResourceLimitExtension, type RoomResourceLimits } from "./room-resource-limits.ts";
 
 export interface PiSessionOpenOptions {
 	externalSessionId: string;
@@ -416,6 +417,13 @@ export class PiProductSession implements PooledSession {
 			{
 				directory: process.env.RAG_IME_PI_DEBUG_CONTEXT_DIR,
 				maxBytes: Number.parseInt(process.env.RAG_IME_PI_DEBUG_CONTEXT_MAX_BYTES ?? "", 10),
+				contributionRefs: [
+					...(options.roomCapability ? [{ kind: "room-capability", ...options.roomCapability }] : []),
+					...(options.roomProviderContext
+						? [{ kind: "room-provider-context", ...options.roomProviderContext }]
+						: []),
+					...(options.roomSkillPolicy ? [{ kind: "room-skill", ...options.roomSkillPolicy }] : []),
+				],
 			},
 		);
 		const settingsManager = SettingsManager.create(options.cwd, options.agentDir, { projectTrusted: true });
@@ -467,14 +475,16 @@ export class PiProductSession implements PooledSession {
 							productSession.sessionContextRefreshRevision += 1;
 						}
 					},
-						getRecentMessages: () => productSession?.recentMessagesForContext() ?? [],
-						getRoomSkillRecovery: () => productSession?.roomSkillLoadReceipt(),
-					}),
+					getRecentMessages: () => productSession?.recentMessagesForContext() ?? [],
+					getRoomSkillRecovery: () => productSession?.roomSkillLoadReceipt(),
+				}),
 				createWorkflowControlExtension({
 					bridge: backendBridge,
 					onProjectComplete: (details) => lifecycleHooks.projectComplete(details),
 				}),
-				createRoomResourceLimitExtension(() => productSession?.authorizeRoomToolCall() ?? { allowed: false, reason: "Room Session is not ready" }),
+				createRoomResourceLimitExtension(
+					() => productSession?.authorizeRoomToolCall() ?? { allowed: false, reason: "Room Session is not ready" },
+				),
 				lifecycleHooks.extension,
 				createTransientContextExtension(() => ({
 					sessionContext: productSession?.sessionContext ?? "",
@@ -486,23 +496,25 @@ export class PiProductSession implements PooledSession {
 			noContextFiles: options.noContextFiles ?? false,
 			systemPrompt: options.systemPrompt,
 		});
-			await resourceLoader.reload();
-			let roomSkillLoad: { text: string; details: Record<string, unknown> } | undefined;
-			if (options.roomSkillPolicy) {
-				const skillId = String(options.roomSkillPolicy.skillId ?? "");
-				const skills = resourceLoader.getSkills().skills;
-				const search = searchSkills(skills, { query: skillId, limit: 20 });
-				const matches = Array.isArray(search.items)
-					? search.items.filter((item) => typeof item === "object" && item !== null && (item as { name?: unknown }).name === skillId)
-					: [];
-				if (matches.length !== 1) {
-					throw new RuntimeProtocolError("ROOM_SKILL_NOT_UNIQUE", `Required Room Skill is not unique: ${skillId}`);
-				}
-				roomSkillLoad = await loadSkill(skills, { name: skillId });
-				if (roomSkillLoad.details.contentRevision !== options.roomSkillPolicy.skillHash) {
-					throw new RuntimeProtocolError("ROOM_SKILL_HASH_MISMATCH", `Required Room Skill changed: ${skillId}`);
-				}
+		await resourceLoader.reload();
+		let roomSkillLoad: { text: string; details: Record<string, unknown> } | undefined;
+		if (options.roomSkillPolicy) {
+			const skillId = String(options.roomSkillPolicy.skillId ?? "");
+			const skills = resourceLoader.getSkills().skills;
+			const search = searchSkills(skills, { query: skillId, limit: 20 });
+			const matches = Array.isArray(search.items)
+				? search.items.filter(
+						(item) => typeof item === "object" && item !== null && (item as { name?: unknown }).name === skillId,
+					)
+				: [];
+			if (matches.length !== 1) {
+				throw new RuntimeProtocolError("ROOM_SKILL_NOT_UNIQUE", `Required Room Skill is not unique: ${skillId}`);
 			}
+			roomSkillLoad = await loadSkill(skills, { name: skillId });
+			if (roomSkillLoad.details.contentRevision !== options.roomSkillPolicy.skillHash) {
+				throw new RuntimeProtocolError("ROOM_SKILL_HASH_MISMATCH", `Required Room Skill changed: ${skillId}`);
+			}
+		}
 		let model: Model<Api> | undefined;
 		if (options.provider || options.modelId) {
 			if (!options.provider || !options.modelId) {
@@ -534,22 +546,22 @@ export class PiProductSession implements PooledSession {
 		// every authorized tool routable while Provider schemas stay progressive.
 		created.session.setRegisteredToolExecutionEnabled(true);
 		applyBackendToolDisclosure(created.session, registry);
-			productSession = new PiProductSession(
+		productSession = new PiProductSession(
 			options,
 			created.session,
 			registry,
 			resourceLoader,
 			settingsManager,
-				debugContextRecorder,
-			);
-			productSession.sessionContext = [options.sessionContext?.trim(), roomSkillLoad?.text]
-				.filter((value): value is string => Boolean(value))
-				.join("\n\n");
-			productSession.roomProviderContext = options.roomProviderContext
-				? structuredClone(options.roomProviderContext)
-				: undefined;
-			productSession.roomSkillLoad = roomSkillLoad;
-			await created.session.bindExtensions({
+			debugContextRecorder,
+		);
+		productSession.sessionContext = [options.sessionContext?.trim(), roomSkillLoad?.text]
+			.filter((value): value is string => Boolean(value))
+			.join("\n\n");
+		productSession.roomProviderContext = options.roomProviderContext
+			? structuredClone(options.roomProviderContext)
+			: undefined;
+		productSession.roomSkillLoad = roomSkillLoad;
+		await created.session.bindExtensions({
 			mode: "rpc",
 			uiContext: productSession.extensionUIContext(),
 			onError: (error) => {
@@ -781,7 +793,7 @@ export class PiProductSession implements PooledSession {
 				"INVALID_UI_RESPONSE",
 				"Confirm UI response must include confirmed, value, or cancelled",
 			);
-			}
+		}
 		pending.resolve(confirmed);
 		return { requestId, resolved: true };
 	}
@@ -945,13 +957,13 @@ export class PiProductSession implements PooledSession {
 			toolCatalogRevision: this.toolRegistry.revision(),
 			toolSchemaRevision: backendToolSchemaRevision(this.toolRegistry.list()),
 			toolManifest: this.toolRegistry.list(),
-				roomCapability: this.roomCapability ? structuredClone(this.roomCapability) : undefined,
-				roomProviderContext: this.roomProviderContext ? structuredClone(this.roomProviderContext) : undefined,
+			roomCapability: this.roomCapability ? structuredClone(this.roomCapability) : undefined,
+			roomProviderContext: this.roomProviderContext ? structuredClone(this.roomProviderContext) : undefined,
 			disclosedBackendTools: this.toolRegistry.disclosed().map((tool) => tool.name),
 			// Compatibility field for older control-center clients.
 			activeBackendTools: this.toolRegistry.disclosed().map((tool) => tool.name),
-				skillCatalogRevision: runtimeSkillCatalogRevision(this.resourceLoader.getSkills().skills),
-				roomSkillLoad: this.roomSkillLoadReceipt(),
+			skillCatalogRevision: runtimeSkillCatalogRevision(this.resourceLoader.getSkills().skills),
+			roomSkillLoad: this.roomSkillLoadReceipt(),
 			piSkillsEnabled: this.piSkillsEnabled,
 			codexSkillsEnabled: this.codexSkillsEnabled,
 			messages: this.session.messages,
@@ -963,6 +975,27 @@ export class PiProductSession implements PooledSession {
 	debugContext(turnId?: string): Record<string, unknown> {
 		const context = this.debugContextRecorder.get(turnId);
 		const storage = this.debugContextRecorder.storage();
+		const latestCall = context?.modelCalls.at(-1);
+		const pending = this.messageQueue();
+		const contextProjection = latestCall
+			? {
+					schemaVersion: "rag-ime.context-assembly-projection.v1",
+					stablePrefixMessages: latestCall.contextDelta.commonPrefixMessages,
+					stablePrefixBytes: latestCall.contextDelta.prefixBytes,
+					dynamicTailMessages: latestCall.contextDelta.addedMessageCount,
+					dynamicTailBytes: latestCall.contextDelta.deltaBytes,
+					sealedMessages: context?.contributionRefs.length ?? 0,
+					pendingMessages:
+						(Array.isArray(pending.steering) ? pending.steering.length : 0) +
+						(Array.isArray(pending.followUp) ? pending.followUp.length : 0),
+					compactionState: this.latestCompaction?.status ?? "not_started",
+					recoveryState:
+						context?.contributionRefs.some((item) => item.kind === "room-provider-context") === true
+							? "ready"
+							: "not_required",
+					sourceRefs: context?.contributionRefs ?? [],
+				}
+			: undefined;
 		return {
 			schemaVersion: "rag-ime.pi-debug-context-response.v1",
 			sessionId: this.externalSessionId,
@@ -971,9 +1004,47 @@ export class PiProductSession implements PooledSession {
 			transient: !storage.persistent,
 			storage,
 			availableTurns: this.debugContextRecorder.list(),
-			context: context ?? null,
+			context: context ? { ...context, contextProjection } : null,
+			transcript: this.transcriptInspectionReceipt(),
 			telemetry: this.telemetry(),
 		};
+	}
+
+	private transcriptInspectionReceipt(): Record<string, unknown> {
+		try {
+			const sessionFile = this.session.sessionFile;
+			if (!sessionFile) throw new Error("session transcript is unavailable");
+			const bytes = readFileSync(sessionFile);
+			const lines = bytes
+				.toString("utf8")
+				.split("\n")
+				.filter((line) => line.trim().length > 0);
+			const entryTypes: string[] = [];
+			for (const line of lines) {
+				try {
+					const parsed = JSON.parse(line) as { type?: unknown };
+					entryTypes.push(String(parsed.type ?? "unknown"));
+				} catch {
+					entryTypes.push("invalid");
+				}
+			}
+			return {
+				schemaVersion: "rag-ime.pi-session-jsonl-receipt.v1",
+				sha256: createHash("sha256").update(bytes).digest("hex"),
+				bytes: bytes.length,
+				lineCount: lines.length,
+				entryTypes,
+				leafId: this.session.sessionManager.getLeafId() ?? "",
+				contentIncluded: false,
+			};
+		} catch {
+			return {
+				schemaVersion: "rag-ime.pi-session-jsonl-receipt.v1",
+				available: false,
+				contentIncluded: false,
+				error: "session transcript is unavailable",
+			};
+		}
 	}
 
 	async rewind(entryId: string): Promise<Record<string, unknown>> {
@@ -1215,9 +1286,9 @@ export class PiProductSession implements PooledSession {
 				roomSkillLoad: this.roomSkillLoadReceipt(),
 				providerContextReceipt: this.roomProviderContext
 					? {
-						...structuredClone(this.roomProviderContext),
-						providerRequestId: turn.turnId,
-					}
+							...structuredClone(this.roomProviderContext),
+							providerRequestId: turn.turnId,
+						}
 					: undefined,
 			};
 		}

@@ -3,7 +3,7 @@
  */
 
 import type { AgentMessage } from "@earendil-works/pi-agent-core";
-import type { ImageContent, Model, ProviderHeaders } from "@earendil-works/pi-ai";
+import type { Context, ImageContent, Model, ProviderHeaders } from "@earendil-works/pi-ai";
 import type { KeyId } from "@earendil-works/pi-tui";
 import { type Theme, theme } from "../../modes/interactive/theme/theme.ts";
 import type { ResourceDiagnostic } from "../diagnostics.ts";
@@ -45,6 +45,7 @@ import type {
 	ProjectTrustEvent,
 	ProjectTrustEventResult,
 	ProviderConfig,
+	ProviderContextInspectionEvent,
 	RegisteredCommand,
 	RegisteredTool,
 	ReplacedSessionContext,
@@ -1014,6 +1015,40 @@ export class ExtensionRunner {
 		}
 
 		return currentPayload;
+	}
+
+	async emitProviderContextInspection(model: Model<any>, context: Context): Promise<void> {
+		const ctx = this.createContext();
+		const inspectionContext = {
+			systemPrompt: context.systemPrompt,
+			messages: structuredClone(context.messages),
+			tools: context.tools?.map((tool) => ({
+				name: tool.name,
+				description: tool.description,
+				parameters: structuredClone(tool.parameters),
+			})),
+		} as Context;
+		for (const ext of this.extensions) {
+			const handlers = ext.handlers.get("provider_context_inspection");
+			if (!handlers || handlers.length === 0) continue;
+			for (const handler of handlers) {
+				try {
+					const event: ProviderContextInspectionEvent = {
+						type: "provider_context_inspection",
+						model,
+						context: structuredClone(inspectionContext),
+					};
+					await handler(event, ctx);
+				} catch (err) {
+					this.emitError({
+						extensionPath: ext.path,
+						event: "provider_context_inspection",
+						error: err instanceof Error ? err.message : String(err),
+						stack: err instanceof Error ? err.stack : undefined,
+					});
+				}
+			}
+		}
 	}
 
 	async emitBeforeProviderHeaders(headers: ProviderHeaders): Promise<ProviderHeaders> {

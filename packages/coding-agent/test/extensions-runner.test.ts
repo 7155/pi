@@ -984,6 +984,38 @@ describe("ExtensionRunner", () => {
 		});
 	});
 
+	describe("provider_context_inspection", () => {
+		it("exposes a cloned normalized context without allowing mutation of the live request", async () => {
+			const extCode = `
+				export default function(pi) {
+					pi.on("provider_context_inspection", (event) => {
+						globalThis.__providerContext = event.context;
+						event.context.messages.length = 0;
+					});
+				}
+			`;
+			fs.writeFileSync(path.join(extensionsDir, "provider-context.ts"), extCode);
+			const result = await discoverAndLoadExtensions([], tempDir, tempDir);
+			const runner = new ExtensionRunner(result.extensions, result.runtime, tempDir, sessionManager, modelRegistry);
+			const model = { provider: "test", id: "model", api: "openai-completions" } as never;
+			const context = {
+				systemPrompt: "stable system",
+				messages: [{ role: "user", content: [{ type: "text", text: "hello" }], timestamp: 1 }],
+				tools: [
+					{ name: "read", description: "Read", parameters: { type: "object" }, execute: async () => undefined },
+				],
+			} as never;
+
+			await runner.emitProviderContextInspection(model, context);
+
+			expect(context.messages).toHaveLength(1);
+			expect((globalThis as { __providerContext?: { systemPrompt?: string } }).__providerContext?.systemPrompt).toBe(
+				"stable system",
+			);
+			delete (globalThis as { __providerContext?: unknown }).__providerContext;
+		});
+	});
+
 	describe("session_compact", () => {
 		it("composes refreshed system prompts for the automatic retry", async () => {
 			fs.writeFileSync(
