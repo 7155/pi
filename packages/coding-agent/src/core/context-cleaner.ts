@@ -95,9 +95,7 @@ function safeData(value: unknown, depth = 0): boolean {
 	return true;
 }
 
-function summaryFor(type: string, data: Record<string, unknown>, supplied: unknown): string {
-	const explicit = compact(supplied);
-	if (explicit) return explicit;
+function summaryFor(type: string, data: Record<string, unknown>): string {
 	const title = compact(data.title || data.label || data.name || data.fileName || data.path, 120);
 	switch (type) {
 		case "card":
@@ -146,7 +144,7 @@ function normalizeBlock(value: unknown): CanonicalBlock | undefined {
 	if (!safeData(data) || byteLength(canonicalJson(raw)) > MAX_BLOCK_BYTES) return undefined;
 	const type = KNOWN_TYPES.has(originalType) ? originalType : "unknown";
 	const summaryData = type === "unknown" ? { originalType } : data;
-	const summary = summaryFor(type, summaryData, raw.summary);
+	const summary = summaryFor(type, summaryData);
 	if (!summary) return undefined;
 	const digest = createHash("sha256").update(canonicalJson(raw)).digest("hex");
 	return { id, type, summary, digest };

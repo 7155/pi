@@ -183,11 +183,9 @@ export function convertToLlm(messages: AgentMessage[]): Message[] {
 						timestamp: m.timestamp,
 					};
 				case "user":
-				case "assistant":
-				case "toolResult": {
-					if (typeof m.content === "string") {
-						return { ...m, content: cleanAgentBlockText(m.content).text } as Message;
-					}
+				case "toolResult":
+					return m;
+				case "assistant": {
 					const content = m.content.map((item) =>
 						item.type === "text" ? { ...item, text: cleanAgentBlockText(item.text).text } : item,
 					);
