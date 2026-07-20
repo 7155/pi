@@ -39,6 +39,7 @@ import {
 } from "./tool-bridge.ts";
 import { createTransientContextExtension } from "./transient-context.ts";
 import { createWorkflowControlExtension } from "./workflow-control.ts";
+import { createRoomResourceLimitExtension, type RoomResourceLimits } from "./room-resource-limits.ts";
 
 export interface PiSessionOpenOptions {
 	externalSessionId: string;
@@ -66,6 +67,7 @@ export interface PiSessionOpenOptions {
 	sessionContext?: string;
 	roomProviderContext?: Record<string, unknown>;
 	roomSkillPolicy?: Record<string, unknown>;
+	roomResourceLimits?: RoomResourceLimits;
 	noContextFiles?: boolean;
 	emitEvent(event: RuntimeEventEnvelope): void;
 }
@@ -355,6 +357,9 @@ export class PiProductSession implements PooledSession {
 	private sessionContextRefreshRevision = 0;
 	private transientContext = "";
 	private roomProviderContext?: Record<string, unknown>;
+	private readonly roomResourceLimits?: RoomResourceLimits;
+	private roomToolCalls = 0;
+	private roomToolCost = 0;
 	private roomSkillLoad?: { text: string; details: Record<string, unknown> };
 	private latestCompaction: PublicCompactionState | undefined;
 	private readonly pendingDecisions = new Map<
@@ -385,6 +390,7 @@ export class PiProductSession implements PooledSession {
 		this.piSkillsEnabled = options.piSkillsEnabled ?? false;
 		this.codexSkillsEnabled = options.codexSkillsEnabled ?? false;
 		this.roomCapability = options.roomCapability ? structuredClone(options.roomCapability) : undefined;
+		this.roomResourceLimits = options.roomResourceLimits ? structuredClone(options.roomResourceLimits) : undefined;
 		this.session = session;
 		this.toolRegistry = registry;
 		this.resourceLoader = resourceLoader;
@@ -468,6 +474,7 @@ export class PiProductSession implements PooledSession {
 					bridge: backendBridge,
 					onProjectComplete: (details) => lifecycleHooks.projectComplete(details),
 				}),
+				createRoomResourceLimitExtension(() => productSession?.authorizeRoomToolCall() ?? { allowed: false, reason: "Room Session is not ready" }),
 				lifecycleHooks.extension,
 				createTransientContextExtension(() => ({
 					sessionContext: productSession?.sessionContext ?? "",
@@ -507,6 +514,9 @@ export class PiProductSession implements PooledSession {
 					"MODEL_NOT_FOUND",
 					`Model not found: ${options.provider}/${options.modelId}`,
 				);
+			}
+			if (options.roomResourceLimits) {
+				model = { ...model, maxTokens: Math.min(model.maxTokens, options.roomResourceLimits.maxOutputTokens) };
 			}
 		}
 		const created = await createAgentSession({
@@ -1195,6 +1205,7 @@ export class PiProductSession implements PooledSession {
 		rootId: string;
 		generation: number;
 	}): Promise<Record<string, unknown>> {
+		this.assertRoomDispatchResources();
 		if (!this.activeTurn || this.session.isIdle) {
 			const turn = await this.prompt({ message: options.message });
 			this.activeRoom = { rootId: options.rootId, generation: options.generation };
@@ -1216,6 +1227,34 @@ export class PiProductSession implements PooledSession {
 			idempotencyKey: options.dispatchId,
 		});
 		return { delivery: "followUp", turnId: this.activeTurn.turnId, continuationId: continuation.id };
+	}
+
+	authorizeRoomToolCall(): { allowed: boolean; reason?: string } {
+		if (!this.roomResourceLimits) return { allowed: true };
+		if (Date.now() >= this.roomResourceLimits.deadlineAtMs) {
+			return { allowed: false, reason: "Room wall-clock deadline exceeded" };
+		}
+		if (this.roomToolCalls >= this.roomResourceLimits.maxToolCalls) {
+			return { allowed: false, reason: "Room tool-call limit exhausted" };
+		}
+		if (this.roomToolCost + 1 > this.roomResourceLimits.maxToolCost) {
+			return { allowed: false, reason: "Room tool-cost limit exhausted" };
+		}
+		this.roomToolCalls += 1;
+		this.roomToolCost += 1;
+		return { allowed: true };
+	}
+
+	private assertRoomDispatchResources(): void {
+		const limits = this.roomResourceLimits;
+		if (!limits) return;
+		if (Date.now() >= limits.deadlineAtMs) {
+			throw new RuntimeProtocolError("ROOM_DEADLINE_EXCEEDED", "Room wall-clock deadline exceeded");
+		}
+		const contextTokens = this.session.getContextUsage()?.tokens ?? 0;
+		if (contextTokens > limits.maxInputTokens) {
+			throw new RuntimeProtocolError("ROOM_INPUT_LIMIT_EXCEEDED", "Room input-token limit exceeded");
+		}
 	}
 
 	cancelRoom(rootId: string, generation: number): { cancelledIds: string[]; abortRequired: boolean } {

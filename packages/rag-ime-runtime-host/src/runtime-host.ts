@@ -11,6 +11,7 @@ import {
 } from "@earendil-works/pi-ai";
 import { ModelRuntime } from "@earendil-works/pi-coding-agent";
 import { PiProductSession } from "./pi-session.ts";
+import type { RoomResourceLimits } from "./room-resource-limits.ts";
 import { ManagedPluginManager } from "./plugin-manager.ts";
 import {
 	PROTOCOL_NAME,
@@ -193,6 +194,30 @@ function optionalRoomSkillPolicy(params: Record<string, unknown>): Record<string
 		throw new RuntimeProtocolError("INVALID_PARAMS", "roomSkillPolicy.skillHash must be sha256 hex");
 	}
 	return structuredClone(record);
+}
+
+function optionalRoomResourceLimits(params: Record<string, unknown>): RoomResourceLimits | undefined {
+	const value = params.roomResourceLimits;
+	if (value === undefined || value === null) return undefined;
+	if (typeof value !== "object" || Array.isArray(value)) {
+		throw new RuntimeProtocolError("INVALID_PARAMS", "roomResourceLimits must be an object");
+	}
+	const record = value as Record<string, unknown>;
+	const result = {} as RoomResourceLimits;
+	for (const key of [
+		"deadlineAtMs", "maxInputTokens", "maxOutputTokens", "maxToolCalls",
+		"maxToolCost", "retryRemaining", "repairRemaining",
+	] as const) {
+		const entry = record[key];
+		if (typeof entry !== "number" || !Number.isSafeInteger(entry) || entry < 0) {
+			throw new RuntimeProtocolError("INVALID_PARAMS", `roomResourceLimits.${key} is invalid`);
+		}
+		result[key] = entry;
+	}
+	if (result.deadlineAtMs <= Date.now() || result.maxInputTokens < 1 || result.maxOutputTokens < 1) {
+		throw new RuntimeProtocolError("ROOM_RESOURCE_LIMIT_EXHAUSTED", "Room resource limit is already exhausted");
+	}
+	return result;
 }
 
 function isInside(root: string, candidate: string): boolean {
@@ -505,6 +530,7 @@ export class RagImeRuntimeHost {
 							sessionContext: optionalString(params, "sessionContext", 256_000),
 							roomProviderContext: optionalRoomProviderContext(params),
 							roomSkillPolicy: optionalRoomSkillPolicy(params),
+							roomResourceLimits: optionalRoomResourceLimits(params),
 							noContextFiles: optionalBoolean(params, "noContextFiles"),
 						emitEvent: this.options.emitEvent,
 					}),
@@ -663,6 +689,12 @@ export class RagImeRuntimeHost {
 				const target = this.session(params);
 				const cancelled = target.cancelRoom(rootId, generation);
 				if (cancelled.abortRequired) await target.abort();
+				const termination = (surface: string, targetIds: string[] = []) => ({
+					schemaVersion: "wisdom-weasel.runtime-surface-termination-receipt.v1",
+					surface,
+					state: "terminated",
+					targetIds,
+				});
 				return {
 					schemaVersion: "wisdom-weasel.room-runtime-receipt.v1",
 					receiptKind: "cancel_applied",
@@ -672,6 +704,18 @@ export class RagImeRuntimeHost {
 					sessionId,
 					cancelledContinuationIds: cancelled.cancelledIds,
 					activeRunAborted: cancelled.abortRequired,
+					pendingTargets: [],
+					cancellationSurfaces: {
+						provider: termination("provider"),
+						tool: termination("tool"),
+						exec: termination("exec"),
+						retry: termination("retry"),
+						compaction: termination("compaction"),
+						branch_summary: termination("branch_summary"),
+						timer: termination("timer"),
+						continuation: termination("continuation", cancelled.cancelledIds),
+						session: termination("session", [sessionId]),
+					},
 				};
 			}
 			case "approval.resolve":

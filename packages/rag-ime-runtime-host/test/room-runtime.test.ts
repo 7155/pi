@@ -53,6 +53,15 @@ describe("Room runtime RPC", () => {
 						skillId: "room-test-driven-implementation",
 						skillHash: createHash("sha256").update(body).digest("hex"),
 					},
+					roomResourceLimits: {
+						deadlineAtMs: Date.now() + 60_000,
+						maxInputTokens: 64_000,
+						maxOutputTokens: 1024,
+						maxToolCalls: 2,
+						maxToolCost: 2,
+						retryRemaining: 1,
+						repairRemaining: 1,
+					},
 				}),
 			)) as Record<string, any>;
 
@@ -132,7 +141,16 @@ describe("Room runtime RPC", () => {
 				receiptKind: "cancel_applied",
 				activeRunAborted: true,
 				cancelledContinuationIds: ["continuation:1"],
+				pendingTargets: [],
 			});
+			expect((cancelled as Record<string, any>).cancellationSurfaces.session).toMatchObject({
+				schemaVersion: "wisdom-weasel.runtime-surface-termination-receipt.v1",
+				state: "terminated",
+			});
+			expect(Object.keys((cancelled as Record<string, any>).cancellationSurfaces)).toEqual([
+				"provider", "tool", "exec", "retry", "compaction", "branch_summary",
+				"timer", "continuation", "session",
+			]);
 			expect(target.abort).toHaveBeenCalledTimes(1);
 		} finally {
 			await host.dispose();
