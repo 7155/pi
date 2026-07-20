@@ -39,6 +39,8 @@ export interface ContextCleanerReceipt {
 	estimatedTokensBefore: number;
 	estimatedTokensAfter: number;
 	cleanedBlockCount: number;
+	omittedInvalidFenceCount: number;
+	/** @deprecated Invalid fences are now omitted from Provider context, not preserved. */
 	preservedInvalidFenceCount: number;
 }
 
@@ -62,11 +64,22 @@ function canonicalJson(value: unknown): string {
 	if (Array.isArray(value)) return `[${value.map(canonicalJson).join(",")}]`;
 	if (value && typeof value === "object") {
 		return `{${Object.entries(value as Record<string, unknown>)
-			.sort(([left], [right]) => left.localeCompare(right))
+			.sort(([left], [right]) => compareUnicodeCodePoints(left, right))
 			.map(([key, item]) => `${JSON.stringify(key)}:${canonicalJson(item)}`)
 			.join(",")}}`;
 	}
 	return JSON.stringify(value) ?? "null";
+}
+
+// Python json.dumps(sort_keys=True) compares Unicode scalar values. localeCompare
+// is locale-sensitive and produces a different cross-runtime content digest.
+function compareUnicodeCodePoints(left: string, right: string): number {
+	const leftPoints = Array.from(left, (value) => value.codePointAt(0)!);
+	const rightPoints = Array.from(right, (value) => value.codePointAt(0)!);
+	for (let index = 0; index < Math.min(leftPoints.length, rightPoints.length); index += 1) {
+		if (leftPoints[index] !== rightPoints[index]) return leftPoints[index] - rightPoints[index];
+	}
+	return leftPoints.length - rightPoints.length;
 }
 
 function compact(value: unknown, limit = MAX_SUMMARY_CHARS): string {
@@ -80,6 +93,7 @@ function compact(value: unknown, limit = MAX_SUMMARY_CHARS): string {
 function safeData(value: unknown, depth = 0): boolean {
 	if (depth > 8) return false;
 	if (value === null || typeof value === "string" || typeof value === "number" || typeof value === "boolean") {
+		if (typeof value === "number") return Number.isFinite(value);
 		return typeof value !== "string" || byteLength(value) <= MAX_BLOCK_BYTES;
 	}
 	if (Array.isArray(value)) return value.length <= 256 && value.every((item) => safeData(item, depth + 1));
@@ -175,12 +189,13 @@ function renderReference(block: CanonicalBlock): string {
 
 export function cleanAgentBlockText(input: string): CleanedContextText {
 	let cleanedBlockCount = 0;
-	let preservedInvalidFenceCount = 0;
-	const text = input.replace(BLOCK_FENCE, (match, json: string) => {
+	let omittedInvalidFenceCount = 0;
+	const text = input.replace(BLOCK_FENCE, (_match, json: string) => {
 		const blocks = parseEnvelope(json);
 		if (!blocks) {
-			preservedInvalidFenceCount += 1;
-			return match;
+			omittedInvalidFenceCount += 1;
+			const digest = createHash("sha256").update(json, "utf8").digest("hex");
+			return `[无效内容块已省略 digest=sha256:${digest}]`;
 		}
 		cleanedBlockCount += blocks.length;
 		return blocks.map(renderReference).join("\n");
@@ -196,7 +211,8 @@ export function cleanAgentBlockText(input: string): CleanedContextText {
 			estimatedTokensBefore: Math.ceil(beforeBytes / 4),
 			estimatedTokensAfter: Math.ceil(afterBytes / 4),
 			cleanedBlockCount,
-			preservedInvalidFenceCount,
+			omittedInvalidFenceCount,
+			preservedInvalidFenceCount: 0,
 		},
 	};
 }

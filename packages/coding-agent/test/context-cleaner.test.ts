@@ -34,22 +34,38 @@ describe("agent block context cleaner", () => {
 		expect(first.receipt.afterBytes).toBeLessThan(first.receipt.beforeBytes);
 	});
 
-	it("preserves malformed or partially invalid fences verbatim", () => {
+	it("keeps invalid fences in Session but omits their raw payload from Provider context", () => {
 		const malformed = "```rag_ime_blocks\n{not json}\n```";
 		const partial = envelope([
 			{ id: "ok", type: "card", data: { title: "ok" } },
 			{ id: "bad", type: "html_widget", data: { html: "<script>alert(1)</script>" } },
 		]);
-		expect(cleanAgentBlockText(malformed).text).toBe(malformed);
-		expect(cleanAgentBlockText(partial).text).toBe(partial);
-		expect(cleanAgentBlockText(partial).receipt.preservedInvalidFenceCount).toBe(1);
+		for (const input of [malformed, partial]) {
+			const cleaned = cleanAgentBlockText(input);
+			expect(cleaned.text).toMatch(/^before\n|^\[无效内容块已省略 digest=sha256:[0-9a-f]{64}\]/);
+			expect(cleaned.text).not.toContain("not json");
+			expect(cleaned.text).not.toContain("<script>");
+			expect(cleaned.receipt.omittedInvalidFenceCount).toBe(1);
+			expect(cleaned.receipt.preservedInvalidFenceCount).toBe(0);
+		}
 	});
 
 	it("rejects event handlers and unsafe URLs", () => {
 		const handler = envelope([{ id: "x", type: "card", data: { title: "x", onClick: "steal()" } }]);
 		const url = envelope([{ id: "x", type: "reference", data: { title: "x", url: "javascript:steal()" } }]);
-		expect(cleanAgentBlockText(handler).text).toBe(handler);
-		expect(cleanAgentBlockText(url).text).toBe(url);
+		expect(cleanAgentBlockText(handler).text).not.toContain("steal()");
+		expect(cleanAgentBlockText(url).text).not.toContain("javascript:");
+	});
+
+	it("uses Python-compatible Unicode key order and rejects non-finite JSON numbers", () => {
+		const ordered = envelope([{ id: "keys", type: "card", data: { Z: 1, a: 2, z: 3, ä: 4, é: 5, "😀": 6 } }]);
+		expect(cleanAgentBlockText(ordered).text).toContain(
+			"digest=sha256:f36370b7cb9eb2b4d44b9cf30c4bf126fb3a8242a49536018aa728f5c754825f",
+		);
+		const overflow = `\`\`\`rag_ime_blocks\n{"schemaVersion":"rag-ime.agent-blocks.v1","blocks":[{"id":"x","type":"card","data":{"value":1e400}}]}\n\`\`\``;
+		const cleaned = cleanAgentBlockText(overflow);
+		expect(cleaned.text).toContain("无效内容块已省略");
+		expect(cleaned.text).not.toContain("1e400");
 	});
 
 	it("keeps unknown types readable without echoing their data", () => {
