@@ -31,7 +31,15 @@ const HOST_VERSION = "1.0.0";
 const SESSION_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,199}$/;
 const COMPLETION_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,199}$/;
 const THINKING_LEVELS = new Set<ModelThinkingLevel>(["off", "minimal", "low", "medium", "high", "xhigh", "max"]);
-const STATELESS_THINKING_LEVELS = new Set<ModelThinkingLevel>(["off", "low"]);
+const STATELESS_THINKING_LEVELS = new Set<ModelThinkingLevel>([
+	"off",
+	"minimal",
+	"low",
+	"medium",
+	"high",
+	"xhigh",
+	"max",
+]);
 
 export interface RuntimeHostOptions {
 	agentDir: string;
@@ -277,7 +285,7 @@ export class RagImeRuntimeHost {
 				if (!STATELESS_THINKING_LEVELS.has(thinkingLevel)) {
 					throw new RuntimeProtocolError(
 						"INVALID_PARAMS",
-						"Stateless completion only supports off or low thinking",
+						"Stateless completion received an unsupported thinking level",
 					);
 				}
 				if (this.completions.has(requestId)) {
@@ -336,7 +344,7 @@ export class RagImeRuntimeHost {
 						],
 					};
 					const response = await this.modelRuntime.completeSimple(model, context, {
-						...(thinkingLevel === "low" ? { reasoning: "low" as const } : {}),
+						...(thinkingLevel === "off" ? {} : { reasoning: thinkingLevel }),
 						cacheRetention: "none",
 						maxRetries: 0,
 						maxTokens: Math.min(model.maxTokens, 4096),
