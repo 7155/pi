@@ -18,7 +18,7 @@ describe("agent block context cleaner", () => {
 		const first = cleanAgentBlockText(input);
 		const second = cleanAgentBlockText(input);
 		expect(first.text).toBe(second.text);
-		expect(first.text).toContain("type=checklist：清单：发布清单，1/2 完成");
+		expect(first.text).toMatch(/digest=sha256:[0-9a-f]{64} type=checklist：清单：发布清单，1\/2 完成/);
 		expect(first.text).not.toContain("发布\",\"checked");
 		expect(first.receipt.cleanedBlockCount).toBe(1);
 		expect(first.receipt.afterBytes).toBeLessThan(first.receipt.beforeBytes);

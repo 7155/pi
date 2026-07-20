@@ -146,7 +146,7 @@ function normalizeBlock(value: unknown): CanonicalBlock | undefined {
 	const summaryData = type === "unknown" ? { originalType } : data;
 	const summary = summaryFor(type, summaryData);
 	if (!summary) return undefined;
-	const digest = createHash("sha256").update(canonicalJson(raw)).digest("hex");
+	const digest = createHash("sha256").update(canonicalJson({ type, data: summaryData })).digest("hex");
 	return { id, type, summary, digest };
 }
 
@@ -167,7 +167,7 @@ function parseEnvelope(json: string): CanonicalBlock[] | undefined {
 }
 
 function renderReference(block: CanonicalBlock): string {
-	return `[内容块 ref=block:${block.id}:${block.digest.slice(0, 16)} type=${block.type}：${block.summary}]`;
+	return `[内容块 digest=sha256:${block.digest} type=${block.type}：${block.summary}]`;
 }
 
 export function cleanAgentBlockText(input: string): CleanedContextText {
