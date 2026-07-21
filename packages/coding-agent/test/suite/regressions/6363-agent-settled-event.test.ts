@@ -99,6 +99,43 @@ describe("regression #6363: agent settled event and idle waiting", () => {
 		});
 	});
 
+	it("runs one governed before-settle follow-up before exposing the settled event", async () => {
+		let attempt = 0;
+		const phases: string[] = [];
+		const harness = await createHarness({
+			extensionFactories: [
+				(pi) => {
+					pi.on("before_agent_settle", (event) => {
+						phases.push(`before:${event.message.stopReason}`);
+						attempt += 1;
+						if (attempt > 1) return;
+						return {
+							followUp: {
+								text: "请在收工前补齐结构化责任提交",
+								continuation: {
+									correlationId: "room-root-1",
+									idempotencyKey: "settle-remedial-1",
+									maxAttempts: 2,
+								},
+							},
+						};
+					});
+					pi.on("agent_settled", () => {
+						phases.push("settled");
+					});
+				},
+			],
+		});
+		harnesses.push(harness);
+		harness.setResponses([fauxAssistantMessage("初步完成"), fauxAssistantMessage("已经提交")]);
+
+		await harness.session.prompt("完成 Room 工作项");
+
+		expect(getUserTexts(harness)).toEqual(["完成 Room 工作项", "请在收工前补齐结构化责任提交"]);
+		expect(phases).toEqual(["before:stop", "before:stop", "settled"]);
+		expect(harness.eventsOfType("agent_settled")).toHaveLength(1);
+	});
+
 	it("lists, selectively cancels, and wakes delayed structured continuations", async () => {
 		const harness = await createHarness();
 		harnesses.push(harness);

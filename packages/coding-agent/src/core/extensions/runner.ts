@@ -12,6 +12,8 @@ import type { ModelRegistry } from "../model-registry.ts";
 import type { SessionManager } from "../session-manager.ts";
 import type { BuildSystemPromptOptions } from "../system-prompt.ts";
 import type {
+	BeforeAgentSettleEvent,
+	BeforeAgentSettleEventResult,
 	BeforeAgentStartEvent,
 	BeforeAgentStartEventResult,
 	BeforeProviderHeadersEvent,
@@ -132,6 +134,7 @@ type RunnerEmitEvent = Exclude<
 	| BeforeProviderRequestEvent
 	| BeforeProviderHeadersEvent
 	| BeforeAgentStartEvent
+	| BeforeAgentSettleEvent
 	| MessageEndEvent
 	| ResourcesDiscoverEvent
 	| InputEvent
@@ -1146,6 +1149,44 @@ export class ExtensionRunner {
 		}
 
 		return undefined;
+	}
+
+	async emitBeforeAgentSettle(event: BeforeAgentSettleEvent): Promise<BeforeAgentSettleEventResult | undefined> {
+		const ctx = this.createContext();
+		let selected: BeforeAgentSettleEventResult | undefined;
+
+		for (const ext of this.extensions) {
+			const handlers = ext.handlers.get("before_agent_settle");
+			if (!handlers || handlers.length === 0) continue;
+			for (const handler of handlers) {
+				try {
+					const result = (await handler(event, ctx)) as BeforeAgentSettleEventResult | undefined;
+					if (!result?.followUp) continue;
+					const text = result.followUp.text.trim();
+					if (!text) throw new Error("before_agent_settle follow-up text must not be empty");
+					if (selected) {
+						throw new Error("only one before_agent_settle follow-up may own the next continuation");
+					}
+					selected = {
+						followUp: {
+							text,
+							...(result.followUp.continuation ? { continuation: result.followUp.continuation } : {}),
+						},
+					};
+				} catch (err) {
+					const message = err instanceof Error ? err.message : String(err);
+					const stack = err instanceof Error ? err.stack : undefined;
+					this.emitError({
+						extensionPath: ext.path,
+						event: "before_agent_settle",
+						error: message,
+						stack,
+					});
+				}
+			}
+		}
+
+		return selected;
 	}
 
 	async emitResourcesDiscover(

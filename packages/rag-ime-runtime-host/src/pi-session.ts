@@ -25,6 +25,7 @@ import {
 } from "./discovery-tools.ts";
 import { createLifecycleHookController } from "./lifecycle-hooks.ts";
 import { PROTOCOL_VERSION, type RuntimeEventEnvelope, RuntimeProtocolError } from "./protocol.ts";
+import { createProviderContextJournalExtension, ProviderContextJournal } from "./provider-context-journal.ts";
 import { createRoomResourceLimitExtension, type RoomResourceLimits } from "./room-resource-limits.ts";
 import { TOOL_LOAD_TOOL_NAME } from "./runtime-tool-names.ts";
 import { createSessionContextRefreshExtension } from "./session-context-refresh.ts";
@@ -38,7 +39,6 @@ import {
 	createBackendToolExtension,
 	diffBackendToolCatalog,
 } from "./tool-bridge.ts";
-import { createTransientContextExtension } from "./transient-context.ts";
 import { createWorkflowControlExtension } from "./workflow-control.ts";
 
 export interface PiSessionOpenOptions {
@@ -368,6 +368,7 @@ export class PiProductSession implements PooledSession {
 	private readonly resourceLoader: DefaultResourceLoader;
 	private readonly settingsManager: SettingsManager;
 	private readonly debugContextRecorder: PiDebugContextRecorder;
+	private readonly providerContextJournal: ProviderContextJournal;
 	private readonly emitEvent: (event: RuntimeEventEnvelope) => void;
 	private unsubscribe: (() => void) | undefined;
 	private sequence = 0;
@@ -402,6 +403,7 @@ export class PiProductSession implements PooledSession {
 		resourceLoader: DefaultResourceLoader,
 		settingsManager: SettingsManager,
 		debugContextRecorder: PiDebugContextRecorder,
+		providerContextJournal: ProviderContextJournal,
 		roomSkillLoad: RoomSkillLoadReceipt | undefined,
 	) {
 		this.externalSessionId = options.externalSessionId;
@@ -417,6 +419,7 @@ export class PiProductSession implements PooledSession {
 		this.resourceLoader = resourceLoader;
 		this.settingsManager = settingsManager;
 		this.debugContextRecorder = debugContextRecorder;
+		this.providerContextJournal = providerContextJournal;
 		this.emitEvent = options.emitEvent;
 		this.unsubscribe = session.subscribe((event) => this.onSessionEvent(event));
 	}
@@ -469,6 +472,7 @@ export class PiProductSession implements PooledSession {
 			...(options.codexSkillsEnabled ? options.codexSkillPaths : []),
 		];
 		const lifecycleHooks = createLifecycleHookController({ bridge: backendBridge });
+		const providerContextJournal = new ProviderContextJournal();
 		let requiredSkillPrompt = "";
 		resourceLoader = new DefaultResourceLoader({
 			cwd: options.cwd,
@@ -498,6 +502,7 @@ export class PiProductSession implements PooledSession {
 					},
 					getRecentMessages: () => productSession?.recentMessagesForContext() ?? [],
 					getRoomSkillRecovery: () => productSession?.roomSkillLoadReceipt(),
+					providerContextJournal,
 				}),
 				createWorkflowControlExtension({
 					bridge: backendBridge,
@@ -507,7 +512,7 @@ export class PiProductSession implements PooledSession {
 					() => productSession?.authorizeRoomToolCall() ?? { allowed: false, reason: "Room Session is not ready" },
 				),
 				lifecycleHooks.extension,
-				createTransientContextExtension(() => ({
+				createProviderContextJournalExtension(providerContextJournal, () => ({
 					sessionContext: productSession?.sessionContext ?? "",
 					transientContext: productSession?.transientContext ?? "",
 				})),
@@ -581,6 +586,7 @@ export class PiProductSession implements PooledSession {
 			resourceLoader,
 			settingsManager,
 			debugContextRecorder,
+			providerContextJournal,
 			roomSkillLoad,
 		);
 		productSession.sessionContext = options.sessionContext?.trim() ?? "";
@@ -1015,6 +1021,7 @@ export class PiProductSession implements PooledSession {
 						(Array.isArray(pending.steering) ? pending.steering.length : 0) +
 						(Array.isArray(pending.followUp) ? pending.followUp.length : 0),
 					compactionState: this.latestCompaction?.status ?? "not_started",
+					providerContextJournal: this.providerContextJournal.snapshot(),
 					recoveryState:
 						context?.contributionRefs.some((item) => item.kind === "room-provider-context") === true
 							? "ready"

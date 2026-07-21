@@ -726,6 +726,64 @@ describe("ExtensionRunner", () => {
 		});
 	});
 
+	describe("before_agent_settle", () => {
+		it("admits one structured remedial continuation and rejects a second owner", async () => {
+			const first = `
+				export default function(pi) {
+					pi.on("before_agent_settle", () => ({
+						followUp: {
+							text: "补齐责任提交",
+							continuation: {
+								correlationId: "root-1",
+								idempotencyKey: "settle-1",
+								maxAttempts: 2,
+							},
+						},
+					}));
+				}
+			`;
+			const second = `
+				export default function(pi) {
+					pi.on("before_agent_settle", () => ({ followUp: { text: "重复接管" } }));
+				}
+			`;
+			fs.writeFileSync(path.join(extensionsDir, "a-settle-owner.ts"), first);
+			fs.writeFileSync(path.join(extensionsDir, "b-settle-owner.ts"), second);
+
+			const loaded = await discoverAndLoadExtensions([], tempDir, tempDir);
+			const runner = new ExtensionRunner(loaded.extensions, loaded.runtime, tempDir, sessionManager, modelRegistry);
+			const errors: string[] = [];
+			runner.onError((error) => errors.push(error.error));
+			runner.bindCore(extensionActions, extensionContextActions);
+
+			const result = await runner.emitBeforeAgentSettle({
+				type: "before_agent_settle",
+				message: {
+					role: "assistant",
+					content: [{ type: "text", text: "完成" }],
+					api: "openai-completions",
+					provider: "test",
+					model: "test",
+					usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0, cost: {} },
+					stopReason: "stop",
+					timestamp: 0,
+				} as never,
+			});
+
+			expect(result).toEqual({
+				followUp: {
+					text: "补齐责任提交",
+					continuation: {
+						correlationId: "root-1",
+						idempotencyKey: "settle-1",
+						maxAttempts: 2,
+					},
+				},
+			});
+			expect(errors).toEqual(["only one before_agent_settle follow-up may own the next continuation"]);
+		});
+	});
+
 	describe("tool_result chaining", () => {
 		it("chains content modifications across handlers", async () => {
 			const extCode1 = `

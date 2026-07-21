@@ -1201,6 +1201,17 @@ export class AgentSession {
 
 		// The agent loop drains both queues before emitting agent_end. Any messages
 		// here were queued by agent_end extension handlers and need a continuation.
+		if (this.agent.hasQueuedMessages()) return true;
+		if (this._cancelScope?.signal.aborted || String(msg.stopReason) === "aborted") return false;
+
+		const emitBeforeAgentSettle = this._extensionRunner.emitBeforeAgentSettle;
+		if (typeof emitBeforeAgentSettle !== "function") return false;
+		const settle = await emitBeforeAgentSettle.call(this._extensionRunner, {
+			type: "before_agent_settle",
+			message: msg,
+		});
+		if (!settle?.followUp) return false;
+		await this._queueFollowUp(settle.followUp.text, undefined, settle.followUp.continuation);
 		return this.agent.hasQueuedMessages();
 	}
 

@@ -1,6 +1,6 @@
 import type { ExtensionFactory } from "@earendil-works/pi-coding-agent";
+import type { ProviderContextJournal } from "./provider-context-journal.ts";
 import { type BackendToolBridgeOptions, requestProductGateway } from "./tool-bridge.ts";
-import { replaceRuntimeSessionContext } from "./transient-context.ts";
 
 interface SessionContextRefreshOptions {
 	bridge: BackendToolBridgeOptions;
@@ -8,6 +8,7 @@ interface SessionContextRefreshOptions {
 	setSessionContext(value: string): void;
 	getRecentMessages(): Array<{ role: "user" | "assistant"; text: string }>;
 	getRoomSkillRecovery(): Record<string, unknown> | undefined;
+	providerContextJournal: ProviderContextJournal;
 }
 
 export function createSessionContextRefreshExtension(options: SessionContextRefreshOptions): ExtensionFactory {
@@ -52,9 +53,11 @@ export function createSessionContextRefreshExtension(options: SessionContextRefr
 		});
 		pi.on("session_compact", async (event, ctx) => {
 			const context = await refresh("compaction", "", event.compactionEntry.summary);
-			if (!context) return;
 			return {
-				systemPrompt: replaceRuntimeSessionContext(ctx.getSystemPrompt(), context),
+				systemPrompt: options.providerContextJournal.beginEpoch("compaction", ctx.getSystemPrompt(), {
+					sessionContext: context ?? options.getSessionContext(),
+					transientContext: "",
+				}),
 			};
 		});
 	};

@@ -1,4 +1,5 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { ProviderContextJournal } from "../src/provider-context-journal.ts";
 import { createSessionContextRefreshExtension } from "../src/session-context-refresh.ts";
 
 describe("session context refresh", () => {
@@ -43,6 +44,7 @@ describe("session context refresh", () => {
 				contentRevision: "d".repeat(64),
 				loadReason: "stage_required",
 			}),
+			providerContextJournal: new ProviderContextJournal(),
 		});
 		extension({
 			on: (event: string, handler: (value: any, context?: any) => Promise<unknown>) => handlers.set(event, handler),
@@ -95,6 +97,7 @@ describe("session context refresh", () => {
 			setSessionContext: () => undefined,
 			getRecentMessages: () => [],
 			getRoomSkillRecovery: () => ({ name: "implementation" }),
+			providerContextJournal: new ProviderContextJournal(),
 		});
 		extension({
 			on: (event: string, handler: (value: any, context?: any) => Promise<unknown>) => handlers.set(event, handler),

@@ -34,6 +34,8 @@ export type {
 	// Events - Tool (ToolCallEvent types)
 	BashToolCallEvent,
 	BashToolResultEvent,
+	BeforeAgentSettleEvent,
+	BeforeAgentSettleEventResult,
 	BeforeAgentStartEvent,
 	BeforeAgentStartEventResult,
 	BeforeProviderHeadersEvent,
