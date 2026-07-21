@@ -480,6 +480,10 @@ export class RpcClient {
 					clearTimeout(timer);
 					unsubscribe();
 					resolve();
+				} else if (event.type === "agent_settle_failed") {
+					clearTimeout(timer);
+					unsubscribe();
+					reject(new Error(`Agent settlement failed: ${event.error}`));
 				}
 			});
 		});
@@ -502,6 +506,10 @@ export class RpcClient {
 					clearTimeout(timer);
 					unsubscribe();
 					resolve(events);
+				} else if (event.type === "agent_settle_failed") {
+					clearTimeout(timer);
+					unsubscribe();
+					reject(new Error(`Agent settlement failed: ${event.error}`));
 				}
 			});
 		});

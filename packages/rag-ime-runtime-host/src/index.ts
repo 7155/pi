@@ -4,6 +4,7 @@ export * from "./lifecycle-hooks.ts";
 export * from "./plugin-manager.ts";
 export * from "./protocol.ts";
 export * from "./provider-context-journal.ts";
+export * from "./room-settle-lifecycle.ts";
 export * from "./runtime-host.ts";
 export * from "./runtime-tool-names.ts";
 export * from "./session-context-refresh.ts";

@@ -3026,6 +3026,10 @@ export class InteractiveMode {
 				await this.checkShutdownRequested();
 				break;
 
+			case "agent_settle_failed":
+				this.showError(`Agent settlement failed: ${event.error}`);
+				break;
+
 			case "compaction_start": {
 				if (this.settingsManager.getShowTerminalProgress()) {
 					this.ui.terminal.setProgress(true);

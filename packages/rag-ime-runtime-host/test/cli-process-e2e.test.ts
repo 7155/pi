@@ -1,5 +1,6 @@
 import { type ChildProcessWithoutNullStreams, spawn } from "node:child_process";
 import { mkdtemp, rm } from "node:fs/promises";
+import { createServer, type Server } from "node:http";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { createInterface } from "node:readline";
@@ -10,9 +11,36 @@ const packageRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const workspaceRoot = resolve(packageRoot, "../..");
 const protocolVersion = "2";
 const children: ChildProcessWithoutNullStreams[] = [];
+const servers: Server[] = [];
 
 async function startHost(slow = false) {
 	const stateRoot = await mkdtemp(join(tmpdir(), "rag-ime-real-host-e2e-"));
+	const settleRequests: Record<string, unknown>[] = [];
+	const gateway = createServer((request, response) => {
+		let body = "";
+		request.setEncoding("utf8");
+		request.on("data", (chunk) => {
+			body += chunk;
+		});
+		request.on("end", () => {
+			const payload = JSON.parse(body) as Record<string, unknown>;
+			if (request.url?.endsWith("/room-settle")) settleRequests.push(payload);
+			response.writeHead(200, { "Content-Type": "application/json" });
+			response.end(
+				JSON.stringify({
+					ok: true,
+					result: {
+						state: "committed",
+						dispatchId: payload.dispatchId,
+					},
+				}),
+			);
+		});
+	});
+	await new Promise<void>((accept) => gateway.listen(0, "127.0.0.1", accept));
+	servers.push(gateway);
+	const address = gateway.address();
+	if (!address || typeof address === "string") throw new Error("test gateway did not bind a TCP port");
 	const child = spawn(process.execPath, [join(packageRoot, "dist/cli.js")], {
 		cwd: workspaceRoot,
 		env: {
@@ -22,6 +50,8 @@ async function startHost(slow = false) {
 			RAG_IME_PI_DETERMINISTIC_SLOW: slow ? "1" : "0",
 			RAG_IME_APP_SUPPORT_DIR: stateRoot,
 			RAG_IME_WORKSPACE_ROOTS: workspaceRoot,
+			RAG_IME_TOOL_GATEWAY_URL: `http://127.0.0.1:${address.port}/api/agent/tool/execute`,
+			RAG_IME_TOOL_GATEWAY_TOKEN: "test-token",
 		},
 		stdio: ["pipe", "pipe", "pipe"],
 	});
@@ -59,9 +89,10 @@ async function startHost(slow = false) {
 		child.stdin.end();
 		child.kill("SIGTERM");
 		await closed;
+		await new Promise<void>((accept) => gateway.close(() => accept()));
 		await rm(stateRoot, { recursive: true, force: true });
 	};
-	return { child, messages, waitFor, request, close };
+	return { child, messages, settleRequests, waitFor, request, close };
 }
 
 async function openSession(host: Awaited<ReturnType<typeof startHost>>) {
@@ -88,6 +119,9 @@ afterEach(() => {
 	for (const child of children.splice(0)) {
 		if (!child.killed) child.kill("SIGTERM");
 	}
+	for (const server of servers.splice(0)) {
+		if (server.listening) server.close();
+	}
 });
 
 describe("runtime host real JSONL process", () => {
@@ -109,6 +143,7 @@ describe("runtime host real JSONL process", () => {
 			rootId: "root:e2e",
 			dispatchId: "dispatch:e2e",
 			generation: 1,
+			capabilityEpoch: 1,
 			idempotencyKey: "root:e2e/task/participant",
 			message: "Inspect package.json and settle.",
 		});
@@ -121,10 +156,18 @@ describe("runtime host real JSONL process", () => {
 		);
 		await host.waitFor((message) => message.event === "agent.event" && message.payload?.type === "agent_settled");
 		expect(host.messages.some((message) => message.payload?.toolName === "read")).toBe(true);
+		expect(host.settleRequests).toEqual([
+			expect.objectContaining({
+				dispatchId: "dispatch:e2e",
+				rootId: "root:e2e",
+				capabilityEpoch: 1,
+				settleAttempt: 1,
+			}),
+		]);
 		await host.close();
 	});
 
-	it("queues a continuation and propagates cancel while the Provider is active", async () => {
+	it("rejects overlapping Dispatch ownership and propagates cancel while the Provider is active", async () => {
 		const host = await startHost(true);
 		await openSession(host);
 		await host.request("dispatch-1", "room.dispatch", {
@@ -132,26 +175,30 @@ describe("runtime host real JSONL process", () => {
 			rootId: "root:e2e",
 			dispatchId: "dispatch:1",
 			generation: 1,
+			capabilityEpoch: 1,
 			idempotencyKey: "root:e2e/1",
 			message: "Start bounded work.",
 		});
-		const followUp = await host.request("dispatch-2", "room.dispatch", {
+		const overlapping = await host.request("dispatch-2", "room.dispatch", {
 			sessionId: "session:e2e",
 			rootId: "root:e2e",
 			dispatchId: "dispatch:2",
 			generation: 1,
+			capabilityEpoch: 1,
 			idempotencyKey: "root:e2e/2",
 			message: "Continue the same bounded work.",
 		});
-		expect(followUp.result).toMatchObject({ delivery: "followUp" });
-		expect(followUp.result.continuationId).toEqual(expect.any(String));
+		expect(overlapping).toMatchObject({
+			ok: false,
+			error: { code: "ROOM_SESSION_BUSY" },
+		});
 		const cancelled = await host.request("cancel", "room.cancel", {
 			sessionId: "session:e2e",
 			rootId: "root:e2e",
 			generation: 2,
 		});
 		expect(cancelled.result.activeRunAborted).toBe(true);
-		expect(cancelled.result.cancelledContinuationIds).toContain(followUp.result.continuationId);
+		expect(cancelled.result.cancelledContinuationIds).toEqual(expect.any(Array));
 		await host.waitFor((message) => message.event === "agent.event" && message.payload?.type === "agent_settled");
 		await host.close();
 	}, 20_000);

@@ -106,7 +106,7 @@ describe("regression #6363: agent settled event and idle waiting", () => {
 			extensionFactories: [
 				(pi) => {
 					pi.on("before_agent_settle", (event) => {
-						phases.push(`before:${event.message.stopReason}`);
+						phases.push(`before:${event.message.stopReason}:${event.settleAttempt}`);
 						attempt += 1;
 						if (attempt > 1) return;
 						return {
@@ -132,8 +132,33 @@ describe("regression #6363: agent settled event and idle waiting", () => {
 		await harness.session.prompt("完成 Room 工作项");
 
 		expect(getUserTexts(harness)).toEqual(["完成 Room 工作项", "请在收工前补齐结构化责任提交"]);
-		expect(phases).toEqual(["before:stop", "before:stop", "settled"]);
+		expect(phases).toEqual(["before:stop:1", "before:stop:2", "settled"]);
 		expect(harness.eventsOfType("agent_settled")).toHaveLength(1);
+	});
+
+	it("does not expose a false settled event when the settlement owner fails", async () => {
+		const harness = await createHarness({
+			extensionFactories: [
+				(pi) => {
+					pi.on("before_agent_settle", () => {
+						throw new Error("settlement unavailable");
+					});
+				},
+			],
+		});
+		harnesses.push(harness);
+		harness.setResponses([fauxAssistantMessage("finished locally")]);
+
+		await expect(harness.session.prompt("finish governed work")).rejects.toThrow("settlement unavailable");
+
+		expect(harness.eventsOfType("agent_settled")).toHaveLength(0);
+		expect(harness.eventsOfType("agent_settle_failed")).toEqual([
+			expect.objectContaining({
+				type: "agent_settle_failed",
+				error: "settlement unavailable",
+				receipt: expect.objectContaining({ pendingOperations: 0 }),
+			}),
+		]);
 	});
 
 	it("lists, selectively cancels, and wakes delayed structured continuations", async () => {

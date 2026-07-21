@@ -724,6 +724,13 @@ export interface AgentEndEvent {
 export interface BeforeAgentSettleEvent {
 	type: "before_agent_settle";
 	message: AssistantMessage;
+	/** Monotonic within one cancel scope; retries caused by this hook increment it. */
+	settleAttempt: number;
+	/** Stable runtime identity used by products to deduplicate one settle attempt. */
+	cancelScope: {
+		scopeId: string;
+		generation: number;
+	};
 }
 
 /** Fired after an agent run has fully settled and no automatic retry, compaction, or queued continuation will run. */

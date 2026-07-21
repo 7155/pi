@@ -134,9 +134,13 @@ function optionalTimeoutMs(params: Record<string, unknown>): number {
 }
 
 function requiredGeneration(params: Record<string, unknown>): number {
-	const value = params.generation;
+	return requiredNonNegativeInteger(params, "generation");
+}
+
+function requiredNonNegativeInteger(params: Record<string, unknown>, key: string): number {
+	const value = params[key];
 	if (typeof value !== "number" || !Number.isSafeInteger(value) || value < 0) {
-		throw new RuntimeProtocolError("INVALID_PARAMS", "generation must be a non-negative safe integer");
+		throw new RuntimeProtocolError("INVALID_PARAMS", `${key} must be a non-negative safe integer`);
 	}
 	return value;
 }
@@ -672,6 +676,7 @@ export class RagImeRuntimeHost {
 				const dispatchId = requiredString(params, "dispatchId", 240);
 				const rootId = requiredString(params, "rootId", 240);
 				const generation = requiredGeneration(params);
+				const capabilityEpoch = requiredNonNegativeInteger(params, "capabilityEpoch");
 				const idempotencyKey = requiredString(params, "idempotencyKey", 512);
 				const receiptKey = `${rootId}\u001f${idempotencyKey}`;
 				const existing = this.roomReceipts.get(receiptKey);
@@ -681,6 +686,7 @@ export class RagImeRuntimeHost {
 					dispatchId,
 					rootId,
 					generation,
+					capabilityEpoch,
 				});
 				const receipt = {
 					schemaVersion: "wisdom-weasel.room-runtime-receipt.v1",
@@ -689,6 +695,7 @@ export class RagImeRuntimeHost {
 					rootId,
 					dispatchId,
 					generation,
+					capabilityEpoch,
 					sessionId,
 					...accepted,
 				};
@@ -702,6 +709,7 @@ export class RagImeRuntimeHost {
 				const target = this.session(params);
 				const cancelled = target.cancelRoom(rootId, generation);
 				if (cancelled.abortRequired) await target.abort();
+				target.finishRoomCancel(rootId, generation);
 				const termination = (surface: string, targetIds: string[] = []) => ({
 					schemaVersion: "wisdom-weasel.runtime-surface-termination-receipt.v1",
 					surface,

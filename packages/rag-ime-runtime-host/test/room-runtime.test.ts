@@ -100,6 +100,7 @@ describe("Room runtime RPC", () => {
 			externalSessionId: "session:target",
 			dispatchRoom: vi.fn(async () => ({ delivery: "prompt", turnId: "turn:1" })),
 			cancelRoom: vi.fn(() => ({ cancelledIds: ["continuation:1"], abortRequired: true })),
+			finishRoomCancel: vi.fn(() => undefined),
 			abort: vi.fn(async () => undefined),
 			dispose: vi.fn(async () => undefined),
 		};
@@ -113,6 +114,7 @@ describe("Room runtime RPC", () => {
 				rootId: "root:1",
 				dispatchId: "dispatch:1",
 				generation: 3,
+				capabilityEpoch: 7,
 				idempotencyKey: "root:1/task:1/participant:b",
 				message: "Execute the bounded Room task.",
 			};
@@ -125,6 +127,7 @@ describe("Room runtime RPC", () => {
 				rootId: "root:1",
 				dispatchId: "dispatch:1",
 				generation: 3,
+				capabilityEpoch: 7,
 				turnId: "turn:1",
 			});
 			expect(duplicate).toMatchObject({ duplicate: true, dispatchId: "dispatch:1" });
@@ -159,6 +162,7 @@ describe("Room runtime RPC", () => {
 				"session",
 			]);
 			expect(target.abort).toHaveBeenCalledTimes(1);
+			expect(target.finishRoomCancel).toHaveBeenCalledWith("root:1", 4);
 		} finally {
 			await host.dispose();
 			await rm(root, { recursive: true, force: true });

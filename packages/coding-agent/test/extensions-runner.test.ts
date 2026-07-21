@@ -727,6 +727,31 @@ describe("ExtensionRunner", () => {
 	});
 
 	describe("before_agent_settle", () => {
+		it("fails closed when the settlement owner throws", async () => {
+			fs.writeFileSync(
+				path.join(extensionsDir, "settle-owner.ts"),
+				`export default function(pi) {
+					pi.on("before_agent_settle", () => { throw new Error("settlement unavailable"); });
+				}`,
+			);
+			const loaded = await discoverAndLoadExtensions([], tempDir, tempDir);
+			const runner = new ExtensionRunner(loaded.extensions, loaded.runtime, tempDir, sessionManager, modelRegistry);
+			runner.bindCore(extensionActions, extensionContextActions);
+
+			await expect(
+				runner.emitBeforeAgentSettle({
+					type: "before_agent_settle",
+					settleAttempt: 1,
+					cancelScope: { scopeId: "scope-1", generation: 0 },
+					message: {
+						role: "assistant",
+						content: [],
+						stopReason: "stop",
+					} as never,
+				}),
+			).rejects.toThrow("settlement unavailable");
+		});
+
 		it("admits one structured remedial continuation and rejects a second owner", async () => {
 			const first = `
 				export default function(pi) {
@@ -758,6 +783,8 @@ describe("ExtensionRunner", () => {
 
 			const result = await runner.emitBeforeAgentSettle({
 				type: "before_agent_settle",
+				settleAttempt: 1,
+				cancelScope: { scopeId: "scope-1", generation: 0 },
 				message: {
 					role: "assistant",
 					content: [{ type: "text", text: "完成" }],

@@ -120,6 +120,13 @@ interface BeforeAgentStartCombinedResult {
 	systemPrompt?: string;
 }
 
+class BeforeAgentSettleOwnershipError extends Error {
+	constructor() {
+		super("only one before_agent_settle follow-up may own the next continuation");
+		this.name = "BeforeAgentSettleOwnershipError";
+	}
+}
+
 /**
  * Events handled by the generic emit() method.
  * Events with dedicated emitXxx() methods are excluded for stronger type safety.
@@ -1165,7 +1172,7 @@ export class ExtensionRunner {
 					const text = result.followUp.text.trim();
 					if (!text) throw new Error("before_agent_settle follow-up text must not be empty");
 					if (selected) {
-						throw new Error("only one before_agent_settle follow-up may own the next continuation");
+						throw new BeforeAgentSettleOwnershipError();
 					}
 					selected = {
 						followUp: {
@@ -1182,6 +1189,12 @@ export class ExtensionRunner {
 						error: message,
 						stack,
 					});
+					if (err instanceof BeforeAgentSettleOwnershipError) {
+						continue;
+					}
+					// Settlement is a state transition, not optional telemetry. If its
+					// owner cannot decide, do not emit a misleading final event.
+					throw err;
 				}
 			}
 		}

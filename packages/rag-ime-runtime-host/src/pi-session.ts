@@ -27,6 +27,7 @@ import { createLifecycleHookController } from "./lifecycle-hooks.ts";
 import { PROTOCOL_VERSION, type RuntimeEventEnvelope, RuntimeProtocolError } from "./protocol.ts";
 import { createProviderContextJournalExtension, ProviderContextJournal } from "./provider-context-journal.ts";
 import { createRoomResourceLimitExtension, type RoomResourceLimits } from "./room-resource-limits.ts";
+import { type ActiveRoomDispatch, createRoomSettleLifecycleExtension } from "./room-settle-lifecycle.ts";
 import { TOOL_LOAD_TOOL_NAME } from "./runtime-tool-names.ts";
 import { createSessionContextRefreshExtension } from "./session-context-refresh.ts";
 import type { PooledSession } from "./session-pool.ts";
@@ -373,7 +374,8 @@ export class PiProductSession implements PooledSession {
 	private unsubscribe: (() => void) | undefined;
 	private sequence = 0;
 	private activeTurn: ActiveTurn | undefined;
-	private activeRoom: { rootId: string; generation: number } | undefined;
+	private activeRoom: ActiveRoomDispatch | undefined;
+	private roomUsageBaseline: { input: number; output: number } | undefined;
 	private sessionContext = "";
 	private sessionContextRefreshRevision = 0;
 	private transientContext = "";
@@ -511,6 +513,11 @@ export class PiProductSession implements PooledSession {
 				createRoomResourceLimitExtension(
 					() => productSession?.authorizeRoomToolCall() ?? { allowed: false, reason: "Room Session is not ready" },
 				),
+				createRoomSettleLifecycleExtension({
+					bridge: backendBridge,
+					getActiveRoom: () => productSession?.activeRoom,
+					getResourceUsage: () => productSession?.roomResourceUsage() ?? {},
+				}),
 				lifecycleHooks.extension,
 				createProviderContextJournalExtension(providerContextJournal, () => ({
 					sessionContext: productSession?.sessionContext ?? "",
@@ -875,6 +882,10 @@ export class PiProductSession implements PooledSession {
 		if (event.type === "agent_settled") {
 			this.activeTurn = undefined;
 			this.activeRoom = undefined;
+			this.roomUsageBaseline = undefined;
+			this.transientContext = "";
+		} else if (event.type === "agent_settle_failed" && !this.activeRoom) {
+			this.activeTurn = undefined;
 			this.transientContext = "";
 		}
 	}
@@ -990,6 +1001,7 @@ export class PiProductSession implements PooledSession {
 			toolSchemaRevision: backendToolSchemaRevision(this.toolRegistry.list()),
 			toolManifest: this.toolRegistry.list(),
 			roomCapability: this.roomCapability ? structuredClone(this.roomCapability) : undefined,
+			activeRoom: this.activeRoom ? structuredClone(this.activeRoom) : undefined,
 			roomProviderContext: this.roomProviderContext ? structuredClone(this.roomProviderContext) : undefined,
 			disclosedBackendTools: this.toolRegistry.disclosed().map((tool) => tool.name),
 			// Compatibility field for older control-center clients.
@@ -1305,22 +1317,34 @@ export class PiProductSession implements PooledSession {
 		dispatchId: string;
 		rootId: string;
 		generation: number;
+		capabilityEpoch: number;
 	}): Promise<Record<string, unknown>> {
 		this.assertRoomDispatchResources();
+		if (this.activeRoom && this.activeRoom.dispatchId !== options.dispatchId) {
+			throw new RuntimeProtocolError("ROOM_SESSION_BUSY", "Room Session already owns another active Dispatch");
+		}
+		this.beginRoomDispatch(options);
 		if (!this.activeTurn || this.session.isIdle) {
-			const turn = await this.prompt({ message: options.message });
-			this.activeRoom = { rootId: options.rootId, generation: options.generation };
-			return {
-				delivery: "prompt",
-				turnId: turn.turnId,
-				roomSkillLoad: this.roomSkillLoadReceipt(),
-				providerContextReceipt: this.roomProviderContext
-					? {
-							...structuredClone(this.roomProviderContext),
-							providerRequestId: turn.turnId,
-						}
-					: undefined,
-			};
+			try {
+				const turn = await this.prompt({ message: options.message });
+				return {
+					delivery: "prompt",
+					turnId: turn.turnId,
+					roomSkillLoad: this.roomSkillLoadReceipt(),
+					providerContextReceipt: this.roomProviderContext
+						? {
+								...structuredClone(this.roomProviderContext),
+								providerRequestId: turn.turnId,
+							}
+						: undefined,
+				};
+			} catch (error) {
+				if (this.activeRoom?.dispatchId === options.dispatchId) {
+					this.activeRoom = undefined;
+					this.roomUsageBaseline = undefined;
+				}
+				throw error;
+			}
 		}
 		const continuation = await this.session.followUp(options.message, undefined, {
 			correlationId: options.rootId,
@@ -1328,6 +1352,29 @@ export class PiProductSession implements PooledSession {
 			idempotencyKey: options.dispatchId,
 		});
 		return { delivery: "followUp", turnId: this.activeTurn.turnId, continuationId: continuation.id };
+	}
+
+	private beginRoomDispatch(options: ActiveRoomDispatch): void {
+		const stats = this.session.getSessionStats();
+		this.activeRoom = { ...options };
+		this.roomUsageBaseline = {
+			input: stats.tokens.input,
+			output: stats.tokens.output,
+		};
+		this.roomToolCalls = 0;
+		this.roomToolCost = 0;
+	}
+
+	private roomResourceUsage(): Record<string, number> {
+		const baseline = this.roomUsageBaseline;
+		const stats = this.session.getSessionStats();
+		return {
+			inputTokens: Math.max(0, stats.tokens.input - (baseline?.input ?? stats.tokens.input)),
+			outputTokens: Math.max(0, stats.tokens.output - (baseline?.output ?? stats.tokens.output)),
+			toolCalls: this.roomToolCalls,
+			toolCost: this.roomToolCost,
+			retryCount: 0,
+		};
 	}
 
 	authorizeRoomToolCall(): { allowed: boolean; reason?: string } {
@@ -1364,6 +1411,14 @@ export class PiProductSession implements PooledSession {
 			cancelledIds: byCorrelation.cancelledIds,
 			abortRequired: this.activeRoom?.rootId === rootId && this.activeRoom.generation <= generation,
 		};
+	}
+
+	finishRoomCancel(rootId: string, generation: number): void {
+		if (this.activeRoom?.rootId !== rootId || this.activeRoom.generation > generation) return;
+		this.activeTurn = undefined;
+		this.activeRoom = undefined;
+		this.roomUsageBaseline = undefined;
+		this.transientContext = "";
 	}
 
 	private messageQueue(): Record<string, unknown> {

@@ -67,6 +67,7 @@ import { DEFAULT_THINKING_LEVEL } from "./defaults.ts";
 import { exportSessionToHtml, type ToolHtmlRenderer } from "./export-html/index.ts";
 import { createToolHtmlRenderer } from "./export-html/tool-renderer.ts";
 import {
+	type BeforeAgentSettleEventResult,
 	type ContextUsage,
 	type ExtensionCommandContextActions,
 	type ExtensionErrorListener,
@@ -145,6 +146,11 @@ export type AgentSessionEvent =
 	  }
 	| { type: "agent_settled"; receipt?: AgentSettledReceipt }
 	| {
+			type: "agent_settle_failed";
+			error: string;
+			receipt?: AgentSettledReceipt;
+	  }
+	| {
 			type: "queue_update";
 			steering: readonly string[];
 			followUp: readonly string[];
@@ -173,6 +179,13 @@ export interface AgentSettledReceipt {
 	aborted: boolean;
 	pendingOperations: number;
 	operationCounts: Record<string, number>;
+}
+
+class AgentSettleLifecycleError extends Error {
+	constructor(error: unknown) {
+		super(error instanceof Error ? error.message : String(error), { cause: error });
+		this.name = "AgentSettleLifecycleError";
+	}
 }
 
 // ============================================================================
@@ -327,6 +340,7 @@ export class AgentSession {
 	private _retryAttempt = 0;
 	private _cancelScope: CancelScope | undefined;
 	private _cancelScopeSequence = 0;
+	private _beforeSettleAttempt = 0;
 	private _cancelOperationCounts = new Map<string, number>();
 	private _toolCancelUnregister = new Map<string, () => void>();
 	private _lastSettledReceipt: AgentSettledReceipt | undefined;
@@ -390,7 +404,9 @@ export class AgentSession {
 		// (session persistence, extensions, auto-compaction, retry logic)
 		this._unsubscribeAgent = this.agent.subscribe(this._handleAgentEvent);
 		this.agent.onContinuationReady = () => {
-			if (!this._isAgentRunActive) void this._runAgentContinuation();
+			if (!this._isAgentRunActive) {
+				void this._runAgentContinuation().catch(() => undefined);
+			}
 		};
 		this._installAgentToolHooks();
 		this._installAgentNextTurnRefresh();
@@ -586,6 +602,12 @@ export class AgentSession {
 		} finally {
 			this._resolveIdleWaitIfIdle();
 		}
+	}
+
+	private _emitAgentSettleFailed(error: AgentSettleLifecycleError, receipt: AgentSettledReceipt): void {
+		this._isAgentRunActive = false;
+		this._emit({ type: "agent_settle_failed", error: error.message, receipt });
+		this._resolveIdleWaitIfIdle();
 	}
 
 	// Track last assistant message for auto-compaction check
@@ -1097,16 +1119,22 @@ export class AgentSession {
 		const scope = this._beginCancelScope();
 		const unregisterProvider = this._registerCancelOperation("provider", "provider", () => this.agent.abort());
 		this._isAgentRunActive = true;
+		let settleFailure: AgentSettleLifecycleError | undefined;
 		try {
 			await this.agent.prompt(messages);
 			while (await this._handlePostAgentRun()) {
 				await this.agent.continue();
 			}
+		} catch (error) {
+			if (error instanceof AgentSettleLifecycleError) settleFailure = error;
+			throw error;
 		} finally {
 			unregisterProvider();
 			this._systemPromptOverride = undefined;
 			this._flushPendingBashMessages();
-			await this._emitAgentSettled(this._settledReceipt(scope));
+			const receipt = this._settledReceipt(scope);
+			if (settleFailure) this._emitAgentSettleFailed(settleFailure, receipt);
+			else await this._emitAgentSettled(receipt);
 			if (this._cancelScope === scope) this._cancelScope = undefined;
 		}
 	}
@@ -1119,15 +1147,21 @@ export class AgentSession {
 		});
 		const unregisterProvider = this._registerCancelOperation("provider", "provider", () => this.agent.abort());
 		this._isAgentRunActive = true;
+		let settleFailure: AgentSettleLifecycleError | undefined;
 		try {
 			await this.agent.continue();
 			while (await this._handlePostAgentRun()) await this.agent.continue();
+		} catch (error) {
+			if (error instanceof AgentSettleLifecycleError) settleFailure = error;
+			throw error;
 		} finally {
 			unregisterTimer();
 			unregisterProvider();
 			this._systemPromptOverride = undefined;
 			this._flushPendingBashMessages();
-			await this._emitAgentSettled(this._settledReceipt(scope));
+			const receipt = this._settledReceipt(scope);
+			if (settleFailure) this._emitAgentSettleFailed(settleFailure, receipt);
+			else await this._emitAgentSettled(receipt);
 			if (this._cancelScope === scope) this._cancelScope = undefined;
 		}
 	}
@@ -1137,6 +1171,7 @@ export class AgentSession {
 			scopeId: `${this.sessionId}:run:${++this._cancelScopeSequence}`,
 		});
 		this._cancelScope = scope;
+		this._beforeSettleAttempt = 0;
 		this._cancelOperationCounts = new Map();
 		return scope;
 	}
@@ -1206,13 +1241,28 @@ export class AgentSession {
 
 		const emitBeforeAgentSettle = this._extensionRunner.emitBeforeAgentSettle;
 		if (typeof emitBeforeAgentSettle !== "function") return false;
-		const settle = await emitBeforeAgentSettle.call(this._extensionRunner, {
-			type: "before_agent_settle",
-			message: msg,
-		});
-		if (!settle?.followUp) return false;
-		await this._queueFollowUp(settle.followUp.text, undefined, settle.followUp.continuation);
-		return this.agent.hasQueuedMessages();
+		const cancelScope = this._cancelScope?.snapshot();
+		if (!cancelScope) throw new Error("before_agent_settle requires an active cancel scope");
+		try {
+			const settle: BeforeAgentSettleEventResult | undefined = await emitBeforeAgentSettle.call(
+				this._extensionRunner,
+				{
+					type: "before_agent_settle",
+					message: msg,
+					settleAttempt: ++this._beforeSettleAttempt,
+					cancelScope: {
+						scopeId: cancelScope.scopeId,
+						generation: cancelScope.generation,
+					},
+				},
+			);
+			if (!settle?.followUp) return false;
+			await this._queueFollowUp(settle.followUp.text, undefined, settle.followUp.continuation);
+			return this.agent.hasQueuedMessages();
+		} catch (error) {
+			if (error instanceof AgentSettleLifecycleError) throw error;
+			throw new AgentSettleLifecycleError(error);
+		}
 	}
 
 	/**
