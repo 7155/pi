@@ -1,5 +1,6 @@
 import type { ToolDefinition } from "@earendil-works/pi-coding-agent";
 import { describe, expect, it, vi } from "vitest";
+import { modelVisibleResult, ToolArtifactBuffer, toolAgentBlocks } from "../src/tool-artifact-buffer.ts";
 import {
 	BackendToolRegistry,
 	backendToolCatalogRevision,
@@ -8,6 +9,23 @@ import {
 	createBackendToolExtension,
 	diffBackendToolCatalog,
 } from "../src/tool-bridge.ts";
+
+function managedFileBlock(sessionId = "session-room") {
+	const mediaId = "media_abcdefghijklmnop";
+	return {
+		id: "tool-artifact:file:0123456789abcdef",
+		type: "file",
+		data: {
+			mediaId,
+			sessionId,
+			fileName: "handoff.md",
+			mimeType: "text/markdown",
+			byteSize: 42,
+			sha256: "a".repeat(64),
+			receiptUrl: `/api/agent/media/${mediaId}/content?sessionId=${encodeURIComponent(sessionId)}`,
+		},
+	};
+}
 
 function tool(options: {
 	name: string;
@@ -195,6 +213,117 @@ describe("BackendToolRegistry", () => {
 				approvalState: "applied",
 				approval: { receipt: { summary: "设置已应用" } },
 			});
+		} finally {
+			vi.unstubAllGlobals();
+		}
+	});
+
+	it("keeps managed artifacts out of model context and carries them into the governed Room delivery", async () => {
+		const artifacts = new ToolArtifactBuffer();
+		const block = managedFileBlock();
+		const waitForDecision = vi.fn(async () => true);
+		const fetchMock = vi
+			.fn<typeof fetch>()
+			.mockResolvedValueOnce(
+				new Response(
+					JSON.stringify({
+						ok: true,
+						result: {
+							approvalRequired: true,
+							approval: { approvalId: "approval-artifact", state: "pending" },
+						},
+					}),
+					{ status: 200, headers: { "Content-Type": "application/json" } },
+				),
+			)
+			.mockResolvedValueOnce(
+				new Response(
+					JSON.stringify({
+						ok: true,
+						approval: {
+							approvalId: "approval-artifact",
+							state: "applied",
+							receipt: { summary: "文件已写入", agentBlocks: [block] },
+						},
+					}),
+					{ status: 200, headers: { "Content-Type": "application/json" } },
+				),
+			)
+			.mockResolvedValueOnce(
+				new Response(JSON.stringify({ ok: true, result: { accepted: true } }), {
+					status: 200,
+					headers: { "Content-Type": "application/json" },
+				}),
+			);
+		vi.stubGlobal("fetch", fetchMock);
+		try {
+			const options = {
+				sessionId: "session-room",
+				registry: new BackendToolRegistry(),
+				gatewayUrl: "http://127.0.0.1:8768/api/agent/tool/execute",
+				waitForDecision,
+			};
+			const patchTool = createBackendToolDefinition(options, tool({ name: "workspace_patch" }), artifacts);
+			const patchResult = await patchTool.execute(
+				"call-patch",
+				{ query: "apply" } as never,
+				undefined,
+				undefined,
+				{} as never,
+			);
+
+			const modelText = JSON.stringify(patchResult.content);
+			expect(modelText).toContain("文件已写入");
+			expect(modelText).not.toContain("agentBlocks");
+			expect(modelText).not.toContain("media_abcdefghijklmnop");
+			expect(patchResult.details).toMatchObject({ agentBlocks: [block] });
+			expect(artifacts.size()).toBe(1);
+
+			const commitTool = createBackendToolDefinition(options, tool({ name: "room_commit" }), artifacts);
+			await commitTool.execute(
+				"call-commit",
+				{ decision: "deliver", result: "完成" } as never,
+				undefined,
+				undefined,
+				{} as never,
+			);
+			const commitRequest = JSON.parse(String(fetchMock.mock.calls[2]?.[1]?.body)) as {
+				args: Record<string, unknown>;
+			};
+			expect(commitRequest.args.blocks).toEqual([block]);
+			expect(artifacts.size()).toBe(0);
+		} finally {
+			vi.unstubAllGlobals();
+		}
+	});
+
+	it("retains a pending Room artifact when delivery fails and rejects forged receipts", async () => {
+		const artifacts = new ToolArtifactBuffer();
+		const block = managedFileBlock();
+		expect(artifacts.capture({ details: { approval: { receipt: { agentBlocks: [block] } } } })).toEqual([block]);
+		expect(
+			toolAgentBlocks({ agentBlocks: [{ ...block, data: { ...block.data, mediaId: "../../secret" } }] }),
+		).toEqual([]);
+		expect(modelVisibleResult({ receipt: { agentBlocks: [block], summary: "done" } })).toEqual({
+			receipt: { summary: "done" },
+		});
+
+		const fetchMock = vi.fn<typeof fetch>().mockRejectedValue(new Error("gateway unavailable"));
+		vi.stubGlobal("fetch", fetchMock);
+		try {
+			const definition = createBackendToolDefinition(
+				{
+					sessionId: "session-room",
+					registry: new BackendToolRegistry(),
+					gatewayUrl: "http://127.0.0.1:8768/api/agent/tool/execute",
+				},
+				tool({ name: "room_post" }),
+				artifacts,
+			);
+			await expect(
+				definition.execute("call-post", { content: "交付" } as never, undefined, undefined, {} as never),
+			).rejects.toThrow("gateway unavailable");
+			expect(artifacts.size()).toBe(1);
 		} finally {
 			vi.unstubAllGlobals();
 		}

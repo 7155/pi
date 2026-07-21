@@ -2,6 +2,7 @@ import { createHash } from "node:crypto";
 import type { InlineExtension, ToolDefinition } from "@earendil-works/pi-coding-agent";
 import { RuntimeProtocolError } from "./protocol.ts";
 import { RESERVED_RUNTIME_TOOL_NAMES } from "./runtime-tool-names.ts";
+import { modelVisibleResult, ToolArtifactBuffer } from "./tool-artifact-buffer.ts";
 
 const TOOL_NAME_PATTERN = /^[a-zA-Z][a-zA-Z0-9_.-]{0,127}$/;
 const MAX_TOOLS = 256;
@@ -291,7 +292,9 @@ async function executeGatewayTool(
 	toolCallId: string,
 	args: unknown,
 	signal: AbortSignal | undefined,
+	artifacts: ToolArtifactBuffer,
 ): Promise<{ content: Array<{ type: "text"; text: string }>; details: unknown }> {
+	const prepared = artifacts.prepare(tool.name, args);
 	const payload = await requestProductGateway(
 		options,
 		"execute",
@@ -300,12 +303,13 @@ async function executeGatewayTool(
 			sessionId: options.sessionId,
 			toolCallId,
 			tool: tool.name,
-			args,
+			args: prepared.arguments,
 			...(options.roomCapability ? { roomCapability: options.roomCapability } : {}),
 			...(options.registry.loadReceipt(tool.name) ? { loadReceiptId: options.registry.loadReceipt(tool.name) } : {}),
 		},
 		signal,
 	);
+	artifacts.acknowledge(prepared.deliveryKeys);
 	const result = payload.result ?? {};
 	if (result.reviewRequired === true) {
 		const run = typeof result.run === "object" && result.run !== null ? (result.run as Record<string, unknown>) : {};
@@ -315,11 +319,22 @@ async function executeGatewayTool(
 		const summary = reviewed
 			? "控制中心已完成本次草案审阅。本轮不要继续调用记忆维护工具，请简要确认后结束。"
 			: "用户暂缓了本次草案审阅，未应用变更。本轮不要继续调用记忆维护工具，请简要确认后结束。";
+		const agentBlocks = artifacts.capture(result);
 		return {
 			content: [
-				{ type: "text", text: JSON.stringify({ summary, reviewState: reviewed ? "reviewed" : "deferred", runId }) },
+				{
+					type: "text",
+					text: JSON.stringify(
+						modelVisibleResult({ summary, reviewState: reviewed ? "reviewed" : "deferred", runId }),
+					),
+				},
 			],
-			details: { ...result, reviewState: reviewed ? "reviewed" : "deferred", runId },
+			details: {
+				...result,
+				reviewState: reviewed ? "reviewed" : "deferred",
+				runId,
+				...(agentBlocks.length > 0 ? { agentBlocks } : {}),
+			},
 		};
 	}
 	if (result.approvalRequired === true) {
@@ -355,20 +370,33 @@ async function executeGatewayTool(
 			receipt?.summary ??
 				(approvalState === "applied" ? "受控操作已应用。" : "用户拒绝、审批失效或操作失败，未应用变更。"),
 		);
+		const agentBlocks = artifacts.capture(result, resolved, receipt);
 		return {
-			content: [{ type: "text", text: JSON.stringify({ summary, approvalState, receipt: receipt ?? null }) }],
-			details: { ...result, approvalState, approval: resolved },
+			content: [
+				{
+					type: "text",
+					text: JSON.stringify(modelVisibleResult({ summary, approvalState, receipt: receipt ?? null })),
+				},
+			],
+			details: {
+				...result,
+				approvalState,
+				approval: resolved,
+				...(agentBlocks.length > 0 ? { agentBlocks } : {}),
+			},
 		};
 	}
+	const agentBlocks = artifacts.capture(result);
 	return {
-		content: [{ type: "text", text: JSON.stringify(result) }],
-		details: { ...result, toolName: tool.name },
+		content: [{ type: "text", text: JSON.stringify(modelVisibleResult(result)) }],
+		details: { ...result, toolName: tool.name, ...(agentBlocks.length > 0 ? { agentBlocks } : {}) },
 	};
 }
 
 export function createBackendToolDefinition(
 	options: BackendToolBridgeOptions,
 	tool: BackendToolManifest,
+	artifacts = new ToolArtifactBuffer(),
 ): ToolDefinition {
 	return {
 		name: tool.name,
@@ -376,18 +404,20 @@ export function createBackendToolDefinition(
 		description: tool.description,
 		parameters: tool.parameters as ToolDefinition["parameters"],
 		executionMode: "parallel",
-		execute: async (toolCallId, args, signal) => executeGatewayTool(options, tool, toolCallId, args, signal),
+		execute: async (toolCallId, args, signal) =>
+			executeGatewayTool(options, tool, toolCallId, args, signal, artifacts),
 	};
 }
 
 export function createBackendToolExtension(options: BackendToolBridgeOptions): InlineExtension {
+	const artifacts = new ToolArtifactBuffer();
 	return {
 		name: "rag-ime-backend-tools",
 		factory(pi) {
 			// Register the complete session-authorized catalog for execution lookup.
 			// Provider visibility is narrowed separately by AgentSession.active tools.
 			for (const tool of options.registry.list()) {
-				pi.registerTool(createBackendToolDefinition(options, tool));
+				pi.registerTool(createBackendToolDefinition(options, tool, artifacts));
 			}
 		},
 	};
