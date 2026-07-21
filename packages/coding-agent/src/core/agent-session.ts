@@ -17,13 +17,16 @@ import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { basename, dirname } from "node:path";
 import type {
 	Agent,
+	AgentContinuation,
 	AgentEvent,
 	AgentMessage,
 	AgentState,
 	AgentTool,
+	ContinuationOptions,
 	PrepareNextTurnContext,
 	ThinkingLevel,
 } from "@earendil-works/pi-agent-core";
+import { CancelScope } from "@earendil-works/pi-agent-core";
 import type {
 	AssistantMessage,
 	AuthResult,
@@ -140,7 +143,7 @@ export type AgentSessionEvent =
 			messages: AgentMessage[];
 			willRetry: boolean;
 	  }
-	| { type: "agent_settled" }
+	| { type: "agent_settled"; receipt?: AgentSettledReceipt }
 	| {
 			type: "queue_update";
 			steering: readonly string[];
@@ -163,6 +166,14 @@ export type AgentSessionEvent =
 
 /** Listener function for agent session events */
 export type AgentSessionEventListener = (event: AgentSessionEvent) => void;
+
+export interface AgentSettledReceipt {
+	scopeId: string;
+	generation: number;
+	aborted: boolean;
+	pendingOperations: number;
+	operationCounts: Record<string, number>;
+}
 
 // ============================================================================
 // Types
@@ -296,9 +307,10 @@ export class AgentSession {
 	private _resolveIdleWait: (() => void) | undefined;
 
 	/** Tracks pending steering messages for UI display. Removed when delivered. */
-	private _steeringMessages: string[] = [];
+	private _steeringMessages: Array<{ id: string; text: string }> = [];
 	/** Tracks pending follow-up messages for UI display. Removed when delivered. */
-	private _followUpMessages: string[] = [];
+	private _followUpMessages: Array<{ id: string; text: string }> = [];
+	private readonly _continuationIdByMessage = new WeakMap<object, string>();
 	/** Messages queued to be included with the next user prompt as context ("asides"). */
 	private _pendingNextTurnMessages: CustomMessage[] = [];
 
@@ -313,6 +325,11 @@ export class AgentSession {
 	// Retry state
 	private _retryAbortController: AbortController | undefined = undefined;
 	private _retryAttempt = 0;
+	private _cancelScope: CancelScope | undefined;
+	private _cancelScopeSequence = 0;
+	private _cancelOperationCounts = new Map<string, number>();
+	private _toolCancelUnregister = new Map<string, () => void>();
+	private _lastSettledReceipt: AgentSettledReceipt | undefined;
 
 	// Bash execution state
 	private _bashAbortController: AbortController | undefined = undefined;
@@ -372,6 +389,9 @@ export class AgentSession {
 		// Always subscribe to agent events for internal handling
 		// (session persistence, extensions, auto-compaction, retry logic)
 		this._unsubscribeAgent = this.agent.subscribe(this._handleAgentEvent);
+		this.agent.onContinuationReady = () => {
+			if (!this._isAgentRunActive) void this._runAgentContinuation();
+		};
 		this._installAgentToolHooks();
 		this._installAgentNextTurnRefresh();
 
@@ -533,8 +553,8 @@ export class AgentSession {
 	private _emitQueueUpdate(): void {
 		this._emit({
 			type: "queue_update",
-			steering: [...this._steeringMessages],
-			followUp: [...this._followUpMessages],
+			steering: this._steeringMessages.map((item) => item.text),
+			followUp: this._followUpMessages.map((item) => item.text),
 		});
 	}
 
@@ -548,7 +568,7 @@ export class AgentSession {
 	}
 
 	private _resolveIdleWaitIfIdle(): void {
-		if (this._isAgentRunActive || !this._resolveIdleWait) {
+		if (!this.isIdle || !this._resolveIdleWait) {
 			return;
 		}
 		const resolve = this._resolveIdleWait;
@@ -557,11 +577,12 @@ export class AgentSession {
 		resolve();
 	}
 
-	private async _emitAgentSettled(): Promise<void> {
+	private async _emitAgentSettled(receipt?: AgentSettledReceipt): Promise<void> {
 		this._isAgentRunActive = false;
+		this._lastSettledReceipt = receipt;
 		try {
 			await this._extensionRunner.emit({ type: "agent_settled" });
-			this._emit({ type: "agent_settled" });
+			this._emit({ type: "agent_settled", receipt });
 		} finally {
 			this._resolveIdleWaitIfIdle();
 		}
@@ -572,20 +593,34 @@ export class AgentSession {
 
 	/** Internal handler for agent events - shared by subscribe and reconnect */
 	private _handleAgentEvent = async (event: AgentEvent): Promise<void> => {
+		if (event.type === "tool_execution_start") {
+			this._toolCancelUnregister.set(
+				event.toolCallId,
+				this._registerCancelOperation(`tool:${event.toolCallId}`, "tool", () => this.agent.abort()),
+			);
+		} else if (event.type === "tool_execution_end") {
+			this._toolCancelUnregister.get(event.toolCallId)?.();
+			this._toolCancelUnregister.delete(event.toolCallId);
+		}
 		// When a user message starts, check if it's from either queue and remove it BEFORE emitting
 		// This ensures the UI sees the updated queue state
 		if (event.type === "message_start" && event.message.role === "user") {
 			this._overflowRecoveryAttempted = false;
+			const continuationId = this._continuationIdByMessage.get(event.message);
 			const messageText = this._getUserMessageText(event.message);
 			if (messageText) {
 				// Check steering queue first
-				const steeringIndex = this._steeringMessages.indexOf(messageText);
+				const steeringIndex = this._steeringMessages.findIndex((item) =>
+					continuationId ? item.id === continuationId : item.text === messageText,
+				);
 				if (steeringIndex !== -1) {
 					this._steeringMessages.splice(steeringIndex, 1);
 					this._emitQueueUpdate();
 				} else {
 					// Check follow-up queue
-					const followUpIndex = this._followUpMessages.indexOf(messageText);
+					const followUpIndex = this._followUpMessages.findIndex((item) =>
+						continuationId ? item.id === continuationId : item.text === messageText,
+					);
 					if (followUpIndex !== -1) {
 						this._followUpMessages.splice(followUpIndex, 1);
 						this._emitQueueUpdate();
@@ -867,7 +902,7 @@ export class AgentSession {
 
 	/** Whether the session has no active agent run, retry, auto-compaction, or queued continuation. */
 	get isIdle(): boolean {
-		return !this._isAgentRunActive;
+		return !this._isAgentRunActive && !this.agent.hasQueuedMessages();
 	}
 
 	/** Current effective system prompt (includes any per-turn extension modifications) */
@@ -1059,6 +1094,8 @@ export class AgentSession {
 	// =========================================================================
 
 	private async _runAgentPrompt(messages: AgentMessage | AgentMessage[]): Promise<void> {
+		const scope = this._beginCancelScope();
+		const unregisterProvider = this._registerCancelOperation("provider", "provider", () => this.agent.abort());
 		this._isAgentRunActive = true;
 		try {
 			await this.agent.prompt(messages);
@@ -1066,10 +1103,75 @@ export class AgentSession {
 				await this.agent.continue();
 			}
 		} finally {
+			unregisterProvider();
 			this._systemPromptOverride = undefined;
 			this._flushPendingBashMessages();
-			await this._emitAgentSettled();
+			await this._emitAgentSettled(this._settledReceipt(scope));
+			if (this._cancelScope === scope) this._cancelScope = undefined;
 		}
+	}
+
+	private async _runAgentContinuation(): Promise<void> {
+		if (this._isAgentRunActive || !this.agent.hasQueuedMessages()) return;
+		const scope = this._beginCancelScope();
+		const unregisterTimer = this._registerCancelOperation("continuation-timer", "continuation_timer", () => {
+			this.agent.cancelActiveContinuationGeneration("user_abort");
+		});
+		const unregisterProvider = this._registerCancelOperation("provider", "provider", () => this.agent.abort());
+		this._isAgentRunActive = true;
+		try {
+			await this.agent.continue();
+			while (await this._handlePostAgentRun()) await this.agent.continue();
+		} finally {
+			unregisterTimer();
+			unregisterProvider();
+			this._systemPromptOverride = undefined;
+			this._flushPendingBashMessages();
+			await this._emitAgentSettled(this._settledReceipt(scope));
+			if (this._cancelScope === scope) this._cancelScope = undefined;
+		}
+	}
+
+	private _beginCancelScope(): CancelScope {
+		const scope = new CancelScope({
+			scopeId: `${this.sessionId}:run:${++this._cancelScopeSequence}`,
+		});
+		this._cancelScope = scope;
+		this._cancelOperationCounts = new Map();
+		return scope;
+	}
+
+	private _registerCancelOperation(operationId: string, kind: string, cancel: () => void | Promise<void>): () => void {
+		const scope = this._cancelScope;
+		if (!scope || scope.signal.aborted) return () => {};
+		this._cancelOperationCounts.set(kind, (this._cancelOperationCounts.get(kind) ?? 0) + 1);
+		return scope.register({ operationId, kind, cancel });
+	}
+
+	private _settledReceipt(scope: CancelScope): AgentSettledReceipt {
+		const snapshot = scope.snapshot();
+		return {
+			scopeId: snapshot.scopeId,
+			generation: snapshot.generation,
+			aborted: snapshot.cancelled,
+			pendingOperations: snapshot.operations.length,
+			operationCounts: Object.fromEntries(this._cancelOperationCounts),
+		};
+	}
+
+	private _beginOperationScope(kind: string): { scope: CancelScope; owned: boolean } {
+		if (this._cancelScope && !this._cancelScope.signal.aborted) {
+			return { scope: this._cancelScope, owned: false };
+		}
+		const scope = this._beginCancelScope();
+		this._cancelOperationCounts.set(kind, 0);
+		return { scope, owned: true };
+	}
+
+	private _finishOperationScope(scope: CancelScope, owned: boolean): void {
+		if (!owned) return;
+		this._lastSettledReceipt = this._settledReceipt(scope);
+		if (this._cancelScope === scope) this._cancelScope = undefined;
 	}
 
 	private async _handlePostAgentRun(): Promise<boolean> {
@@ -1332,7 +1434,7 @@ export class AgentSession {
 	 * @param images Optional image attachments to include with the message
 	 * @throws Error if text is an extension command
 	 */
-	async steer(text: string, images?: ImageContent[]): Promise<void> {
+	async steer(text: string, images?: ImageContent[], continuation?: ContinuationOptions): Promise<AgentContinuation> {
 		// Check for extension commands (cannot be queued)
 		if (text.startsWith("/")) {
 			this._throwIfExtensionCommand(text);
@@ -1342,7 +1444,7 @@ export class AgentSession {
 		let expandedText = this._expandSkillCommand(text);
 		expandedText = expandPromptTemplate(expandedText, [...this.promptTemplates]);
 
-		await this._queueSteer(expandedText, images);
+		return await this._queueSteer(expandedText, images, continuation);
 	}
 
 	/**
@@ -1352,7 +1454,11 @@ export class AgentSession {
 	 * @param images Optional image attachments to include with the message
 	 * @throws Error if text is an extension command
 	 */
-	async followUp(text: string, images?: ImageContent[]): Promise<void> {
+	async followUp(
+		text: string,
+		images?: ImageContent[],
+		continuation?: ContinuationOptions,
+	): Promise<AgentContinuation> {
 		// Check for extension commands (cannot be queued)
 		if (text.startsWith("/")) {
 			this._throwIfExtensionCommand(text);
@@ -1362,41 +1468,65 @@ export class AgentSession {
 		let expandedText = this._expandSkillCommand(text);
 		expandedText = expandPromptTemplate(expandedText, [...this.promptTemplates]);
 
-		await this._queueFollowUp(expandedText, images);
+		return await this._queueFollowUp(expandedText, images, continuation);
 	}
 
 	/**
 	 * Internal: Queue a steering message (already expanded, no extension command check).
 	 */
-	private async _queueSteer(text: string, images?: ImageContent[]): Promise<void> {
-		this._steeringMessages.push(text);
-		this._emitQueueUpdate();
+	private async _queueSteer(
+		text: string,
+		images?: ImageContent[],
+		continuation?: ContinuationOptions,
+	): Promise<AgentContinuation> {
 		const content: (TextContent | ImageContent)[] = [{ type: "text", text }];
 		if (images) {
 			content.push(...images);
 		}
-		this.agent.steer({
-			role: "user",
-			content,
-			timestamp: Date.now(),
-		});
+		const existingIds = new Set(this.agent.listContinuations().map((item) => item.id));
+		const admitted = this.agent.steer(
+			{
+				role: "user",
+				content,
+				timestamp: Date.now(),
+			},
+			continuation,
+		);
+		if (!existingIds.has(admitted.id)) {
+			this._steeringMessages.push({ id: admitted.id, text });
+			this._continuationIdByMessage.set(admitted.payload, admitted.id);
+			this._emitQueueUpdate();
+		}
+		return admitted;
 	}
 
 	/**
 	 * Internal: Queue a follow-up message (already expanded, no extension command check).
 	 */
-	private async _queueFollowUp(text: string, images?: ImageContent[]): Promise<void> {
-		this._followUpMessages.push(text);
-		this._emitQueueUpdate();
+	private async _queueFollowUp(
+		text: string,
+		images?: ImageContent[],
+		continuation?: ContinuationOptions,
+	): Promise<AgentContinuation> {
 		const content: (TextContent | ImageContent)[] = [{ type: "text", text }];
 		if (images) {
 			content.push(...images);
 		}
-		this.agent.followUp({
-			role: "user",
-			content,
-			timestamp: Date.now(),
-		});
+		const existingIds = new Set(this.agent.listContinuations().map((item) => item.id));
+		const admitted = this.agent.followUp(
+			{
+				role: "user",
+				content,
+				timestamp: Date.now(),
+			},
+			continuation,
+		);
+		if (!existingIds.has(admitted.id)) {
+			this._followUpMessages.push({ id: admitted.id, text });
+			this._continuationIdByMessage.set(admitted.payload, admitted.id);
+			this._emitQueueUpdate();
+		}
+		return admitted;
 	}
 
 	/**
@@ -1508,8 +1638,8 @@ export class AgentSession {
 	 * @returns Object with steering and followUp arrays
 	 */
 	clearQueue(): { steering: string[]; followUp: string[] } {
-		const steering = [...this._steeringMessages];
-		const followUp = [...this._followUpMessages];
+		const steering = this._steeringMessages.map((item) => item.text);
+		const followUp = this._followUpMessages.map((item) => item.text);
 		this._steeringMessages = [];
 		this._followUpMessages = [];
 		this.agent.clearAllQueues();
@@ -1522,14 +1652,43 @@ export class AgentSession {
 		return this._steeringMessages.length + this._followUpMessages.length;
 	}
 
+	listContinuations(): AgentContinuation[] {
+		return this.agent.listContinuations();
+	}
+
+	cancelContinuation(
+		selector: { id?: string; correlationId?: string; generation?: number },
+		reason = "rpc_cancel",
+	): { cancelledIds: string[] } {
+		const receipt = this.agent.cancelContinuation(selector, reason);
+		this._applyContinuationCancellation(receipt);
+		return receipt;
+	}
+
+	private _applyContinuationCancellation(receipt: { cancelledIds: string[] }): void {
+		if (receipt.cancelledIds.length > 0) {
+			const cancelled = new Set(receipt.cancelledIds);
+			const activeIds = new Set(
+				this.agent
+					.listContinuations()
+					.filter((item) => item.state === "pending" && !cancelled.has(item.id))
+					.map((item) => item.id),
+			);
+			this._steeringMessages = this._steeringMessages.filter((item) => activeIds.has(item.id));
+			this._followUpMessages = this._followUpMessages.filter((item) => activeIds.has(item.id));
+			this._emitQueueUpdate();
+		}
+		this._resolveIdleWaitIfIdle();
+	}
+
 	/** Get pending steering messages (read-only) */
 	getSteeringMessages(): readonly string[] {
-		return this._steeringMessages;
+		return this._steeringMessages.map((item) => item.text);
 	}
 
 	/** Get pending follow-up messages (read-only) */
 	getFollowUpMessages(): readonly string[] {
-		return this._followUpMessages;
+		return this._followUpMessages.map((item) => item.text);
 	}
 
 	get resourceLoader(): ResourceLoader {
@@ -1540,6 +1699,8 @@ export class AgentSession {
 	 * Abort current operation and wait for agent to become idle.
 	 */
 	async abort(): Promise<void> {
+		await this._cancelScope?.cancel("user_abort");
+		this._applyContinuationCancellation(this.agent.cancelActiveContinuationGeneration("user_abort"));
 		this.abortRetry();
 		this.agent.abort();
 		await this.waitForIdle();
@@ -1550,6 +1711,16 @@ export class AgentSession {
 			return;
 		}
 		await this._getIdleWaitPromise();
+	}
+
+	getRuntimeLifecycleSnapshot(): {
+		activeScope: ReturnType<CancelScope["snapshot"]> | null;
+		lastSettledReceipt: AgentSettledReceipt | null;
+	} {
+		return {
+			activeScope: this._cancelScope?.snapshot() ?? null,
+			lastSettledReceipt: this._lastSettledReceipt ?? null,
+		};
 	}
 
 	// =========================================================================
@@ -1783,7 +1954,11 @@ export class AgentSession {
 	async compact(customInstructions?: string): Promise<CompactionResult> {
 		this._disconnectFromAgent();
 		await this.abort();
+		const operationScope = this._beginOperationScope("manual_compaction");
 		this._compactionAbortController = new AbortController();
+		const unregisterCompaction = this._registerCancelOperation("manual-compaction", "manual_compaction", () =>
+			this._compactionAbortController?.abort(),
+		);
 		this._emit({ type: "compaction_start", reason: "manual" });
 
 		try {
@@ -1917,7 +2092,9 @@ export class AgentSession {
 			});
 			throw error;
 		} finally {
+			unregisterCompaction();
 			this._compactionAbortController = undefined;
+			this._finishOperationScope(operationScope.scope, operationScope.owned);
 			this._reconnectToAgent();
 		}
 	}
@@ -2045,6 +2222,7 @@ export class AgentSession {
 	private async _runAutoCompaction(reason: "overflow" | "threshold", willRetry: boolean): Promise<boolean> {
 		const settings = this.settingsManager.getCompactionSettings();
 		let started = false;
+		let unregisterAutoCompaction = () => {};
 
 		try {
 			if (!this.model) {
@@ -2073,6 +2251,9 @@ export class AgentSession {
 
 			this._emit({ type: "compaction_start", reason });
 			this._autoCompactionAbortController = new AbortController();
+			unregisterAutoCompaction = this._registerCancelOperation("auto-compaction", "auto_compaction", () =>
+				this._autoCompactionAbortController?.abort(),
+			);
 			started = true;
 
 			let extensionCompaction: CompactionResult | undefined;
@@ -2210,6 +2391,7 @@ export class AgentSession {
 			}
 			return false;
 		} finally {
+			unregisterAutoCompaction();
 			this._autoCompactionAbortController = undefined;
 		}
 	}
@@ -2669,6 +2851,9 @@ export class AgentSession {
 
 		// Wait with exponential backoff (abortable)
 		this._retryAbortController = new AbortController();
+		const unregisterRetry = this._registerCancelOperation("retry-sleep", "retry_sleep", () =>
+			this._retryAbortController?.abort(),
+		);
 		try {
 			await sleep(delayMs, this._retryAbortController.signal);
 		} catch {
@@ -2683,6 +2868,7 @@ export class AgentSession {
 			});
 			return false;
 		} finally {
+			unregisterRetry();
 			this._retryAbortController = undefined;
 		}
 
@@ -2731,6 +2917,10 @@ export class AgentSession {
 		options?: { excludeFromContext?: boolean; operations?: BashOperations },
 	): Promise<BashResult> {
 		this._bashAbortController = new AbortController();
+		const operationScope = this._beginOperationScope("bash_process");
+		const unregisterBash = this._registerCancelOperation("bash-process", "bash_process", () =>
+			this._bashAbortController?.abort(),
+		);
 
 		// Apply command prefix if configured (e.g., "shopt -s expand_aliases" for alias support)
 		const prefix = this.settingsManager.getShellCommandPrefix();
@@ -2751,7 +2941,9 @@ export class AgentSession {
 			this.recordBashResult(command, result, options);
 			return result;
 		} finally {
+			unregisterBash();
 			this._bashAbortController = undefined;
+			this._finishOperationScope(operationScope.scope, operationScope.owned);
 		}
 	}
 
@@ -2895,6 +3087,10 @@ export class AgentSession {
 
 		// Set up abort controller for summarization
 		this._branchSummaryAbortController = new AbortController();
+		const operationScope = this._beginOperationScope("branch_summary");
+		const unregisterBranchSummary = this._registerCancelOperation("branch-summary", "branch_summary", () =>
+			this._branchSummaryAbortController?.abort(),
+		);
 
 		try {
 			let extensionSummary: { summary: string; details?: unknown } | undefined;
@@ -3033,7 +3229,9 @@ export class AgentSession {
 
 			return { editorText, cancelled: false, summaryEntry };
 		} finally {
+			unregisterBranchSummary();
 			this._branchSummaryAbortController = undefined;
+			this._finishOperationScope(operationScope.scope, operationScope.owned);
 		}
 	}
 

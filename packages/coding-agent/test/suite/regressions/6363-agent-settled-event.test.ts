@@ -57,6 +57,11 @@ describe("regression #6363: agent settled event and idle waiting", () => {
 
 		expect(harness.eventsOfType("agent_end").map((event) => event.willRetry)).toEqual([true, false]);
 		expect(harness.eventsOfType("agent_settled")).toHaveLength(1);
+		expect(harness.eventsOfType("agent_settled")[0]?.receipt).toMatchObject({
+			aborted: false,
+			pendingOperations: 0,
+			operationCounts: { provider: 1, retry_sleep: 1 },
+		});
 		expect(extensionEvents).toEqual(["agent_end", "agent_end", "agent_settled:true"]);
 		expect(publicEvents).toEqual(["agent_settled"]);
 	});
@@ -87,6 +92,81 @@ describe("regression #6363: agent settled event and idle waiting", () => {
 		expect(harness.eventsOfType("agent_end")).toHaveLength(2);
 		expect(harness.eventsOfType("agent_settled")).toHaveLength(1);
 		expect(settledIdleStates).toEqual([true]);
+		expect(harness.eventsOfType("agent_settled")[0]?.receipt).toMatchObject({
+			aborted: false,
+			pendingOperations: 0,
+			operationCounts: { provider: 1 },
+		});
+	});
+
+	it("lists, selectively cancels, and wakes delayed structured continuations", async () => {
+		const harness = await createHarness();
+		harnesses.push(harness);
+		harness.setResponses([fauxAssistantMessage("ready"), fauxAssistantMessage("continued")]);
+		await harness.session.prompt("start");
+
+		await harness.session.followUp("duplicate text", undefined, {
+			id: "by-id",
+			correlationId: "correlation-a",
+			idempotencyKey: "by-id",
+			notBefore: Date.now() + 10_000,
+		});
+		await harness.session.followUp("duplicate text", undefined, {
+			id: "by-correlation",
+			correlationId: "correlation-b",
+			idempotencyKey: "by-correlation",
+			notBefore: Date.now() + 10_000,
+		});
+		expect(harness.session.cancelContinuation({ id: "by-id" }).cancelledIds).toEqual(["by-id"]);
+		expect(harness.session.getFollowUpMessages()).toEqual(["duplicate text"]);
+		expect(harness.session.cancelContinuation({ correlationId: "correlation-b" }).cancelledIds).toEqual([
+			"by-correlation",
+		]);
+		await harness.session.followUp("cancel by generation", undefined, {
+			id: "by-generation",
+			idempotencyKey: "by-generation",
+			cancelGeneration: 0,
+			notBefore: Date.now() + 10_000,
+		});
+		expect(harness.session.cancelContinuation({ generation: 0 }).cancelledIds).toEqual(["by-generation"]);
+
+		await harness.session.followUp("timer delivery", undefined, {
+			id: "timer",
+			idempotencyKey: "timer",
+			notBefore: Date.now() + 20,
+		});
+		expect(harness.session.listContinuations().find((item) => item.id === "timer")?.state).toBe("pending");
+		await harness.session.waitForIdle();
+
+		expect(getUserTexts(harness)).toEqual(["start", "timer delivery"]);
+		expect(harness.session.listContinuations()).toEqual(
+			expect.arrayContaining([
+				expect.objectContaining({ id: "by-id", state: "cancelled" }),
+				expect.objectContaining({ id: "by-correlation", state: "cancelled" }),
+				expect.objectContaining({ id: "by-generation", state: "cancelled" }),
+				expect.objectContaining({ id: "timer", state: "completed", attempt: 1, cancelGeneration: 1 }),
+			]),
+		);
+	});
+
+	it("global abort cancels a delayed continuation before its timer fires", async () => {
+		const harness = await createHarness();
+		harnesses.push(harness);
+		harness.setResponses([fauxAssistantMessage("ready")]);
+		await harness.session.prompt("start");
+		await harness.session.followUp("must not run", undefined, {
+			id: "delayed-abort",
+			idempotencyKey: "delayed-abort",
+			notBefore: Date.now() + 10_000,
+		});
+
+		await harness.session.abort();
+
+		expect(harness.session.isIdle).toBe(true);
+		expect(harness.session.listContinuations()).toContainEqual(
+			expect.objectContaining({ id: "delayed-abort", state: "cancelled", terminalReason: "user_abort" }),
+		);
+		expect(getUserTexts(harness)).toEqual(["start"]);
 	});
 
 	it("extension command waitForIdle waits for session-level settlement", async () => {
@@ -154,5 +234,41 @@ describe("regression #6363: agent settled event and idle waiting", () => {
 
 		expect(commandResults).toEqual([true]);
 		expect(harness.eventsOfType("agent_settled")).toHaveLength(1);
+	});
+
+	it("propagates abort through the run scope and reports drained tool operations", async () => {
+		let markStarted = () => {};
+		const started = new Promise<void>((resolve) => {
+			markStarted = resolve;
+		});
+		const abortableTool: AgentTool = {
+			name: "abortable",
+			label: "Abortable",
+			description: "Wait for cancellation",
+			parameters: Type.Object({}),
+			execute: async (_toolCallId, _params, signal) => {
+				markStarted();
+				await new Promise<void>((resolve) => {
+					if (signal?.aborted) resolve();
+					else signal?.addEventListener("abort", () => resolve(), { once: true });
+				});
+				return { content: [{ type: "text", text: "cancelled" }], details: {} };
+			},
+		};
+		const harness = await createHarness({ tools: [abortableTool] });
+		harnesses.push(harness);
+		harness.setResponses([fauxAssistantMessage(fauxToolCall("abortable", {}), { stopReason: "toolUse" })]);
+
+		const prompt = harness.session.prompt("start");
+		await started;
+		await harness.session.abort();
+		await prompt;
+
+		expect(harness.eventsOfType("agent_settled")[0]?.receipt).toMatchObject({
+			aborted: true,
+			generation: 1,
+			pendingOperations: 0,
+			operationCounts: { provider: 1, tool: 1 },
+		});
 	});
 });

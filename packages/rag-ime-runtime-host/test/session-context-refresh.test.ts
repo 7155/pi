@@ -36,6 +36,13 @@ describe("session context refresh", () => {
 				{ role: "user", text: "完成检索测试" },
 				{ role: "assistant", text: "已经完成初步实现" },
 			],
+			getRoomSkillRecovery: () => ({
+				schemaVersion: "rag-ime.skill-load.v1",
+				name: "implementation",
+				catalogRevision: "c".repeat(64),
+				contentRevision: "d".repeat(64),
+				loadReason: "stage_required",
+			}),
 		});
 		extension({
 			on: (event: string, handler: (value: any, context?: any) => Promise<unknown>) => handlers.set(event, handler),
@@ -65,5 +72,39 @@ describe("session context refresh", () => {
 		expect(request.trigger).toBe("compaction");
 		expect(request.summary).toBe("压缩摘要");
 		expect(request.recentMessages).toHaveLength(2);
+		expect(request.roomSkillRecovery).toEqual({
+			schemaVersion: "rag-ime.skill-load.v1",
+			name: "implementation",
+			catalogRevision: "c".repeat(64),
+			contentRevision: "d".repeat(64),
+			loadReason: "stage_required",
+		});
+	});
+
+	it("fails closed when governed Room skill recovery cannot reach the product", async () => {
+		const handlers = new Map<string, (event: any, context?: any) => Promise<unknown>>();
+		vi.stubGlobal("fetch", vi.fn().mockRejectedValue(new Error("gateway offline")));
+		const extension = createSessionContextRefreshExtension({
+			bridge: {
+				sessionId: "agent:room-child",
+				registry: {} as never,
+				gatewayUrl: "http://127.0.0.1:8766/api/agent/tool/execute",
+				gatewayToken: "test-token",
+			},
+			getSessionContext: () => "existing context",
+			setSessionContext: () => undefined,
+			getRecentMessages: () => [],
+			getRoomSkillRecovery: () => ({ name: "implementation" }),
+		});
+		extension({
+			on: (event: string, handler: (value: any, context?: any) => Promise<unknown>) => handlers.set(event, handler),
+		} as never);
+
+		await expect(
+			handlers.get("session_compact")?.(
+				{ compactionEntry: { summary: "summary" } },
+				{ getSystemPrompt: () => "base prompt" },
+			),
+		).rejects.toThrow("gateway offline");
 	});
 });

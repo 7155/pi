@@ -1,4 +1,5 @@
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
+import { readFileSync } from "node:fs";
 import { resolve } from "node:path";
 import { type Api, getSupportedThinkingLevels, type Model } from "@earendil-works/pi-ai";
 import {
@@ -24,6 +25,7 @@ import {
 } from "./discovery-tools.ts";
 import { createLifecycleHookController } from "./lifecycle-hooks.ts";
 import { PROTOCOL_VERSION, type RuntimeEventEnvelope, RuntimeProtocolError } from "./protocol.ts";
+import { createRoomResourceLimitExtension, type RoomResourceLimits } from "./room-resource-limits.ts";
 import { TOOL_LOAD_TOOL_NAME } from "./runtime-tool-names.ts";
 import { createSessionContextRefreshExtension } from "./session-context-refresh.ts";
 import type { PooledSession } from "./session-pool.ts";
@@ -58,10 +60,14 @@ export interface PiSessionOpenOptions {
 	modelId?: string;
 	thinkingLevel?: NonNullable<CreateAgentSessionOptions["thinkingLevel"]>;
 	toolManifest?: unknown;
+	roomCapability?: Record<string, unknown>;
 	toolGatewayUrl?: string;
 	toolGatewayToken?: string;
 	systemPrompt?: string;
+	sessionContext?: string;
+	roomProviderContext?: Record<string, unknown>;
 	roomSkillPolicy?: unknown;
+	roomResourceLimits?: RoomResourceLimits;
 	noContextFiles?: boolean;
 	emitEvent(event: RuntimeEventEnvelope): void;
 }
@@ -87,6 +93,7 @@ export interface PiForkRuntimeProfile {
 	modelId?: string;
 	thinkingLevel?: NonNullable<CreateAgentSessionOptions["thinkingLevel"]>;
 	toolManifest: BackendToolManifest[];
+	roomCapability?: Record<string, unknown>;
 	systemPrompt: string;
 	noContextFiles: boolean;
 	piSkillsEnabled: boolean;
@@ -180,7 +187,11 @@ export function restoreBackendToolDisclosures(registry: BackendToolRegistry, ses
 		const details = objectRecord(message.details);
 		const loadedTool = objectRecord(details?.tool);
 		const loadedName = typeof loadedTool?.name === "string" ? loadedTool.name : "";
-		if (registry.get(loadedName)) restored.add(loadedName);
+		if (registry.get(loadedName)) {
+			restored.add(loadedName);
+			const governed = objectRecord(details?.governedReceipt);
+			if (typeof governed?.receiptId === "string") registry.recordLoadReceipt(loadedName, governed.receiptId);
+		}
 	}
 	for (const name of restored) registry.disclose(name);
 	return [...restored].sort();
@@ -352,6 +363,7 @@ export class PiProductSession implements PooledSession {
 	readonly noContextFiles: boolean;
 	readonly piSkillsEnabled: boolean;
 	readonly codexSkillsEnabled: boolean;
+	readonly roomCapability?: Record<string, unknown>;
 	private readonly session: AgentSession;
 	private readonly resourceLoader: DefaultResourceLoader;
 	private readonly settingsManager: SettingsManager;
@@ -360,9 +372,14 @@ export class PiProductSession implements PooledSession {
 	private unsubscribe: (() => void) | undefined;
 	private sequence = 0;
 	private activeTurn: ActiveTurn | undefined;
+	private activeRoom: { rootId: string; generation: number } | undefined;
 	private sessionContext = "";
 	private sessionContextRefreshRevision = 0;
 	private transientContext = "";
+	private roomProviderContext?: Record<string, unknown>;
+	private readonly roomResourceLimits?: RoomResourceLimits;
+	private roomToolCalls = 0;
+	private roomToolCost = 0;
 	private latestCompaction: PublicCompactionState | undefined;
 	private readonly pendingDecisions = new Map<
 		string,
@@ -392,6 +409,8 @@ export class PiProductSession implements PooledSession {
 		this.noContextFiles = options.noContextFiles ?? false;
 		this.piSkillsEnabled = options.piSkillsEnabled ?? false;
 		this.codexSkillsEnabled = options.codexSkillsEnabled ?? false;
+		this.roomCapability = options.roomCapability ? structuredClone(options.roomCapability) : undefined;
+		this.roomResourceLimits = options.roomResourceLimits ? structuredClone(options.roomResourceLimits) : undefined;
 		this.session = session;
 		this.toolRegistry = registry;
 		this.roomSkillLoad = roomSkillLoad;
@@ -418,6 +437,13 @@ export class PiProductSession implements PooledSession {
 			{
 				directory: process.env.RAG_IME_PI_DEBUG_CONTEXT_DIR,
 				maxBytes: Number.parseInt(process.env.RAG_IME_PI_DEBUG_CONTEXT_MAX_BYTES ?? "", 10),
+				contributionRefs: [
+					...(options.roomCapability ? [{ kind: "room-capability", ...options.roomCapability }] : []),
+					...(options.roomProviderContext
+						? [{ kind: "room-provider-context", ...options.roomProviderContext }]
+						: []),
+					...(options.roomSkillPolicy ? [{ kind: "room-skill", ...options.roomSkillPolicy }] : []),
+				],
 			},
 		);
 		const settingsManager = SettingsManager.create(options.cwd, options.agentDir, { projectTrusted: true });
@@ -431,6 +457,7 @@ export class PiProductSession implements PooledSession {
 			registry,
 			gatewayUrl: options.toolGatewayUrl,
 			gatewayToken: options.toolGatewayToken,
+			roomCapability: options.roomCapability,
 			waitForDecision: (kind, targetId, details, signal) => {
 				if (!productSession) throw new Error("Product session decision bridge is not ready");
 				return productSession.waitForDecision(kind, targetId, details, signal);
@@ -457,6 +484,7 @@ export class PiProductSession implements PooledSession {
 				createDiscoveryToolsExtension({
 					getResourceLoader,
 					registry,
+					gateway: backendBridge,
 				}),
 				createBackendToolExtension(backendBridge),
 				createSessionContextRefreshExtension({
@@ -469,11 +497,15 @@ export class PiProductSession implements PooledSession {
 						}
 					},
 					getRecentMessages: () => productSession?.recentMessagesForContext() ?? [],
+					getRoomSkillRecovery: () => productSession?.roomSkillLoadReceipt(),
 				}),
 				createWorkflowControlExtension({
 					bridge: backendBridge,
 					onProjectComplete: (details) => lifecycleHooks.projectComplete(details),
 				}),
+				createRoomResourceLimitExtension(
+					() => productSession?.authorizeRoomToolCall() ?? { allowed: false, reason: "Room Session is not ready" },
+				),
 				lifecycleHooks.extension,
 				createTransientContextExtension(() => ({
 					sessionContext: productSession?.sessionContext ?? "",
@@ -523,6 +555,9 @@ export class PiProductSession implements PooledSession {
 					`Model not found: ${options.provider}/${options.modelId}`,
 				);
 			}
+			if (options.roomResourceLimits) {
+				model = { ...model, maxTokens: Math.min(model.maxTokens, options.roomResourceLimits.maxOutputTokens) };
+			}
 		}
 		const created = await createAgentSession({
 			cwd: options.cwd,
@@ -548,6 +583,10 @@ export class PiProductSession implements PooledSession {
 			debugContextRecorder,
 			roomSkillLoad,
 		);
+		productSession.sessionContext = options.sessionContext?.trim() ?? "";
+		productSession.roomProviderContext = options.roomProviderContext
+			? structuredClone(options.roomProviderContext)
+			: undefined;
 		await created.session.bindExtensions({
 			mode: "rpc",
 			uiContext: productSession.extensionUIContext(),
@@ -829,6 +868,7 @@ export class PiProductSession implements PooledSession {
 		});
 		if (event.type === "agent_settled") {
 			this.activeTurn = undefined;
+			this.activeRoom = undefined;
 			this.transientContext = "";
 		}
 	}
@@ -942,13 +982,16 @@ export class PiProductSession implements PooledSession {
 			sequence: this.sequence,
 			toolCatalogRevision: this.toolRegistry.revision(),
 			toolSchemaRevision: backendToolSchemaRevision(this.toolRegistry.list()),
+			toolManifest: this.toolRegistry.list(),
+			roomCapability: this.roomCapability ? structuredClone(this.roomCapability) : undefined,
+			roomProviderContext: this.roomProviderContext ? structuredClone(this.roomProviderContext) : undefined,
 			disclosedBackendTools: this.toolRegistry.disclosed().map((tool) => tool.name),
 			// Compatibility field for older control-center clients.
 			activeBackendTools: this.toolRegistry.disclosed().map((tool) => tool.name),
 			skillCatalogRevision: runtimeSkillCatalogRevision(this.resourceLoader.getSkills().skills),
+			roomSkillLoad: this.roomSkillLoadReceipt(),
 			piSkillsEnabled: this.piSkillsEnabled,
 			codexSkillsEnabled: this.codexSkillsEnabled,
-			roomSkillLoad: this.roomSkillLoad,
 			messages: this.session.messages,
 			entries: this.session.sessionManager.getEntries(),
 			leafId: this.session.sessionManager.getLeafId(),
@@ -958,6 +1001,27 @@ export class PiProductSession implements PooledSession {
 	debugContext(turnId?: string): Record<string, unknown> {
 		const context = this.debugContextRecorder.get(turnId);
 		const storage = this.debugContextRecorder.storage();
+		const latestCall = context?.modelCalls.at(-1);
+		const pending = this.messageQueue();
+		const contextProjection = latestCall
+			? {
+					schemaVersion: "rag-ime.context-assembly-projection.v1",
+					stablePrefixMessages: latestCall.contextDelta.commonPrefixMessages,
+					stablePrefixBytes: latestCall.contextDelta.prefixBytes,
+					dynamicTailMessages: latestCall.contextDelta.addedMessageCount,
+					dynamicTailBytes: latestCall.contextDelta.deltaBytes,
+					sealedMessages: context?.contributionRefs.length ?? 0,
+					pendingMessages:
+						(Array.isArray(pending.steering) ? pending.steering.length : 0) +
+						(Array.isArray(pending.followUp) ? pending.followUp.length : 0),
+					compactionState: this.latestCompaction?.status ?? "not_started",
+					recoveryState:
+						context?.contributionRefs.some((item) => item.kind === "room-provider-context") === true
+							? "ready"
+							: "not_required",
+					sourceRefs: context?.contributionRefs ?? [],
+				}
+			: undefined;
 		return {
 			schemaVersion: "rag-ime.pi-debug-context-response.v1",
 			sessionId: this.externalSessionId,
@@ -966,9 +1030,47 @@ export class PiProductSession implements PooledSession {
 			transient: !storage.persistent,
 			storage,
 			availableTurns: this.debugContextRecorder.list(),
-			context: context ?? null,
+			context: context ? { ...context, contextProjection } : null,
+			transcript: this.transcriptInspectionReceipt(),
 			telemetry: this.telemetry(),
 		};
+	}
+
+	private transcriptInspectionReceipt(): Record<string, unknown> {
+		try {
+			const sessionFile = this.session.sessionFile;
+			if (!sessionFile) throw new Error("session transcript is unavailable");
+			const bytes = readFileSync(sessionFile);
+			const lines = bytes
+				.toString("utf8")
+				.split("\n")
+				.filter((line) => line.trim().length > 0);
+			const entryTypes: string[] = [];
+			for (const line of lines) {
+				try {
+					const parsed = JSON.parse(line) as { type?: unknown };
+					entryTypes.push(String(parsed.type ?? "unknown"));
+				} catch {
+					entryTypes.push("invalid");
+				}
+			}
+			return {
+				schemaVersion: "rag-ime.pi-session-jsonl-receipt.v1",
+				sha256: createHash("sha256").update(bytes).digest("hex"),
+				bytes: bytes.length,
+				lineCount: lines.length,
+				entryTypes,
+				leafId: this.session.sessionManager.getLeafId() ?? "",
+				contentIncluded: false,
+			};
+		} catch {
+			return {
+				schemaVersion: "rag-ime.pi-session-jsonl-receipt.v1",
+				available: false,
+				contentIncluded: false,
+				error: "session transcript is unavailable",
+			};
+		}
 	}
 
 	async rewind(entryId: string): Promise<Record<string, unknown>> {
@@ -986,6 +1088,11 @@ export class PiProductSession implements PooledSession {
 			leafId: this.session.sessionManager.getLeafId() ?? "",
 			snapshot: this.snapshot(),
 		};
+	}
+
+	roomSkillLoadReceipt(): Record<string, unknown> | undefined {
+		if (!this.roomSkillLoad) return undefined;
+		return { ...structuredClone(this.roomSkillLoad) };
 	}
 
 	listTools(): Array<Record<string, unknown>> {
@@ -1050,6 +1157,7 @@ export class PiProductSession implements PooledSession {
 			modelId: this.session.model?.id,
 			thinkingLevel: this.session.thinkingLevel,
 			toolManifest: this.toolRegistry.list(),
+			roomCapability: this.roomCapability ? structuredClone(this.roomCapability) : undefined,
 			systemPrompt: this.session.systemPrompt,
 			noContextFiles: this.noContextFiles,
 			piSkillsEnabled: this.piSkillsEnabled,
@@ -1182,6 +1290,72 @@ export class PiProductSession implements PooledSession {
 			turnId: turn.turnId,
 			clientMessageId: options.clientMessageId,
 			messageQueue: this.messageQueue(),
+		};
+	}
+
+	async dispatchRoom(options: {
+		message: string;
+		dispatchId: string;
+		rootId: string;
+		generation: number;
+	}): Promise<Record<string, unknown>> {
+		this.assertRoomDispatchResources();
+		if (!this.activeTurn || this.session.isIdle) {
+			const turn = await this.prompt({ message: options.message });
+			this.activeRoom = { rootId: options.rootId, generation: options.generation };
+			return {
+				delivery: "prompt",
+				turnId: turn.turnId,
+				roomSkillLoad: this.roomSkillLoadReceipt(),
+				providerContextReceipt: this.roomProviderContext
+					? {
+							...structuredClone(this.roomProviderContext),
+							providerRequestId: turn.turnId,
+						}
+					: undefined,
+			};
+		}
+		const continuation = await this.session.followUp(options.message, undefined, {
+			correlationId: options.rootId,
+			cancelGeneration: options.generation,
+			idempotencyKey: options.dispatchId,
+		});
+		return { delivery: "followUp", turnId: this.activeTurn.turnId, continuationId: continuation.id };
+	}
+
+	authorizeRoomToolCall(): { allowed: boolean; reason?: string } {
+		if (!this.roomResourceLimits) return { allowed: true };
+		if (Date.now() >= this.roomResourceLimits.deadlineAtMs) {
+			return { allowed: false, reason: "Room wall-clock deadline exceeded" };
+		}
+		if (this.roomToolCalls >= this.roomResourceLimits.maxToolCalls) {
+			return { allowed: false, reason: "Room tool-call limit exhausted" };
+		}
+		if (this.roomToolCost + 1 > this.roomResourceLimits.maxToolCost) {
+			return { allowed: false, reason: "Room tool-cost limit exhausted" };
+		}
+		this.roomToolCalls += 1;
+		this.roomToolCost += 1;
+		return { allowed: true };
+	}
+
+	private assertRoomDispatchResources(): void {
+		const limits = this.roomResourceLimits;
+		if (!limits) return;
+		if (Date.now() >= limits.deadlineAtMs) {
+			throw new RuntimeProtocolError("ROOM_DEADLINE_EXCEEDED", "Room wall-clock deadline exceeded");
+		}
+		const contextTokens = this.session.getContextUsage()?.tokens ?? 0;
+		if (contextTokens > limits.maxInputTokens) {
+			throw new RuntimeProtocolError("ROOM_INPUT_LIMIT_EXCEEDED", "Room input-token limit exceeded");
+		}
+	}
+
+	cancelRoom(rootId: string, generation: number): { cancelledIds: string[]; abortRequired: boolean } {
+		const byCorrelation = this.session.cancelContinuation({ correlationId: rootId }, "room_cancel");
+		return {
+			cancelledIds: byCorrelation.cancelledIds,
+			abortRequired: this.activeRoom?.rootId === rootId && this.activeRoom.generation <= generation,
 		};
 	}
 

@@ -5,7 +5,12 @@
  */
 
 import { type ChildProcess, spawn } from "node:child_process";
-import type { AgentMessage, ThinkingLevel } from "@earendil-works/pi-agent-core";
+import type {
+	AgentContinuation,
+	AgentMessage,
+	ContinuationOptions,
+	ThinkingLevel,
+} from "@earendil-works/pi-agent-core";
 import type { ImageContent } from "@earendil-works/pi-ai";
 import type { AgentSessionEvent, SessionStats } from "../../core/agent-session.ts";
 import type { BashResult } from "../../core/bash-executor.ts";
@@ -201,15 +206,34 @@ export class RpcClient {
 	/**
 	 * Queue a steering message to interrupt the agent mid-run.
 	 */
-	async steer(message: string, images?: ImageContent[]): Promise<void> {
-		await this.send({ type: "steer", message, images });
+	async steer(
+		message: string,
+		images?: ImageContent[],
+		continuation?: ContinuationOptions,
+	): Promise<AgentContinuation> {
+		return this.getData(await this.send({ type: "steer", message, images, continuation }));
 	}
 
 	/**
 	 * Queue a follow-up message to be processed after the agent finishes.
 	 */
-	async followUp(message: string, images?: ImageContent[]): Promise<void> {
-		await this.send({ type: "follow_up", message, images });
+	async followUp(
+		message: string,
+		images?: ImageContent[],
+		continuation?: ContinuationOptions,
+	): Promise<AgentContinuation> {
+		return this.getData(await this.send({ type: "follow_up", message, images, continuation }));
+	}
+
+	async listContinuations(): Promise<AgentContinuation[]> {
+		return this.getData(await this.send({ type: "list_continuations" }));
+	}
+
+	async cancelContinuation(
+		selector: { continuationId?: string; correlationId?: string; generation?: number },
+		reason?: string,
+	): Promise<{ cancelledIds: string[] }> {
+		return this.getData(await this.send({ type: "cancel_continuation", ...selector, reason }));
 	}
 
 	/**

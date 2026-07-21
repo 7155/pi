@@ -24,6 +24,8 @@ export type RuntimeMethod =
 	| "session.model.set"
 	| "session.thinking.set"
 	| "session.close"
+	| "room.dispatch"
+	| "room.cancel"
 	| "approval.resolve"
 	| "review.resolve"
 	| "ui.resolve"
@@ -158,6 +160,8 @@ const RUNTIME_METHODS = new Set<RuntimeMethod>([
 	"session.model.set",
 	"session.thinking.set",
 	"session.close",
+	"room.dispatch",
+	"room.cancel",
 	"approval.resolve",
 	"review.resolve",
 	"ui.resolve",

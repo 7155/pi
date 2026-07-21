@@ -465,6 +465,52 @@ describe("Agent", () => {
 		expect(agent.state.messages).not.toContainEqual(message);
 	});
 
+	it("fences stale continuation generations and deduplicates delivery", async () => {
+		let responseCount = 0;
+		const agent = new Agent({
+			streamFn: () => {
+				responseCount++;
+				const stream = new MockAssistantStream();
+				queueMicrotask(() =>
+					stream.push({ type: "done", reason: "stop", message: createAssistantMessage("done") }),
+				);
+				return stream;
+			},
+		});
+		agent.state.messages = [createAssistantMessage("ready")];
+		const stale = agent.followUp(
+			{ role: "user", content: "stale", timestamp: Date.now() },
+			{
+				id: "stale",
+				correlationId: "root",
+				idempotencyKey: "stale",
+				cancelGeneration: 0,
+				notBefore: Date.now() + 20,
+			},
+		);
+		expect(agent.cancelContinuation({ generation: 0 }, "new_generation").cancelledIds).toEqual([stale.id]);
+		const current = agent.followUp(
+			{ role: "user", content: "current", timestamp: Date.now() },
+			{ id: "current", correlationId: "root", idempotencyKey: "once", notBefore: Date.now() + 20 },
+		);
+		const duplicate = agent.followUp(
+			{ role: "user", content: "duplicate", timestamp: Date.now() },
+			{ id: "duplicate", correlationId: "root", idempotencyKey: "once", notBefore: Date.now() + 20 },
+		);
+
+		expect(duplicate.id).toBe(current.id);
+		await new Promise((resolve) => setTimeout(resolve, 50));
+		await agent.waitForIdle();
+
+		expect(responseCount).toBe(1);
+		expect(agent.listContinuations()).toEqual(
+			expect.arrayContaining([
+				expect.objectContaining({ id: "stale", state: "cancelled", terminalReason: "new_generation" }),
+				expect.objectContaining({ id: "current", state: "completed", attempt: 1 }),
+			]),
+		);
+	});
+
 	it("should handle abort controller", () => {
 		const agent = new Agent();
 

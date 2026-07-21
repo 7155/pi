@@ -7,6 +7,7 @@
 
 import type { AgentMessage } from "@earendil-works/pi-agent-core";
 import type { ImageContent, Message, TextContent } from "@earendil-works/pi-ai";
+import { cleanAgentBlockText } from "./context-cleaner.ts";
 
 export const COMPACTION_SUMMARY_PREFIX = `The conversation history before this point was compacted into the following summary:
 
@@ -182,9 +183,14 @@ export function convertToLlm(messages: AgentMessage[]): Message[] {
 						timestamp: m.timestamp,
 					};
 				case "user":
-				case "assistant":
 				case "toolResult":
 					return m;
+				case "assistant": {
+					const content = m.content.map((item) =>
+						item.type === "text" ? { ...item, text: cleanAgentBlockText(item.text).text } : item,
+					);
+					return { ...m, content } as Message;
+				}
 				default:
 					// biome-ignore lint/correctness/noSwitchDeclarations: fine
 					const _exhaustiveCheck: never = m;

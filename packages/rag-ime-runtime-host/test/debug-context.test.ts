@@ -7,6 +7,38 @@ import { PiDebugContextRecorder } from "../src/debug-context.ts";
 type DebugHandler = (event: Record<string, unknown>, context?: Record<string, unknown>) => unknown;
 
 describe("PiDebugContextRecorder", () => {
+	it("distinguishes a reported no-hit usage block from unavailable all-zero usage", () => {
+		let activeTurn = { turnId: "turn-zero" };
+		const recorder = new PiDebugContextRecorder("session-cache-capability", () => activeTurn);
+		const handlers = new Map<string, DebugHandler>();
+		recorder.extension()({
+			on: (name: string, handler: DebugHandler) => handlers.set(name, handler),
+			getActiveTools: () => [],
+			getAllTools: () => [],
+		} as never);
+		const begin = () => {
+			handlers.get("before_agent_start")?.(
+				{ prompt: "test", systemPrompt: "system", systemPromptOptions: { skills: [] } },
+				{},
+			);
+			handlers.get("context")?.({ messages: [{ role: "user", content: "test" }] });
+		};
+
+		begin();
+		handlers.get("message_end")?.({
+			message: { role: "assistant", content: [], usage: { input: 8, output: 2, cacheRead: 0, cacheWrite: 0 } },
+		});
+		expect(recorder.get()?.cacheEvidence.at(-1)?.capability).toBe("reported");
+		expect(recorder.get()?.cacheEvidence.at(-1)?.cacheHitProven).toBe(false);
+
+		activeTurn = { turnId: "turn-absent" };
+		begin();
+		handlers.get("message_end")?.({
+			message: { role: "assistant", content: [], usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 } },
+		});
+		expect(recorder.get()?.cacheEvidence.at(-1)?.capability).toBe("unsupported");
+	});
+
 	it("captures the final local request boundary while omitting credentials and binary bodies", () => {
 		let activeTurn = { turnId: "turn-1", clientMessageId: "client-1" };
 		const recorder = new PiDebugContextRecorder("session-1", () => activeTurn);
@@ -44,7 +76,17 @@ describe("PiDebugContextRecorder", () => {
 		);
 		handlers.get("turn_start")?.({ turnIndex: 0, timestamp: Date.now() });
 		handlers.get("context")?.({
-			messages: [{ role: "user", content: "final context" }],
+			messages: [
+				{ role: "user", content: "final context" },
+				{ role: "assistant", thinking: "hidden chain", content: [{ type: "reasoning", text: "private" }] },
+			],
+		});
+		handlers.get("provider_context_inspection")?.({
+			context: {
+				systemPrompt: "assembled system prompt",
+				messages: [{ role: "user", content: "final context" }],
+				tools: [{ name: "read", description: "Read", parameters: { type: "object" } }],
+			},
 		});
 		handlers.get("before_provider_request")?.({
 			payload: {
@@ -61,7 +103,11 @@ describe("PiDebugContextRecorder", () => {
 			headers: { "x-request-id": "request-1", "set-cookie": "private-cookie" },
 		});
 		handlers.get("message_end")?.({
-			message: { role: "assistant", content: [{ type: "toolCall", id: "tool-1", name: "read" }] },
+			message: {
+				role: "assistant",
+				content: [{ type: "toolCall", id: "tool-1", name: "read" }],
+				usage: { input: 20, output: 4, cacheRead: 10, cacheWrite: 2, totalTokens: 36 },
+			},
 		});
 		handlers.get("tool_execution_start")?.({ toolCallId: "tool-1", toolName: "read", args: { path: "a.ts" } });
 		handlers.get("tool_execution_start")?.({ toolCallId: "tool-2", toolName: "read", args: { path: "b.ts" } });
@@ -112,7 +158,22 @@ describe("PiDebugContextRecorder", () => {
 			systemPrompt: "assembled system prompt",
 			activeTools: ["read"],
 		});
-		expect(captured?.contextWindows[0]?.messages).toEqual([{ role: "user", content: "final context" }]);
+		expect(captured?.contextWindows[0]?.messages).toEqual([
+			{ role: "user", content: "final context" },
+			{ role: "assistant", content: [{ type: "reasoning", omitted: true }] },
+		]);
+		expect(captured?.modelCalls[0]?.providerContext).toMatchObject({
+			systemPrompt: "assembled system prompt",
+			tools: [{ name: "read" }],
+		});
+		expect(captured?.cacheEvidence[0]).toMatchObject({
+			inputTokens: 20,
+			outputTokens: 4,
+			cacheReadTokens: 10,
+			cacheWriteTokens: 2,
+			capability: "reported",
+		});
+		expect(captured?.cacheEvidence[0]?.prefixSha256).toMatch(/^[a-f0-9]{64}$/u);
 		expect(captured?.providerRequests[0]?.payload).toMatchObject({
 			model: "gpt-test",
 			input: "final provider input",
@@ -129,7 +190,7 @@ describe("PiDebugContextRecorder", () => {
 		expect(captured?.modelCalls[1]?.contextDelta).toMatchObject({
 			baseCallIndex: 1,
 			commonPrefixMessages: 1,
-			removedMessageCount: 0,
+			removedMessageCount: 1,
 			addedMessageCount: 2,
 		});
 		expect(captured?.modelCalls[1]?.contextDelta.addedMessages).toEqual([
@@ -146,6 +207,8 @@ describe("PiDebugContextRecorder", () => {
 		expect(JSON.stringify(captured)).not.toContain("nested-secret");
 		expect(JSON.stringify(captured)).not.toContain("x-secret");
 		expect(JSON.stringify(captured)).not.toContain("private-cookie");
+		expect(JSON.stringify(captured)).not.toContain("hidden chain");
+		expect(JSON.stringify(captured)).not.toContain('"text":"private"');
 		expect(recorder.list()).toEqual([
 			expect.objectContaining({
 				turnId: "turn-1",

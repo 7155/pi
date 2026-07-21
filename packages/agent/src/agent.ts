@@ -9,6 +9,7 @@ import {
 	type Transport,
 } from "@earendil-works/pi-ai/compat";
 import { runAgentLoop, runAgentLoopContinue } from "./agent-loop.ts";
+import { type ContinuationCancelReceipt, type ContinuationEnvelope, ContinuationQueue } from "./runtime-primitives.ts";
 import type {
 	AfterToolCallContext,
 	AfterToolCallResult,
@@ -122,39 +123,121 @@ export interface AgentOptions {
 	resolveToolForExecution?: (name: string) => AgentTool<any> | undefined;
 }
 
-class PendingMessageQueue {
-	private messages: AgentMessage[] = [];
-	public mode: QueueMode;
+export interface ContinuationOptions {
+	id?: string;
+	correlationId?: string;
+	parentContinuationId?: string;
+	origin?: string;
+	idempotencyKey?: string;
+	cancelGeneration?: number;
+	notBefore?: number;
+	deadline?: number;
+	priority?: number;
+	maxAttempts?: number;
+}
 
-	constructor(mode: QueueMode) {
+export type AgentContinuation = ContinuationEnvelope<AgentMessage>;
+
+class PendingMessageQueue {
+	private readonly queue = new ContinuationQueue<AgentMessage>();
+	private timer?: ReturnType<typeof setTimeout>;
+	public mode: QueueMode;
+	private readonly kind: "steer" | "follow_up";
+	private readonly getGeneration: () => number;
+	private readonly wake: () => void;
+
+	constructor(mode: QueueMode, kind: "steer" | "follow_up", getGeneration: () => number, wake: () => void) {
 		this.mode = mode;
+		this.kind = kind;
+		this.getGeneration = getGeneration;
+		this.wake = wake;
 	}
 
-	enqueue(message: AgentMessage): void {
-		this.messages.push(message);
+	enqueue(message: AgentMessage, options: ContinuationOptions = {}): AgentContinuation {
+		const now = Date.now();
+		const id = options.id ?? crypto.randomUUID();
+		const envelope: AgentContinuation = {
+			id,
+			correlationId: options.correlationId ?? id,
+			parentContinuationId: options.parentContinuationId,
+			origin: options.origin ?? "agent_api",
+			kind: this.kind,
+			payload: message,
+			idempotencyKey: options.idempotencyKey ?? id,
+			cancelGeneration: options.cancelGeneration ?? this.getGeneration(),
+			createdAt: now,
+			notBefore: options.notBefore,
+			deadline: options.deadline,
+			priority: options.priority ?? 0,
+			attempt: 0,
+			maxAttempts: options.maxAttempts ?? 1,
+			state: "pending",
+		};
+		const result = this.queue.enqueue(envelope);
+		const accepted = result.accepted
+			? envelope
+			: this.queue.snapshot().items.find((item) => item.id === result.existingId);
+		if (!accepted) throw new Error("deduplicated continuation is missing from the queue");
+		this.schedule();
+		return accepted;
 	}
 
 	hasItems(): boolean {
-		return this.messages.length > 0;
+		return this.queue.snapshot().items.some((item) => item.state === "pending");
 	}
 
 	drain(): AgentMessage[] {
-		if (this.mode === "all") {
-			const drained = this.messages.slice();
-			this.messages = [];
-			return drained;
-		}
-
-		const first = this.messages[0];
-		if (!first) {
-			return [];
-		}
-		this.messages = this.messages.slice(1);
-		return [first];
+		const leased = this.queue.drain({
+			now: Date.now(),
+			cancelGeneration: this.getGeneration(),
+			limit: this.mode === "all" ? Number.MAX_SAFE_INTEGER : 1,
+		});
+		for (const item of leased) this.queue.complete(item.id);
+		this.schedule();
+		return leased.map((item) => item.payload);
 	}
 
 	clear(): void {
-		this.messages = [];
+		for (const item of this.queue.snapshot().items) this.queue.cancelById(item.id, "queue_cleared");
+		this.schedule();
+	}
+
+	snapshot(): AgentContinuation[] {
+		return this.queue.snapshot().items;
+	}
+
+	cancelById(id: string, reason: string): ContinuationCancelReceipt {
+		const receipt = this.queue.cancelById(id, reason);
+		this.schedule();
+		return receipt;
+	}
+
+	cancelCorrelation(correlationId: string, reason: string): ContinuationCancelReceipt {
+		const receipt = this.queue.cancelCorrelation(correlationId, reason);
+		this.schedule();
+		return receipt;
+	}
+
+	cancelGeneration(generation: number, reason: string): ContinuationCancelReceipt {
+		const receipt = this.queue.cancelGeneration(generation, reason);
+		this.schedule();
+		return receipt;
+	}
+
+	private schedule(): void {
+		if (this.timer) clearTimeout(this.timer);
+		this.timer = undefined;
+		const now = Date.now();
+		const next = this.queue
+			.snapshot()
+			.items.filter((item) => item.state === "pending" && item.cancelGeneration === this.getGeneration())
+			.sort((left, right) => (left.notBefore ?? now) - (right.notBefore ?? now))[0];
+		if (!next) return;
+		const delay = Math.max(0, (next.notBefore ?? now) - now);
+		this.timer = setTimeout(() => {
+			this.timer = undefined;
+			this.wake();
+		}, delay);
 	}
 }
 
@@ -175,6 +258,7 @@ export class Agent {
 	private readonly listeners = new Set<(event: AgentEvent, signal: AbortSignal) => Promise<void> | void>();
 	private readonly steeringQueue: PendingMessageQueue;
 	private readonly followUpQueue: PendingMessageQueue;
+	private continuationGeneration = 0;
 
 	public convertToLlm: (messages: AgentMessage[]) => Message[] | Promise<Message[]>;
 	public transformContext?: (messages: AgentMessage[], signal?: AbortSignal) => Promise<AgentMessage[]>;
@@ -210,6 +294,8 @@ export class Agent {
 	public toolExecution: ToolExecutionMode;
 	/** Optional execution-only resolver for runtimes that separate capability from schema disclosure. */
 	public resolveToolForExecution?: (name: string) => AgentTool<any> | undefined;
+	/** Runtime hook used to start a due continuation through its owning session lifecycle. */
+	public onContinuationReady?: () => void;
 
 	constructor(options: AgentOptions = {}) {
 		this._state = createMutableAgentState(options.initialState);
@@ -223,8 +309,23 @@ export class Agent {
 		this.afterToolCall = options.afterToolCall;
 		this.prepareNextTurn = options.prepareNextTurn;
 		this.prepareNextTurnWithContext = options.prepareNextTurnWithContext;
-		this.steeringQueue = new PendingMessageQueue(options.steeringMode ?? "one-at-a-time");
-		this.followUpQueue = new PendingMessageQueue(options.followUpMode ?? "one-at-a-time");
+		const wake = () => {
+			if (this.activeRun || !this.hasQueuedMessages()) return;
+			if (this.onContinuationReady) this.onContinuationReady();
+			else void this.continue().catch(() => undefined);
+		};
+		this.steeringQueue = new PendingMessageQueue(
+			options.steeringMode ?? "one-at-a-time",
+			"steer",
+			() => this.continuationGeneration,
+			wake,
+		);
+		this.followUpQueue = new PendingMessageQueue(
+			options.followUpMode ?? "one-at-a-time",
+			"follow_up",
+			() => this.continuationGeneration,
+			wake,
+		);
 		this.sessionId = options.sessionId;
 		this.thinkingBudgets = options.thinkingBudgets;
 		this.transport = options.transport ?? "auto";
@@ -276,13 +377,44 @@ export class Agent {
 	}
 
 	/** Queue a message to be injected after the current assistant turn finishes. */
-	steer(message: AgentMessage): void {
-		this.steeringQueue.enqueue(message);
+	steer(message: AgentMessage, options?: ContinuationOptions): AgentContinuation {
+		return this.steeringQueue.enqueue(message, options);
 	}
 
 	/** Queue a message to run only after the agent would otherwise stop. */
-	followUp(message: AgentMessage): void {
-		this.followUpQueue.enqueue(message);
+	followUp(message: AgentMessage, options?: ContinuationOptions): AgentContinuation {
+		return this.followUpQueue.enqueue(message, options);
+	}
+
+	listContinuations(): AgentContinuation[] {
+		return [...this.steeringQueue.snapshot(), ...this.followUpQueue.snapshot()].sort(
+			(left, right) => left.createdAt - right.createdAt || left.id.localeCompare(right.id),
+		);
+	}
+
+	cancelContinuation(
+		selector: { id?: string; correlationId?: string; generation?: number },
+		reason: string,
+	): ContinuationCancelReceipt {
+		const selected = [selector.id, selector.correlationId, selector.generation].filter(
+			(value) => value !== undefined,
+		);
+		if (selected.length !== 1) throw new Error("exactly one continuation cancellation selector is required");
+		if (selector.generation !== undefined && selector.generation >= this.continuationGeneration) {
+			this.continuationGeneration = selector.generation + 1;
+		}
+		const cancel = (queue: PendingMessageQueue) =>
+			selector.id !== undefined
+				? queue.cancelById(selector.id, reason)
+				: selector.correlationId !== undefined
+					? queue.cancelCorrelation(selector.correlationId, reason)
+					: queue.cancelGeneration(selector.generation!, reason);
+		const cancelledIds = [...cancel(this.steeringQueue).cancelledIds, ...cancel(this.followUpQueue).cancelledIds];
+		return { cancelledIds };
+	}
+
+	cancelActiveContinuationGeneration(reason: string): ContinuationCancelReceipt {
+		return this.cancelContinuation({ generation: this.continuationGeneration }, reason);
 	}
 
 	/** Remove all queued steering messages. */

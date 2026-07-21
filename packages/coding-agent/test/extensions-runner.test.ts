@@ -6,6 +6,7 @@ import { createModelRegistry } from "./model-runtime-test-utils.ts";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
+import type { Context, Model } from "@earendil-works/pi-ai";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { AuthStorage } from "../src/core/auth-storage.ts";
 import { createExtensionRuntime, discoverAndLoadExtensions, loadExtensions } from "../src/core/extensions/loader.ts";
@@ -981,6 +982,36 @@ describe("ExtensionRunner", () => {
 			expect(errors).toHaveLength(1);
 			expect(errors[0].event).toBe("before_provider_headers");
 			expect(errors[0].error).toContain("header handler boom");
+		});
+	});
+
+	describe("provider_context_inspection", () => {
+		it("exposes a cloned normalized context without allowing mutation of the live request", async () => {
+			const extCode = `
+				export default function(pi) {
+					pi.on("provider_context_inspection", (event) => {
+						globalThis.__providerContext = event.context;
+						event.context.messages.length = 0;
+					});
+				}
+			`;
+			fs.writeFileSync(path.join(extensionsDir, "provider-context.ts"), extCode);
+			const result = await discoverAndLoadExtensions([], tempDir, tempDir);
+			const runner = new ExtensionRunner(result.extensions, result.runtime, tempDir, sessionManager, modelRegistry);
+			const model = { provider: "test", id: "model", api: "openai-completions" } as unknown as Model<any>;
+			const context = {
+				systemPrompt: "stable system",
+				messages: [{ role: "user", content: [{ type: "text", text: "hello" }], timestamp: 1 }],
+				tools: [{ name: "read", description: "Read", parameters: { type: "object" } }],
+			} as Context;
+
+			await runner.emitProviderContextInspection(model, context);
+
+			expect(context.messages).toHaveLength(1);
+			expect((globalThis as { __providerContext?: { systemPrompt?: string } }).__providerContext?.systemPrompt).toBe(
+				"stable system",
+			);
+			delete (globalThis as { __providerContext?: unknown }).__providerContext;
 		});
 	});
 

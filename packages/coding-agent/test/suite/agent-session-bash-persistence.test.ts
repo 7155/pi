@@ -132,6 +132,30 @@ describe("AgentSession bash and persistence characterization", () => {
 		expect(harness.session.isBashRunning).toBe(false);
 	});
 
+	it("cancels a standalone bash process through the total run scope", async () => {
+		const harness = await createHarness();
+		harnesses.push(harness);
+		const operations: BashOperations = {
+			exec: async (_command, _cwd, options) =>
+				await new Promise<{ exitCode: number | null }>((_resolve, reject) => {
+					options.signal?.addEventListener("abort", () => reject(new Error("aborted")), { once: true });
+				}),
+		};
+
+		const bashPromise = harness.session.executeBash("sleep", undefined, { operations });
+		await new Promise((resolve) => setTimeout(resolve, 0));
+		await harness.session.abort();
+		const result = await bashPromise;
+
+		expect(result.cancelled).toBe(true);
+		expect(harness.session.getRuntimeLifecycleSnapshot().lastSettledReceipt).toMatchObject({
+			aborted: true,
+			generation: 1,
+			pendingOperations: 0,
+			operationCounts: { bash_process: 1 },
+		});
+	});
+
 	it("persists user, assistant, toolResult, and custom messages in order", async () => {
 		const echoTool: AgentTool = {
 			name: "echo",

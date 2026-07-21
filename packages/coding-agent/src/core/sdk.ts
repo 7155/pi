@@ -304,6 +304,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			const websocketConnectTimeoutMs =
 				options?.websocketConnectTimeoutMs ?? settingsManager.getWebSocketConnectTimeoutMs();
 			const headerRunner = extensionRunnerRef.current;
+			await headerRunner?.emitProviderContextInspection(model, context);
 			return modelRuntime.streamSimple(model, context, {
 				...options,
 				timeoutMs,

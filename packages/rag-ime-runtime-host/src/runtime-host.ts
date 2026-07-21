@@ -19,6 +19,7 @@ import {
 	RuntimeProtocolError,
 	type RuntimeRequest,
 } from "./protocol.ts";
+import type { RoomResourceLimits } from "./room-resource-limits.ts";
 import { BoundedSessionPool } from "./session-pool.ts";
 import {
 	codexPluginSkillCatalogNames,
@@ -32,6 +33,24 @@ const SESSION_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,199}$/;
 const COMPLETION_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,199}$/;
 const THINKING_LEVELS = new Set<ModelThinkingLevel>(["off", "minimal", "low", "medium", "high", "xhigh", "max"]);
 const STATELESS_THINKING_LEVELS = new Set<ModelThinkingLevel>(["off", "low"]);
+
+export const RUNTIME_PRIMITIVE_CAPABILITIES = Object.freeze({
+	continuationEnvelope: "1",
+	cancelScope: "1",
+	sessionContinuationQueue: true,
+	sessionCancelOperationRegistry: true,
+	sessionCancelOperations: Object.freeze({
+		provider: true,
+		tool: true,
+		retrySleep: true,
+		manualCompaction: true,
+		autoCompaction: true,
+		branchSummary: true,
+		bashProcess: true,
+		continuationTimer: true,
+	}),
+	roomTypes: true,
+});
 
 export interface RuntimeHostOptions {
 	agentDir: string;
@@ -114,6 +133,106 @@ function optionalTimeoutMs(params: Record<string, unknown>): number {
 	return value;
 }
 
+function requiredGeneration(params: Record<string, unknown>): number {
+	const value = params.generation;
+	if (typeof value !== "number" || !Number.isSafeInteger(value) || value < 0) {
+		throw new RuntimeProtocolError("INVALID_PARAMS", "generation must be a non-negative safe integer");
+	}
+	return value;
+}
+
+function optionalRoomCapability(params: Record<string, unknown>): Record<string, unknown> | undefined {
+	const value = params.roomCapability;
+	if (value === undefined || value === null) return undefined;
+	if (typeof value !== "object" || Array.isArray(value)) {
+		throw new RuntimeProtocolError("INVALID_PARAMS", "roomCapability must be an object");
+	}
+	const record = value as Record<string, unknown>;
+	for (const key of ["manifestId", "promptCompileReceiptId", "promptPlanHash"] as const) {
+		if (typeof record[key] !== "string" || !record[key]) {
+			throw new RuntimeProtocolError("INVALID_PARAMS", `roomCapability.${key} is required`);
+		}
+	}
+	if (typeof record.manifestHash !== "string" || !/^[a-f0-9]{64}$/u.test(record.manifestHash)) {
+		throw new RuntimeProtocolError("INVALID_PARAMS", "roomCapability.manifestHash must be sha256 hex");
+	}
+	if (
+		typeof record.capabilityEpoch !== "number" ||
+		!Number.isSafeInteger(record.capabilityEpoch) ||
+		record.capabilityEpoch < 0
+	) {
+		throw new RuntimeProtocolError("INVALID_PARAMS", "roomCapability.capabilityEpoch is invalid");
+	}
+	return structuredClone(record);
+}
+
+function optionalRoomProviderContext(params: Record<string, unknown>): Record<string, unknown> | undefined {
+	const value = params.roomProviderContext;
+	if (value === undefined || value === null) return undefined;
+	if (typeof value !== "object" || Array.isArray(value)) {
+		throw new RuntimeProtocolError("INVALID_PARAMS", "roomProviderContext must be an object");
+	}
+	const record = value as Record<string, unknown>;
+	for (const key of ["journalId", "projectionHash"] as const) {
+		if (typeof record[key] !== "string" || !record[key]) {
+			throw new RuntimeProtocolError("INVALID_PARAMS", `roomProviderContext.${key} is required`);
+		}
+	}
+	if (
+		typeof record.throughSequence !== "number" ||
+		!Number.isSafeInteger(record.throughSequence) ||
+		record.throughSequence < 0
+	) {
+		throw new RuntimeProtocolError("INVALID_PARAMS", "roomProviderContext.throughSequence is invalid");
+	}
+	return structuredClone(record);
+}
+
+function optionalRoomSkillPolicy(params: Record<string, unknown>): Record<string, unknown> | undefined {
+	const value = params.roomSkillPolicy;
+	if (value === undefined || value === null) return undefined;
+	if (typeof value !== "object" || Array.isArray(value)) {
+		throw new RuntimeProtocolError("INVALID_PARAMS", "roomSkillPolicy must be an object");
+	}
+	const record = value as Record<string, unknown>;
+	if (record.selection !== "required" || typeof record.skillId !== "string" || !record.skillId) {
+		throw new RuntimeProtocolError("INVALID_PARAMS", "roomSkillPolicy must name one required Skill");
+	}
+	if (typeof record.skillHash !== "string" || !/^[a-f0-9]{64}$/u.test(record.skillHash)) {
+		throw new RuntimeProtocolError("INVALID_PARAMS", "roomSkillPolicy.skillHash must be sha256 hex");
+	}
+	return structuredClone(record);
+}
+
+function optionalRoomResourceLimits(params: Record<string, unknown>): RoomResourceLimits | undefined {
+	const value = params.roomResourceLimits;
+	if (value === undefined || value === null) return undefined;
+	if (typeof value !== "object" || Array.isArray(value)) {
+		throw new RuntimeProtocolError("INVALID_PARAMS", "roomResourceLimits must be an object");
+	}
+	const record = value as Record<string, unknown>;
+	const result = {} as RoomResourceLimits;
+	for (const key of [
+		"deadlineAtMs",
+		"maxInputTokens",
+		"maxOutputTokens",
+		"maxToolCalls",
+		"maxToolCost",
+		"retryRemaining",
+		"repairRemaining",
+	] as const) {
+		const entry = record[key];
+		if (typeof entry !== "number" || !Number.isSafeInteger(entry) || entry < 0) {
+			throw new RuntimeProtocolError("INVALID_PARAMS", `roomResourceLimits.${key} is invalid`);
+		}
+		result[key] = entry;
+	}
+	if (result.deadlineAtMs <= Date.now() || result.maxInputTokens < 1 || result.maxOutputTokens < 1) {
+		throw new RuntimeProtocolError("ROOM_RESOURCE_LIMIT_EXHAUSTED", "Room resource limit is already exhausted");
+	}
+	return result;
+}
+
 function isInside(root: string, candidate: string): boolean {
 	const child = relative(root, candidate);
 	return child === "" || (!child.startsWith(`..${sep}`) && child !== ".." && !pathIsAbsolute(child));
@@ -140,6 +259,7 @@ export class RagImeRuntimeHost {
 	private readonly options: RuntimeHostOptions;
 	private readonly allowedWorkspaceRoots: string[];
 	private readonly completions = new Map<string, AbortController>();
+	private readonly roomReceipts = new Map<string, Record<string, unknown>>();
 
 	private constructor(options: RuntimeHostOptions, modelRuntime: ModelRuntime) {
 		this.options = options;
@@ -239,6 +359,7 @@ export class RagImeRuntimeHost {
 						activeTurnMessaging: true,
 						statelessCompletion: true,
 						transientContext: true,
+						runtimePrimitives: RUNTIME_PRIMITIVE_CAPABILITIES,
 					},
 				};
 			case "health":
@@ -415,10 +536,14 @@ export class RagImeRuntimeHost {
 						modelId,
 						thinkingLevel: thinking as ModelThinkingLevel | undefined,
 						toolManifest: params.toolManifest ?? [],
+						roomCapability: optionalRoomCapability(params),
 						toolGatewayUrl: this.options.toolGatewayUrl,
 						toolGatewayToken: this.options.toolGatewayToken,
 						systemPrompt: optionalString(params, "systemPrompt", 64_000),
-						roomSkillPolicy: params.roomSkillPolicy,
+						sessionContext: optionalString(params, "sessionContext", 256_000),
+						roomProviderContext: optionalRoomProviderContext(params),
+						roomSkillPolicy: optionalRoomSkillPolicy(params),
+						roomResourceLimits: optionalRoomResourceLimits(params),
 						noContextFiles: optionalBoolean(params, "noContextFiles"),
 						emitEvent: this.options.emitEvent,
 					}),
@@ -426,7 +551,7 @@ export class RagImeRuntimeHost {
 				return {
 					snapshot: opened.session.snapshot(),
 					evictedSessionId: opened.evictedSessionId,
-					roomSkillLoad: opened.session.roomSkillLoad,
+					roomSkillLoad: opened.session.roomSkillLoadReceipt(),
 				};
 			}
 			case "session.snapshot":
@@ -470,6 +595,7 @@ export class RagImeRuntimeHost {
 							modelId: profile.modelId,
 							thinkingLevel: profile.thinkingLevel,
 							toolManifest: profile.toolManifest,
+							roomCapability: profile.roomCapability,
 							toolGatewayUrl: this.options.toolGatewayUrl,
 							toolGatewayToken: this.options.toolGatewayToken,
 							systemPrompt: profile.systemPrompt,
@@ -541,6 +667,70 @@ export class RagImeRuntimeHost {
 			}
 			case "session.close":
 				return { closed: await this.sessions.close(requiredSessionId(params)) };
+			case "room.dispatch": {
+				const sessionId = requiredSessionId(params);
+				const dispatchId = requiredString(params, "dispatchId", 240);
+				const rootId = requiredString(params, "rootId", 240);
+				const generation = requiredGeneration(params);
+				const idempotencyKey = requiredString(params, "idempotencyKey", 512);
+				const receiptKey = `${rootId}\u001f${idempotencyKey}`;
+				const existing = this.roomReceipts.get(receiptKey);
+				if (existing) return { ...existing, duplicate: true };
+				const accepted = await this.session(params).dispatchRoom({
+					message: requiredString(params, "message", 1_000_000),
+					dispatchId,
+					rootId,
+					generation,
+				});
+				const receipt = {
+					schemaVersion: "wisdom-weasel.room-runtime-receipt.v1",
+					receiptKind: "dispatch_accepted",
+					status: "accepted",
+					rootId,
+					dispatchId,
+					generation,
+					sessionId,
+					...accepted,
+				};
+				this.roomReceipts.set(receiptKey, receipt);
+				return receipt;
+			}
+			case "room.cancel": {
+				const sessionId = requiredSessionId(params);
+				const rootId = requiredString(params, "rootId", 240);
+				const generation = requiredGeneration(params);
+				const target = this.session(params);
+				const cancelled = target.cancelRoom(rootId, generation);
+				if (cancelled.abortRequired) await target.abort();
+				const termination = (surface: string, targetIds: string[] = []) => ({
+					schemaVersion: "wisdom-weasel.runtime-surface-termination-receipt.v1",
+					surface,
+					state: "terminated",
+					targetIds,
+				});
+				return {
+					schemaVersion: "wisdom-weasel.room-runtime-receipt.v1",
+					receiptKind: "cancel_applied",
+					status: "applied",
+					rootId,
+					generation,
+					sessionId,
+					cancelledContinuationIds: cancelled.cancelledIds,
+					activeRunAborted: cancelled.abortRequired,
+					pendingTargets: [],
+					cancellationSurfaces: {
+						provider: termination("provider"),
+						tool: termination("tool"),
+						exec: termination("exec"),
+						retry: termination("retry"),
+						compaction: termination("compaction"),
+						branch_summary: termination("branch_summary"),
+						timer: termination("timer"),
+						continuation: termination("continuation", cancelled.cancelledIds),
+						session: termination("session", [sessionId]),
+					},
+				};
+			}
 			case "approval.resolve":
 				return {
 					requestId: this.session(params).resolveDecision(

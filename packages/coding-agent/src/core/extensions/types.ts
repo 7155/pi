@@ -670,6 +670,13 @@ export interface BeforeProviderRequestEvent {
 	payload: unknown;
 }
 
+/** Read-only normalized Provider context after message conversion and before provider serialization. */
+export interface ProviderContextInspectionEvent {
+	type: "provider_context_inspection";
+	model: Model<any>;
+	context: Context;
+}
+
 /**
  * Fired after request headers are assembled, before the provider HTTP call.
  * Handlers mutate `headers` in place (e.g. to inject tracing/session headers);
@@ -1027,6 +1034,7 @@ export type ExtensionEvent =
 	| SessionEvent
 	| ContextEvent
 	| BeforeProviderRequestEvent
+	| ProviderContextInspectionEvent
 	| BeforeProviderHeadersEvent
 	| AfterProviderResponseEvent
 	| BeforeAgentStartEvent
@@ -1195,6 +1203,7 @@ export interface ExtensionAPI {
 		event: "before_provider_request",
 		handler: ExtensionHandler<BeforeProviderRequestEvent, BeforeProviderRequestEventResult>,
 	): void;
+	on(event: "provider_context_inspection", handler: ExtensionHandler<ProviderContextInspectionEvent>): void;
 	on(event: "before_provider_headers", handler: ExtensionHandler<BeforeProviderHeadersEvent>): void;
 	on(event: "after_provider_response", handler: ExtensionHandler<AfterProviderResponseEvent>): void;
 	on(event: "before_agent_start", handler: ExtensionHandler<BeforeAgentStartEvent, BeforeAgentStartEventResult>): void;

@@ -262,6 +262,38 @@ describe("AgentSession compaction characterization", () => {
 		await expect(compactPromise).rejects.toThrow("Compaction cancelled");
 	});
 
+	it("cancels manual compaction through the total run scope", async () => {
+		const harness = await createHarness({
+			settings: { compaction: { keepRecentTokens: 1 } },
+			extensionFactories: [
+				(pi) => {
+					pi.on(
+						"session_before_compact",
+						async (event) =>
+							await new Promise<{ cancel: true }>((resolve) => {
+								event.signal.addEventListener("abort", () => resolve({ cancel: true }), { once: true });
+							}),
+					);
+				},
+			],
+		});
+		harnesses.push(harness);
+		await harness.session.prompt("one");
+		await harness.session.prompt("two");
+
+		const compactPromise = harness.session.compact();
+		await new Promise((resolve) => setTimeout(resolve, 0));
+		await harness.session.abort();
+
+		await expect(compactPromise).rejects.toThrow("Compaction cancelled");
+		expect(harness.session.getRuntimeLifecycleSnapshot().lastSettledReceipt).toMatchObject({
+			aborted: true,
+			generation: 1,
+			pendingOperations: 0,
+			operationCounts: { manual_compaction: 1 },
+		});
+	});
+
 	it("resumes after threshold compaction when only agent-level queued messages exist", async () => {
 		vi.useFakeTimers();
 		const harness = await createHarness({

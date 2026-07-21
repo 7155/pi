@@ -5,9 +5,14 @@
  * Responses and events are emitted as JSON lines on stdout.
  */
 
-import type { AgentMessage, ThinkingLevel } from "@earendil-works/pi-agent-core";
+import type {
+	AgentContinuation,
+	AgentMessage,
+	ContinuationOptions,
+	ThinkingLevel,
+} from "@earendil-works/pi-agent-core";
 import type { ImageContent, Model } from "@earendil-works/pi-ai";
-import type { SessionStats } from "../../core/agent-session.ts";
+import type { AgentSettledReceipt, SessionStats } from "../../core/agent-session.ts";
 import type { BashResult } from "../../core/bash-executor.ts";
 import type { CompactionResult } from "../../core/compaction/index.ts";
 import type { SessionEntry, SessionTreeNode } from "../../core/session-manager.ts";
@@ -20,13 +25,22 @@ import type { SourceInfo } from "../../core/source-info.ts";
 export type RpcCommand =
 	// Prompting
 	| { id?: string; type: "prompt"; message: string; images?: ImageContent[]; streamingBehavior?: "steer" | "followUp" }
-	| { id?: string; type: "steer"; message: string; images?: ImageContent[] }
-	| { id?: string; type: "follow_up"; message: string; images?: ImageContent[] }
+	| { id?: string; type: "steer"; message: string; images?: ImageContent[]; continuation?: ContinuationOptions }
+	| { id?: string; type: "follow_up"; message: string; images?: ImageContent[]; continuation?: ContinuationOptions }
 	| { id?: string; type: "abort" }
 	| { id?: string; type: "new_session"; parentSession?: string }
 
 	// State
 	| { id?: string; type: "get_state" }
+	| { id?: string; type: "list_continuations" }
+	| {
+			id?: string;
+			type: "cancel_continuation";
+			continuationId?: string;
+			correlationId?: string;
+			generation?: number;
+			reason?: string;
+	  }
 
 	// Model
 	| { id?: string; type: "set_model"; provider: string; modelId: string }
@@ -104,6 +118,15 @@ export interface RpcSessionState {
 	autoCompactionEnabled: boolean;
 	messageCount: number;
 	pendingMessageCount: number;
+	runtimeLifecycle: {
+		activeScope: {
+			scopeId: string;
+			generation: number;
+			cancelled: boolean;
+			operations: Array<{ operationId: string; kind: string; registeredAt: number }>;
+		} | null;
+		lastSettledReceipt: AgentSettledReceipt | null;
+	};
 }
 
 // ============================================================================
@@ -114,13 +137,21 @@ export interface RpcSessionState {
 export type RpcResponse =
 	// Prompting (async - events follow)
 	| { id?: string; type: "response"; command: "prompt"; success: true }
-	| { id?: string; type: "response"; command: "steer"; success: true }
-	| { id?: string; type: "response"; command: "follow_up"; success: true }
+	| { id?: string; type: "response"; command: "steer"; success: true; data: AgentContinuation }
+	| { id?: string; type: "response"; command: "follow_up"; success: true; data: AgentContinuation }
 	| { id?: string; type: "response"; command: "abort"; success: true }
 	| { id?: string; type: "response"; command: "new_session"; success: true; data: { cancelled: boolean } }
 
 	// State
 	| { id?: string; type: "response"; command: "get_state"; success: true; data: RpcSessionState }
+	| { id?: string; type: "response"; command: "list_continuations"; success: true; data: AgentContinuation[] }
+	| {
+			id?: string;
+			type: "response";
+			command: "cancel_continuation";
+			success: true;
+			data: { cancelledIds: string[] };
+	  }
 
 	// Model
 	| {

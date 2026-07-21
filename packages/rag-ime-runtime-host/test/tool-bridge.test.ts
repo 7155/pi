@@ -199,4 +199,39 @@ describe("BackendToolRegistry", () => {
 			vi.unstubAllGlobals();
 		}
 	});
+
+	it("binds a governed Room invocation to the loaded manifest receipt", async () => {
+		const registry = new BackendToolRegistry();
+		registry.sync([tool({ name: "room_post" })]);
+		registry.recordLoadReceipt("room_post", "load:room-post");
+		const fetchMock = vi.fn<typeof fetch>().mockResolvedValue(
+			new Response(JSON.stringify({ ok: true, result: { accepted: true } }), {
+				status: 200,
+				headers: { "Content-Type": "application/json" },
+			}),
+		);
+		vi.stubGlobal("fetch", fetchMock);
+		try {
+			const definition = createBackendToolDefinition(
+				{
+					sessionId: "session-room",
+					registry,
+					gatewayUrl: "http://127.0.0.1:8766/api/agent/tool/execute",
+					roomCapability: { manifestId: "manifest:1", manifestHash: "a".repeat(64) },
+				},
+				tool({ name: "room_post" }),
+			);
+			await definition.execute("call-room", { query: "done" } as never, undefined, undefined, {} as never);
+			const request = JSON.parse(String(fetchMock.mock.calls[0]?.[1]?.body)) as Record<string, unknown>;
+			expect(request).toMatchObject({
+				sessionId: "session-room",
+				tool: "room_post",
+				toolCallId: "call-room",
+				loadReceiptId: "load:room-post",
+				roomCapability: { manifestId: "manifest:1", manifestHash: "a".repeat(64) },
+			});
+		} finally {
+			vi.unstubAllGlobals();
+		}
+	});
 });
