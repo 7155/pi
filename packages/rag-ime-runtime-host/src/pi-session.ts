@@ -66,6 +66,7 @@ export interface PiSessionOpenOptions {
 	toolGatewayToken?: string;
 	systemPrompt?: string;
 	sessionContext?: string;
+	roomContext?: string;
 	roomProviderContext?: Record<string, unknown>;
 	roomSkillPolicy?: unknown;
 	roomResourceLimits?: RoomResourceLimits;
@@ -376,6 +377,7 @@ export class PiProductSession implements PooledSession {
 	private activeTurn: ActiveTurn | undefined;
 	private activeRoom: ActiveRoomDispatch | undefined;
 	private roomUsageBaseline: { input: number; output: number } | undefined;
+	private roomContext = "";
 	private sessionContext = "";
 	private sessionContextRefreshRevision = 0;
 	private transientContext = "";
@@ -502,6 +504,7 @@ export class PiProductSession implements PooledSession {
 							productSession.sessionContextRefreshRevision += 1;
 						}
 					},
+					getRoomContext: () => productSession?.roomContext ?? "",
 					getRecentMessages: () => productSession?.recentMessagesForContext() ?? [],
 					getRoomSkillRecovery: () => productSession?.roomSkillLoadReceipt(),
 					providerContextJournal,
@@ -520,6 +523,7 @@ export class PiProductSession implements PooledSession {
 				}),
 				lifecycleHooks.extension,
 				createProviderContextJournalExtension(providerContextJournal, () => ({
+					roomContext: productSession?.roomContext ?? "",
 					sessionContext: productSession?.sessionContext ?? "",
 					transientContext: productSession?.transientContext ?? "",
 				})),
@@ -597,6 +601,7 @@ export class PiProductSession implements PooledSession {
 			roomSkillLoad,
 		);
 		productSession.sessionContext = options.sessionContext?.trim() ?? "";
+		productSession.roomContext = options.roomContext?.trim() ?? "";
 		productSession.roomProviderContext = options.roomProviderContext
 			? structuredClone(options.roomProviderContext)
 			: undefined;
@@ -1318,12 +1323,20 @@ export class PiProductSession implements PooledSession {
 		rootId: string;
 		generation: number;
 		capabilityEpoch: number;
+		sessionContext?: string;
+		roomContext?: string;
 	}): Promise<Record<string, unknown>> {
 		this.assertRoomDispatchResources();
 		if (this.activeRoom && this.activeRoom.dispatchId !== options.dispatchId) {
 			throw new RuntimeProtocolError("ROOM_SESSION_BUSY", "Room Session already owns another active Dispatch");
 		}
 		this.beginRoomDispatch(options);
+		if (options.sessionContext !== undefined) {
+			this.sessionContext = options.sessionContext.trim();
+		}
+		if (options.roomContext !== undefined) {
+			this.roomContext = options.roomContext.trim();
+		}
 		if (!this.activeTurn || this.session.isIdle) {
 			try {
 				const turn = await this.prompt({ message: options.message });

@@ -3,9 +3,9 @@ import type { ExtensionFactory } from "@earendil-works/pi-coding-agent";
 import { formatLocalTimestamp, type RuntimeContextSnapshot } from "./transient-context.ts";
 
 const MANAGED_CONTEXT_BLOCK_PATTERN =
-	/\n*<rag-ime-context\s+type="(?:session_memory|turn_context)"(?=[\s>])[^>]*>[\s\S]*?<\/rag-ime-context>/g;
+	/\n*<rag-ime-context\s+type="(?:room_context|session_memory|turn_context)"(?=[\s>])[^>]*>[\s\S]*?<\/rag-ime-context>/g;
 
-type ProviderContextKind = "session_memory" | "turn_context";
+type ProviderContextKind = "room_context" | "session_memory" | "turn_context";
 
 interface ProviderContextEntry {
 	kind: ProviderContextKind;
@@ -30,6 +30,7 @@ export class ProviderContextJournal {
 	private contentHashes = new Set<string>();
 
 	project(systemPrompt: string, context: RuntimeContextSnapshot, now: Date = new Date()): string {
+		this.append("room_context", context.roomContext ?? "", now);
 		this.append("session_memory", context.sessionContext, now);
 		this.append("turn_context", context.transientContext, now);
 		return this.render(systemPrompt);

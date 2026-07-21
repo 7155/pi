@@ -11,6 +11,7 @@ export interface DecodedRuntimePrompt {
 }
 
 export interface RuntimeContextSnapshot {
+	roomContext?: string;
 	sessionContext: string;
 	transientContext: string;
 }

@@ -6,6 +6,7 @@ interface SessionContextRefreshOptions {
 	bridge: BackendToolBridgeOptions;
 	getSessionContext(): string;
 	setSessionContext(value: string): void;
+	getRoomContext(): string;
 	getRecentMessages(): Array<{ role: "user" | "assistant"; text: string }>;
 	getRoomSkillRecovery(): Record<string, unknown> | undefined;
 	providerContextJournal: ProviderContextJournal;
@@ -56,6 +57,7 @@ export function createSessionContextRefreshExtension(options: SessionContextRefr
 			return {
 				systemPrompt: options.providerContextJournal.beginEpoch("compaction", ctx.getSystemPrompt(), {
 					sessionContext: context ?? options.getSessionContext(),
+					roomContext: options.getRoomContext(),
 					transientContext: "",
 				}),
 			};

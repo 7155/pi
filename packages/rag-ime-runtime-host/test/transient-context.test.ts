@@ -39,22 +39,23 @@ describe("provider context journal", () => {
 		const journal = new ProviderContextJournal();
 		const first = journal.project(
 			"基础角色提示词",
-			{ sessionContext: "第一轮相关记忆", transientContext: "" },
+			{ roomContext: "Room 冻结任务", sessionContext: "第一轮相关记忆", transientContext: "" },
 			new Date("2026-07-18T15:30:45.000Z"),
 		);
 		const second = journal.project(
 			first,
-			{ sessionContext: "第二轮相关记忆", transientContext: "本轮工具证据" },
+			{ roomContext: "Room 冻结任务", sessionContext: "第二轮相关记忆", transientContext: "本轮工具证据" },
 			new Date("2026-07-18T15:31:46.000Z"),
 		);
 
 		expect(second.startsWith(first)).toBe(true);
 		expect(second).toContain("第一轮相关记忆");
 		expect(second).toContain("第二轮相关记忆");
+		expect(second.match(/Room 冻结任务/g)).toHaveLength(1);
 		expect(second).toContain("本轮工具证据");
 		expect(second).not.toContain("contentHash");
 		expect(second).not.toContain("相关度");
-		expect(journal.snapshot().entryCount).toBe(3);
+		expect(journal.snapshot().entryCount).toBe(4);
 	});
 
 	it("deduplicates identical memory and does not rewrite its timestamp", () => {
@@ -80,23 +81,24 @@ describe("provider context journal", () => {
 		const journal = new ProviderContextJournal();
 		const before = journal.project(
 			"基础角色提示词",
-			{ sessionContext: "压缩前记忆", transientContext: "旧工具证据" },
+			{ roomContext: "Room 冻结任务", sessionContext: "压缩前记忆", transientContext: "旧工具证据" },
 			new Date("2026-07-18T15:30:45.000Z"),
 		);
 		const after = journal.beginEpoch(
 			"compaction",
 			before,
-			{ sessionContext: "压缩后任务记忆", transientContext: "" },
+			{ roomContext: "Room 冻结任务", sessionContext: "压缩后任务记忆", transientContext: "" },
 			new Date("2026-07-18T15:31:46.000Z"),
 		);
 
 		expect(after).not.toContain("压缩前记忆");
 		expect(after).not.toContain("旧工具证据");
 		expect(after).toContain("压缩后任务记忆");
+		expect(after).toContain("Room 冻结任务");
 		expect(journal.snapshot()).toMatchObject({
 			epoch: 2,
 			epochReason: "compaction",
-			entryCount: 1,
+			entryCount: 2,
 		});
 	});
 });

@@ -545,6 +545,7 @@ export class RagImeRuntimeHost {
 						toolGatewayToken: this.options.toolGatewayToken,
 						systemPrompt: optionalString(params, "systemPrompt", 64_000),
 						sessionContext: optionalString(params, "sessionContext", 256_000),
+						roomContext: optionalString(params, "roomContext", 256_000),
 						roomProviderContext: optionalRoomProviderContext(params),
 						roomSkillPolicy: optionalRoomSkillPolicy(params),
 						roomResourceLimits: optionalRoomResourceLimits(params),
@@ -687,6 +688,8 @@ export class RagImeRuntimeHost {
 					rootId,
 					generation,
 					capabilityEpoch,
+					sessionContext: optionalString(params, "sessionContext", 256_000),
+					roomContext: optionalString(params, "roomContext", 256_000),
 				});
 				const receipt = {
 					schemaVersion: "wisdom-weasel.room-runtime-receipt.v1",

@@ -42,7 +42,8 @@ describe("Room runtime RPC", () => {
 					sessionId: "session:governed",
 					cwd: root,
 					systemPrompt: "stable-layers-1-through-5",
-					sessionContext: "dynamic-room-tail",
+					sessionContext: "generic-agent-rag",
+					roomContext: "dynamic-room-tail",
 					roomProviderContext: {
 						journalId: "journal:1",
 						throughSequence: 1,
@@ -117,6 +118,8 @@ describe("Room runtime RPC", () => {
 				capabilityEpoch: 7,
 				idempotencyKey: "root:1/task:1/participant:b",
 				message: "Execute the bounded Room task.",
+				sessionContext: "generic-agent-rag",
+				roomContext: "governed-room-task",
 			};
 			const receipt = await host.handle(request("dispatch", "room.dispatch", params));
 			const duplicate = await host.handle(request("dispatch-again", "room.dispatch", params));
@@ -132,6 +135,12 @@ describe("Room runtime RPC", () => {
 			});
 			expect(duplicate).toMatchObject({ duplicate: true, dispatchId: "dispatch:1" });
 			expect(target.dispatchRoom).toHaveBeenCalledTimes(1);
+			expect(target.dispatchRoom).toHaveBeenCalledWith(
+				expect.objectContaining({
+					sessionContext: "generic-agent-rag",
+					roomContext: "governed-room-task",
+				}),
+			);
 
 			const cancelled = await host.handle(
 				request("cancel", "room.cancel", {

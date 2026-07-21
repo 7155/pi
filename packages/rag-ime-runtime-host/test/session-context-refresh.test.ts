@@ -33,6 +33,7 @@ describe("session context refresh", () => {
 			setSessionContext: (value) => {
 				sessionContext = value;
 			},
+			getRoomContext: () => "## Room 当前任务",
 			getRecentMessages: () => [
 				{ role: "user", text: "完成检索测试" },
 				{ role: "assistant", text: "已经完成初步实现" },
@@ -66,7 +67,9 @@ describe("session context refresh", () => {
 		)) as { systemPrompt?: string } | undefined;
 		expect(sessionContext).toBe("## 压缩后任务记忆");
 		expect(compactResult?.systemPrompt).toContain("## 压缩后任务记忆");
+		expect(compactResult?.systemPrompt).toContain("## Room 当前任务");
 		expect(compactResult?.systemPrompt).not.toContain("## 子任务记忆");
+		expect(compactResult?.systemPrompt?.match(/type="room_context"/g)).toHaveLength(1);
 		expect(compactResult?.systemPrompt?.match(/type="session_memory"/g)).toHaveLength(1);
 		expect(fetchMock).toHaveBeenCalledTimes(2);
 		expect(fetchMock.mock.calls[0]?.[0]).toBe("http://127.0.0.1:8766/api/agent/tool/context-refresh");
@@ -95,6 +98,7 @@ describe("session context refresh", () => {
 			},
 			getSessionContext: () => "existing context",
 			setSessionContext: () => undefined,
+			getRoomContext: () => "room context",
 			getRecentMessages: () => [],
 			getRoomSkillRecovery: () => ({ name: "implementation" }),
 			providerContextJournal: new ProviderContextJournal(),
