@@ -20,7 +20,7 @@ import { type BackendToolManifest, type BackendToolRegistry, backendToolSchemaRe
 const DEFAULT_RESULT_LIMIT = 8;
 const MAX_RESULT_LIMIT = 20;
 const MAX_SKILL_BYTES = 128 * 1024;
-const MAX_TOOL_ROUTE_CHARS = 200;
+const MAX_TOOL_ROUTE_CHARS = 512;
 const TOOL_CATALOG_MARKER = '<available_product_tools format="route-jsonl"';
 
 const SKILL_SEARCH_PARAMETERS = {
@@ -28,7 +28,7 @@ const SKILL_SEARCH_PARAMETERS = {
 	properties: {
 		query: {
 			type: "string",
-			description: "Optional name, when, does, or notFor keywords. Leave empty to list the catalog.",
+			description: "Optional name, when, notFor, input, output, or does keywords. Leave empty to list the catalog.",
 		},
 		limit: {
 			type: "integer",
@@ -58,7 +58,7 @@ const TOOL_SEARCH_PARAMETERS = {
 	properties: {
 		query: {
 			type: "string",
-			description: "Optional tool name, description, profile, or risk keywords.",
+			description: "Optional tool name, when, notFor, input, output, or does keywords.",
 		},
 		limit: {
 			type: "integer",
@@ -99,6 +99,10 @@ export interface DiscoveryToolsOptions {
 
 export interface BackendToolRouteEntry {
 	name: string;
+	when: string[];
+	notFor: string[];
+	input: string;
+	output: string;
 	does: string;
 }
 
@@ -138,15 +142,36 @@ function sha256(value: string): string {
 	return createHash("sha256").update(value).digest("hex");
 }
 
+function compactText(value: string, maxCharacters: number): string {
+	const normalized = value.replace(/\s+/gu, " ").trim();
+	if (Array.from(normalized).length <= maxCharacters) return normalized;
+	return `${Array.from(normalized)
+		.slice(0, Math.max(1, maxCharacters - 3))
+		.join("")}...`;
+}
+
 export function backendToolRouteEntry(tool: BackendToolManifest): BackendToolRouteEntry {
-	const normalized = tool.description.replace(/\s+/gu, " ").trim();
-	let does = normalized;
-	let entry = { name: tool.name, does };
-	while (Array.from(JSON.stringify(entry)).length > MAX_TOOL_ROUTE_CHARS && does.length > 4) {
-		does = `${Array.from(does).slice(0, -8).join("")}...`;
-		entry = { name: tool.name, does };
+	const purpose = tool.description.replace(/\s+/gu, " ").trim();
+	const source = {
+		name: tool.name,
+		when: tool.when ?? [purpose],
+		notFor: tool.notFor ?? ["The task does not match this tool's stated use case."],
+		input: tool.input ?? "Arguments required by the selected tool.",
+		output: tool.output ?? "The selected tool's execution result.",
+		does: tool.does ?? purpose,
+	};
+	for (let maxCharacters = 160; maxCharacters >= 24; maxCharacters -= 8) {
+		const entry: BackendToolRouteEntry = {
+			name: source.name,
+			when: source.when.map((item) => compactText(item, maxCharacters)),
+			notFor: source.notFor.map((item) => compactText(item, maxCharacters)),
+			input: compactText(source.input, maxCharacters),
+			output: compactText(source.output, maxCharacters),
+			does: compactText(source.does, maxCharacters),
+		};
+		if (Array.from(JSON.stringify(entry)).length <= MAX_TOOL_ROUTE_CHARS) return entry;
 	}
-	return entry;
+	throw new Error(`Tool routing card exceeds ${MAX_TOOL_ROUTE_CHARS} characters: ${tool.name}`);
 }
 
 export function formatBackendToolRouteCatalog(tools: BackendToolManifest[], revision: string): string {
@@ -156,7 +181,7 @@ export function formatBackendToolRouteCatalog(tools: BackendToolManifest[], revi
 		"",
 		"",
 		`${TOOL_CATALOG_MARKER} revision="sha256:${revision}">`,
-		"Each JSON line exposes only a tool name and short purpose. Use tool_search for its full description and risk, then tool_load before calling it so the Provider receives its parameter schema.",
+		"Each JSON line contains only name, when[], notFor[], input, output, and does. Use tool_load before calling a tool so the Provider receives only that tool's parameter schema.",
 		...entries.map((entry) => JSON.stringify(entry)),
 		"</available_product_tools>",
 	].join("\n");
@@ -195,8 +220,7 @@ export function searchSkills(skills: Skill[], args: { query?: unknown; limit?: u
 	const items = visibleSkills(skills)
 		.map((skill) => {
 			const entry = skillCatalogEntry(skill);
-			const routingText =
-				"description" in entry ? entry.description : [...entry.when, entry.does, ...(entry.notFor ?? [])].join(" ");
+			const routingText = [...entry.when, ...entry.notFor, entry.input, entry.output, entry.does].join(" ");
 			return {
 				entry,
 				score: searchScore(query, skill.name, routingText),
@@ -259,16 +283,18 @@ export function searchBackendTools(
 	const items = tools
 		.map((tool) => ({
 			tool,
-			score: searchScore(query, tool.name, tool.description, `${tool.profile ?? ""} ${tool.risk ?? ""}`),
+			score: searchScore(
+				query,
+				tool.name,
+				tool.description,
+				Object.values(backendToolRouteEntry(tool)).flat().join(" "),
+			),
 		}))
 		.filter((item) => !query || item.score > 0)
 		.sort((left, right) => right.score - left.score || left.tool.name.localeCompare(right.tool.name))
 		.slice(0, limit)
 		.map(({ tool }) => ({
-			name: tool.name,
-			description: tool.description,
-			profile: tool.profile,
-			risk: tool.risk,
+			...backendToolRouteEntry(tool),
 		}));
 	return {
 		schemaVersion: "rag-ime.tool-search.v1",
@@ -318,7 +344,7 @@ export function createDiscoveryToolsExtension(options: DiscoveryToolsOptions): I
 			pi.registerTool({
 				name: SKILL_SEARCH_TOOL_NAME,
 				label: "Search skills",
-				description: "Search the managed Skill Catalog by name, trigger, purpose, or exclusion.",
+				description: "Search the managed Skill Catalog by its six compact routing fields.",
 				promptSnippet: "Search the stable managed Skill Catalog by routing-card fields",
 				parameters: SKILL_SEARCH_PARAMETERS,
 				execute: async (_toolCallId, args) => {
@@ -353,7 +379,8 @@ export function createDiscoveryToolsExtension(options: DiscoveryToolsOptions): I
 				pi.registerTool({
 					name: TOOL_SEARCH_TOOL_NAME,
 					label: "Search tools",
-					description: "Search the product tool catalog by name or description without loading parameter schemas.",
+					description:
+						"Search the product tool catalog by its six compact routing fields without loading schemas.",
 					promptSnippet: "Search the product tool catalog, then use tool_load before calling a result",
 					parameters: TOOL_SEARCH_PARAMETERS,
 					execute: async (_toolCallId, args) => {
@@ -390,12 +417,7 @@ export function createDiscoveryToolsExtension(options: DiscoveryToolsOptions): I
 							schemaVersion: "rag-ime.tool-load.v1",
 							catalogRevision: options.registry.revision(),
 							schemaRevision: backendToolSchemaRevision([loaded.tool]),
-							tool: {
-								name: loaded.tool.name,
-								description: loaded.tool.description,
-								profile: loaded.tool.profile,
-								risk: loaded.tool.risk,
-							},
+							tool: backendToolRouteEntry(loaded.tool),
 							disclosed: true,
 							alreadyDisclosed,
 							nextCall,

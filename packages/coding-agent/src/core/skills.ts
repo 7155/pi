@@ -14,8 +14,8 @@ const MAX_NAME_LENGTH = 64;
 /** Max description length per spec */
 const MAX_DESCRIPTION_LENGTH = 1024;
 
-/** Max compact routing-card length kept in the always-visible catalog. */
-const MAX_ROUTING_CARD_LENGTH = 200;
+/** Max source routing metadata before the normalized six-field catalog is built. */
+const MAX_ROUTING_CARD_LENGTH = 512;
 
 const IGNORE_FILE_NAMES = [".gitignore", ".ignore", ".fdignore"];
 
@@ -74,6 +74,8 @@ export interface SkillFrontmatter {
 	when?: unknown;
 	does?: unknown;
 	notFor?: unknown;
+	input?: unknown;
+	output?: unknown;
 	"disable-model-invocation"?: boolean;
 	[key: string]: unknown;
 }
@@ -82,14 +84,18 @@ export interface SkillRoutingCard {
 	when: string[];
 	does: string;
 	notFor?: string[];
+	input?: string;
+	output?: string;
 }
 
-export type SkillCatalogEntry =
-	| ({ name: string } & SkillRoutingCard)
-	| {
-			name: string;
-			description: string;
-	  };
+export interface SkillCatalogEntry {
+	name: string;
+	when: string[];
+	notFor: string[];
+	input: string;
+	output: string;
+	does: string;
+}
 
 export interface Skill {
 	name: string;
@@ -168,7 +174,11 @@ function parseRoutingCard(
 	frontmatter: SkillFrontmatter,
 ): { routing?: SkillRoutingCard; errors: string[] } {
 	const hasRouting =
-		frontmatter.when !== undefined || frontmatter.does !== undefined || frontmatter.notFor !== undefined;
+		frontmatter.when !== undefined ||
+		frontmatter.does !== undefined ||
+		frontmatter.notFor !== undefined ||
+		frontmatter.input !== undefined ||
+		frontmatter.output !== undefined;
 	if (!hasRouting) return { errors: [] };
 
 	const errors: string[] = [];
@@ -178,12 +188,18 @@ function parseRoutingCard(
 	if (!does) errors.push("does must be a non-empty string");
 	const notFor = routingList(frontmatter.notFor, "notFor", false);
 	if (notFor.error) errors.push(notFor.error);
+	const input = typeof frontmatter.input === "string" ? frontmatter.input.trim() : "";
+	const output = typeof frontmatter.output === "string" ? frontmatter.output.trim() : "";
+	if (frontmatter.input !== undefined && !input) errors.push("input must be a non-empty string");
+	if (frontmatter.output !== undefined && !output) errors.push("output must be a non-empty string");
 	if (errors.length > 0 || !when.items) return { errors };
 
 	const routing: SkillRoutingCard = {
 		when: when.items,
 		does,
 		...(notFor.items ? { notFor: notFor.items } : {}),
+		...(input ? { input } : {}),
+		...(output ? { output } : {}),
 	};
 	const length = Array.from(JSON.stringify({ name, ...routing })).length;
 	if (length > MAX_ROUTING_CARD_LENGTH) {
@@ -420,8 +436,15 @@ function visibleSkillsInStableOrder(skills: Skill[]): Skill[] {
 }
 
 export function skillCatalogEntry(skill: Skill): SkillCatalogEntry {
-	if (skill.routing) return { name: skill.name, ...skill.routing };
-	return { name: skill.name, description: skill.description };
+	const routing = skill.routing;
+	return {
+		name: skill.name,
+		when: routing?.when ?? [skill.description],
+		notFor: routing?.notFor ?? ["The task does not match the stated use case."],
+		input: routing?.input ?? "Task request and relevant working context.",
+		output: routing?.output ?? "Result defined by the loaded Skill instructions.",
+		does: routing?.does ?? skill.description,
+	};
 }
 
 export function skillCatalogRevision(skills: Skill[]): string {
@@ -446,7 +469,7 @@ export function formatSkillsForPrompt(skills: Skill[], options: FormatSkillsForP
 
 	const loadToolName = options.loadToolName ?? "read";
 	const includeLocations = options.includeLocations ?? loadToolName === "read";
-	const compactRoutingCards = !includeLocations && visibleSkills.every((skill) => skill.routing !== undefined);
+	const compactRoutingCards = !includeLocations;
 	const catalogAttributes = [
 		...(options.includeRevision ? [`revision="sha256:${skillCatalogRevision(visibleSkills)}"`] : []),
 		...(compactRoutingCards ? ['format="routing-card-jsonl"'] : []),
@@ -469,7 +492,7 @@ export function formatSkillsForPrompt(skills: Skill[], options: FormatSkillsForP
 	}
 	if (compactRoutingCards) {
 		lines.push(
-			"Each JSON line contains name, when[], does, and optional notFor[]; load a skill when any when condition matches and no notFor condition excludes the task.",
+			"Each JSON line contains only name, when[], notFor[], input, output, and does. Load a skill when a when condition matches and no notFor condition excludes the task.",
 		);
 	}
 	lines.push("", catalogTag);

@@ -10,6 +10,11 @@ export interface BackendToolManifest {
 	name: string;
 	description: string;
 	parameters: Record<string, unknown>;
+	when?: string[];
+	notFor?: string[];
+	input?: string;
+	output?: string;
+	does?: string;
 	profile?: string;
 	risk?: string;
 }
@@ -118,10 +123,36 @@ export class BackendToolRegistry {
 				if (record.risk !== undefined && typeof record.risk !== "string") {
 					throw new RuntimeProtocolError("INVALID_TOOL_MANIFEST", `Tool ${record.name} risk must be a string`);
 				}
+				for (const key of ["when", "notFor"] as const) {
+					if (
+						record[key] !== undefined &&
+						(!Array.isArray(record[key]) ||
+							record[key].length === 0 ||
+							record[key].some((value) => typeof value !== "string" || !value.trim()))
+					) {
+						throw new RuntimeProtocolError(
+							"INVALID_TOOL_MANIFEST",
+							`Tool ${record.name} ${key} must be a non-empty string array`,
+						);
+					}
+				}
+				for (const key of ["input", "output", "does"] as const) {
+					if (record[key] !== undefined && (typeof record[key] !== "string" || !record[key].trim())) {
+						throw new RuntimeProtocolError(
+							"INVALID_TOOL_MANIFEST",
+							`Tool ${record.name} ${key} must be a non-empty string`,
+						);
+					}
+				}
 				return {
 					name: record.name,
 					description: record.description,
 					parameters: canonicalJson(record.parameters) as Record<string, unknown>,
+					when: record.when as string[] | undefined,
+					notFor: record.notFor as string[] | undefined,
+					input: record.input as string | undefined,
+					output: record.output as string | undefined,
+					does: record.does as string | undefined,
 					profile: record.profile,
 					risk: record.risk,
 				};

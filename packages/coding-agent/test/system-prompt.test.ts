@@ -108,7 +108,9 @@ describe("buildSystemPrompt", () => {
 				cwd: process.cwd(),
 			});
 
-			expect(prompt).toContain("<name>memory-review</name>");
+			expect(prompt).toContain('{"name":"memory-review","when":["Review long-term memory."],"notFor":');
+			expect(prompt).toContain('"input":"Task request and relevant working context."');
+			expect(prompt).toContain('"output":"Result defined by the loaded Skill instructions."');
 			expect(prompt).toContain("Use the skill_load tool with the exact skill name");
 			expect(prompt).not.toContain("/managed/memory-review/SKILL.md");
 			expect(prompt).not.toContain("You are an expert coding assistant");

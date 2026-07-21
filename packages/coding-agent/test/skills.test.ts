@@ -232,8 +232,10 @@ describe("skills", () => {
 			expect(skills).toHaveLength(1);
 			expect(skills[0].routing).toEqual({
 				when: ["用户要求整理长期记忆", "用户要求审阅记忆草案"],
-				does: "生成并审阅受控记忆草案。",
 				notFor: ["普通记忆查询"],
+				input: "用户请求、候选记忆与来源证据。",
+				output: "受控记忆草案与审阅结论。",
+				does: "生成并审阅受控记忆草案。",
 			});
 		});
 
@@ -325,8 +327,10 @@ describe("skills", () => {
 					baseDir: "/path/to/memory-review",
 					routing: {
 						when: ["用户要求审阅记忆草案", "用户要求回滚已应用草案"],
-						does: "审阅并受控应用长期记忆草案。",
 						notFor: ["普通记忆查询"],
+						input: "记忆草案、证据与用户决定。",
+						output: "受控审阅结论与应用回执。",
+						does: "审阅并受控应用长期记忆草案。",
 					},
 				}),
 			];
@@ -343,8 +347,10 @@ describe("skills", () => {
 				JSON.stringify({
 					name: "memory-review",
 					when: ["用户要求审阅记忆草案", "用户要求回滚已应用草案"],
-					does: "审阅并受控应用长期记忆草案。",
 					notFor: ["普通记忆查询"],
+					input: "记忆草案、证据与用户决定。",
+					output: "受控审阅结论与应用回执。",
+					does: "审阅并受控应用长期记忆草案。",
 				}),
 			);
 			expect(result).not.toContain("Compatibility description");

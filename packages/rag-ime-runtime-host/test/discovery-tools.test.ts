@@ -61,7 +61,11 @@ describe("runtime discovery tools", () => {
 		expect(result.items).toEqual([
 			{
 				name: "memory-review",
-				description: "Review long-term memory.",
+				when: ["Review long-term memory."],
+				notFor: ["The task does not match the stated use case."],
+				input: "Task request and relevant working context.",
+				output: "Result defined by the loaded Skill instructions.",
+				does: "Review long-term memory.",
 			},
 		]);
 		expect(JSON.stringify(result)).not.toContain("/managed/");
@@ -78,8 +82,10 @@ describe("runtime discovery tools", () => {
 				description: "Compatibility-only description.",
 				routing: {
 					when: ["用户要求审阅记忆草案", "用户要求回滚已应用草案"],
-					does: "审阅并受控应用长期记忆草案。",
 					notFor: ["普通记忆查询"],
+					input: "记忆草案、证据与用户决定。",
+					output: "受控审阅结论与应用回执。",
+					does: "审阅并受控应用长期记忆草案。",
 				},
 			}),
 		];
@@ -92,8 +98,10 @@ describe("runtime discovery tools", () => {
 				{
 					name: "memory-review",
 					when: ["用户要求审阅记忆草案", "用户要求回滚已应用草案"],
-					does: "审阅并受控应用长期记忆草案。",
 					notFor: ["普通记忆查询"],
+					input: "记忆草案、证据与用户决定。",
+					output: "受控审阅结论与应用回执。",
+					does: "审阅并受控应用长期记忆草案。",
 				},
 			],
 		});
@@ -167,7 +175,8 @@ describe("runtime discovery tools", () => {
 			parameters: { type: "object", properties: { secretArgument: { type: "string" } } },
 		});
 
-		expect(Array.from(JSON.stringify(entry)).length).toBeLessThanOrEqual(200);
+		expect(Object.keys(entry)).toEqual(["name", "when", "notFor", "input", "output", "does"]);
+		expect(Array.from(JSON.stringify(entry)).length).toBeLessThanOrEqual(512);
 		expect(JSON.stringify(entry)).not.toContain("secretArgument");
 	});
 
@@ -178,6 +187,11 @@ describe("runtime discovery tools", () => {
 				name: "memory.query",
 				description: "Query long-term memory.",
 				parameters: { type: "object", properties: { query: { type: "string" } } },
+				when: ["需要从长期记忆中查找用户确认过的事实"],
+				notFor: ["当前上下文已经包含答案"],
+				input: "检索问题与范围",
+				output: "有来源的记忆原文",
+				does: "查询长期记忆。",
 				profile: "memory",
 				risk: "read",
 			},
@@ -221,15 +235,21 @@ describe("runtime discovery tools", () => {
 		if (!beforeAgentStart) throw new Error("before_agent_start hook was not registered");
 		const prompt = await beforeAgentStart({ systemPrompt: "base prompt" });
 		expect(prompt?.systemPrompt).toContain('<available_product_tools format="route-jsonl"');
-		expect(prompt?.systemPrompt).toContain('{"name":"memory.query","does":"Query long-term memory."}');
+		expect(prompt?.systemPrompt).toContain(
+			'{"name":"memory.query","when":["需要从长期记忆中查找用户确认过的事实"],"notFor":["当前上下文已经包含答案"]',
+		);
+		expect(prompt?.systemPrompt).toContain('"input":"检索问题与范围"');
+		expect(prompt?.systemPrompt).toContain('"output":"有来源的记忆原文"');
 		expect(prompt?.systemPrompt).not.toContain('"parameters"');
 		const result = searchBackendTools(registry.list(), { query: "memory" }, registry.revision());
 		expect(result.items).toEqual([
 			{
 				name: "memory.query",
-				description: "Query long-term memory.",
-				profile: "memory",
-				risk: "read",
+				when: ["需要从长期记忆中查找用户确认过的事实"],
+				notFor: ["当前上下文已经包含答案"],
+				input: "检索问题与范围",
+				output: "有来源的记忆原文",
+				does: "查询长期记忆。",
 			},
 		]);
 		expect(JSON.stringify(result)).not.toContain('"parameters"');
@@ -262,5 +282,12 @@ describe("runtime discovery tools", () => {
 			tool: { name: "memory.query" },
 		});
 		expect(JSON.stringify(loadResult.content)).not.toContain('"parameters"');
+		const providerLoad = JSON.parse((loadResult.content[0] as { text: string }).text) as {
+			tool: Record<string, unknown>;
+		};
+		expect(Object.keys(providerLoad.tool)).toEqual(["name", "when", "notFor", "input", "output", "does"]);
+		expect(providerLoad.tool.input).toBe("检索问题与范围");
+		expect(providerLoad.tool).not.toHaveProperty("profile");
+		expect(providerLoad.tool).not.toHaveProperty("risk");
 	});
 });
