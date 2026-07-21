@@ -3,6 +3,7 @@ import { readFileSync } from "node:fs";
 import { resolve } from "node:path";
 import { type Api, getSupportedThinkingLevels, type Model } from "@earendil-works/pi-ai";
 import {
+	type AgentAbortReceipt,
 	type AgentSession,
 	type AgentSessionEvent,
 	type CreateAgentSessionOptions,
@@ -39,6 +40,7 @@ import {
 	backendToolSchemaRevision,
 	createBackendToolExtension,
 	diffBackendToolCatalog,
+	rebindGovernedToolReceipts,
 } from "./tool-bridge.ts";
 import { createWorkflowControlExtension } from "./workflow-control.ts";
 
@@ -67,6 +69,7 @@ export interface PiSessionOpenOptions {
 	systemPrompt?: string;
 	sessionContext?: string;
 	roomContext?: string;
+	roomRecoveryContext?: string;
 	roomProviderContext?: Record<string, unknown>;
 	roomSkillPolicy?: unknown;
 	roomResourceLimits?: RoomResourceLimits;
@@ -276,6 +279,15 @@ export interface ActiveTurn {
 	clientMessageId?: string;
 }
 
+export interface PiSessionAbortReceipt {
+	schemaVersion: "rag-ime.pi-session-abort-receipt.v1";
+	sessionId: string;
+	turnId: string;
+	cancelledDecisionIds: string[];
+	cancelledUIRequestIds: string[];
+	lifecycle: AgentAbortReceipt;
+}
+
 interface PublicCompactionState {
 	reason: "manual" | "threshold" | "overflow";
 	status: "running" | "completed" | "failed" | "aborted";
@@ -365,12 +377,13 @@ export class PiProductSession implements PooledSession {
 	readonly noContextFiles: boolean;
 	readonly piSkillsEnabled: boolean;
 	readonly codexSkillsEnabled: boolean;
-	readonly roomCapability?: Record<string, unknown>;
+	private roomCapability?: Record<string, unknown>;
 	private readonly session: AgentSession;
 	private readonly resourceLoader: DefaultResourceLoader;
 	private readonly settingsManager: SettingsManager;
 	private readonly debugContextRecorder: PiDebugContextRecorder;
 	private readonly providerContextJournal: ProviderContextJournal;
+	private readonly backendBridge: BackendToolBridgeOptions;
 	private readonly emitEvent: (event: RuntimeEventEnvelope) => void;
 	private unsubscribe: (() => void) | undefined;
 	private sequence = 0;
@@ -378,11 +391,12 @@ export class PiProductSession implements PooledSession {
 	private activeRoom: ActiveRoomDispatch | undefined;
 	private roomUsageBaseline: { input: number; output: number } | undefined;
 	private roomContext = "";
+	private roomRecoveryContext = "";
 	private sessionContext = "";
 	private sessionContextRefreshRevision = 0;
 	private transientContext = "";
 	private roomProviderContext?: Record<string, unknown>;
-	private readonly roomResourceLimits?: RoomResourceLimits;
+	private roomResourceLimits?: RoomResourceLimits;
 	private roomToolCalls = 0;
 	private roomToolCost = 0;
 	private latestCompaction: PublicCompactionState | undefined;
@@ -408,6 +422,7 @@ export class PiProductSession implements PooledSession {
 		settingsManager: SettingsManager,
 		debugContextRecorder: PiDebugContextRecorder,
 		providerContextJournal: ProviderContextJournal,
+		backendBridge: BackendToolBridgeOptions,
 		roomSkillLoad: RoomSkillLoadReceipt | undefined,
 	) {
 		this.externalSessionId = options.externalSessionId;
@@ -424,6 +439,7 @@ export class PiProductSession implements PooledSession {
 		this.settingsManager = settingsManager;
 		this.debugContextRecorder = debugContextRecorder;
 		this.providerContextJournal = providerContextJournal;
+		this.backendBridge = backendBridge;
 		this.emitEvent = options.emitEvent;
 		this.unsubscribe = session.subscribe((event) => this.onSessionEvent(event));
 	}
@@ -476,7 +492,9 @@ export class PiProductSession implements PooledSession {
 			...(options.codexSkillsEnabled ? options.codexSkillPaths : []),
 		];
 		const lifecycleHooks = createLifecycleHookController({ bridge: backendBridge });
-		const providerContextJournal = new ProviderContextJournal();
+		const initialContextEpoch = Number(options.roomCapability?.contextEpoch ?? 1);
+		const initialContextEpochReason = String(options.roomCapability?.contextEpochReason ?? "session_open");
+		const providerContextJournal = new ProviderContextJournal(initialContextEpoch, initialContextEpochReason);
 		let requiredSkillPrompt = "";
 		resourceLoader = new DefaultResourceLoader({
 			cwd: options.cwd,
@@ -505,8 +523,13 @@ export class PiProductSession implements PooledSession {
 						}
 					},
 					getRoomContext: () => productSession?.roomContext ?? "",
+					getRoomRecoveryContext: () => productSession?.roomRecoveryContext ?? "",
+					setRoomRecoveryContext: (value) => {
+						if (productSession) productSession.roomRecoveryContext = value.trim();
+					},
 					getRecentMessages: () => productSession?.recentMessagesForContext() ?? [],
 					getRoomSkillRecovery: () => productSession?.roomSkillLoadReceipt(),
+					getRoomToolRecovery: () => productSession?.roomToolRecoveryReceipt(),
 					providerContextJournal,
 				}),
 				createWorkflowControlExtension({
@@ -598,10 +621,12 @@ export class PiProductSession implements PooledSession {
 			settingsManager,
 			debugContextRecorder,
 			providerContextJournal,
+			backendBridge,
 			roomSkillLoad,
 		);
 		productSession.sessionContext = options.sessionContext?.trim() ?? "";
 		productSession.roomContext = options.roomContext?.trim() ?? "";
+		productSession.roomRecoveryContext = options.roomRecoveryContext?.trim() ?? productSession.roomContext;
 		productSession.roomProviderContext = options.roomProviderContext
 			? structuredClone(options.roomProviderContext)
 			: undefined;
@@ -1119,6 +1144,15 @@ export class PiProductSession implements PooledSession {
 		return { ...structuredClone(this.roomSkillLoad) };
 	}
 
+	roomToolRecoveryReceipt(): Record<string, unknown> | undefined {
+		const items = this.toolRegistry.governedLoadReceipts();
+		if (items.length === 0) return undefined;
+		return {
+			schemaVersion: "rag-ime.room-tool-recovery.v1",
+			items,
+		};
+	}
+
 	listTools(): Array<Record<string, unknown>> {
 		const active = new Set(this.session.getActiveToolNames());
 		const backend = new Map(this.toolRegistry.list().map((tool) => [tool.name, tool]));
@@ -1268,6 +1302,7 @@ export class PiProductSession implements PooledSession {
 		}
 		this.transientContext = options.transientContext?.trim() ?? "";
 		let preflightSettled = false;
+		let preflightFallback: ReturnType<typeof setTimeout> | undefined;
 		return new Promise<ActiveTurn>((accept, reject) => {
 			void this.session
 				.prompt(options.message, {
@@ -1275,17 +1310,27 @@ export class PiProductSession implements PooledSession {
 					source: "rpc",
 					preflightResult: (success) => {
 						if (preflightSettled) return;
-						preflightSettled = true;
-						if (success) accept(turn);
-						else {
-							this.activeTurn = undefined;
-							this.transientContext = "";
-							reject(new RuntimeProtocolError("PROMPT_REJECTED", "Prompt preflight was rejected"));
+						if (success) {
+							preflightSettled = true;
+							accept(turn);
+							return;
 						}
+						this.activeTurn = undefined;
+						this.transientContext = "";
+						// AgentSession reports preflight=false immediately before
+						// rethrowing the concrete failure. Let the Promise rejection
+						// preserve that diagnostic instead of replacing it with a
+						// generic error; retain a fallback for non-conforming hosts.
+						preflightFallback = setTimeout(() => {
+							if (preflightSettled) return;
+							preflightSettled = true;
+							reject(new RuntimeProtocolError("PROMPT_REJECTED", "Prompt preflight was rejected"));
+						}, 0);
 					},
 				})
 				.catch((error) => {
 					if (!preflightSettled) {
+						if (preflightFallback !== undefined) clearTimeout(preflightFallback);
 						preflightSettled = true;
 						this.activeTurn = undefined;
 						this.transientContext = "";
@@ -1325,6 +1370,10 @@ export class PiProductSession implements PooledSession {
 		capabilityEpoch: number;
 		sessionContext?: string;
 		roomContext?: string;
+		roomRecoveryContext?: string;
+		roomProviderContext?: Record<string, unknown>;
+		roomCapability?: Record<string, unknown>;
+		roomResourceLimits?: RoomResourceLimits;
 	}): Promise<Record<string, unknown>> {
 		this.assertRoomDispatchResources();
 		if (this.activeRoom && this.activeRoom.dispatchId !== options.dispatchId) {
@@ -1336,6 +1385,56 @@ export class PiProductSession implements PooledSession {
 		}
 		if (options.roomContext !== undefined) {
 			this.roomContext = options.roomContext.trim();
+		}
+		if (options.roomRecoveryContext !== undefined) {
+			this.roomRecoveryContext = options.roomRecoveryContext.trim();
+		}
+		if (options.roomCapability !== undefined) {
+			const requestedEpoch = Number(options.roomCapability.contextEpoch);
+			const currentEpoch = this.providerContextJournal.snapshot().epoch;
+			if (!Number.isSafeInteger(requestedEpoch) || requestedEpoch < currentEpoch) {
+				throw new RuntimeProtocolError(
+					"ROOM_CONTEXT_EPOCH_INVALID",
+					"Room Dispatch context epoch is stale or invalid",
+				);
+			}
+			if (requestedEpoch > currentEpoch) {
+				if (String(options.roomCapability.contextEpochReason ?? "") !== "task_switch") {
+					throw new RuntimeProtocolError(
+						"ROOM_CONTEXT_EPOCH_INVALID",
+						"Room Dispatch may advance context only for a task switch",
+					);
+				}
+				this.providerContextJournal.beginEpoch(
+					"task_switch",
+					this.session.systemPrompt,
+					{
+						sessionContext: this.sessionContext,
+						roomContext: this.roomContext,
+						transientContext: "",
+					},
+					requestedEpoch,
+				);
+			}
+		}
+		if (options.roomProviderContext !== undefined) {
+			this.roomProviderContext = structuredClone(options.roomProviderContext);
+		}
+		if (options.roomCapability !== undefined) {
+			this.roomCapability = structuredClone(options.roomCapability);
+			this.backendBridge.roomCapability = structuredClone(options.roomCapability);
+		}
+		if (options.roomResourceLimits !== undefined) {
+			this.roomResourceLimits = structuredClone(options.roomResourceLimits);
+		}
+		try {
+			await rebindGovernedToolReceipts(this.backendBridge, options.dispatchId);
+		} catch (error) {
+			if (this.activeRoom?.dispatchId === options.dispatchId) {
+				this.activeRoom = undefined;
+				this.roomUsageBaseline = undefined;
+			}
+			throw error;
 		}
 		if (!this.activeTurn || this.session.isIdle) {
 			try {
@@ -1443,8 +1542,23 @@ export class PiProductSession implements PooledSession {
 		};
 	}
 
-	async abort(): Promise<void> {
-		await this.session.abort();
+	async abort(): Promise<PiSessionAbortReceipt> {
+		const turnId = this.activeTurn?.turnId ?? "";
+		const cancelledUIRequestIds = [...this.pendingUIRequests.keys()];
+		for (const pending of [...this.pendingUIRequests.values()]) pending.cancel();
+
+		const cancelledDecisionIds = [...this.pendingDecisions.values()].map((pending) => pending.requestId);
+		for (const pending of [...this.pendingDecisions.values()]) pending.resolve(false);
+
+		const lifecycle = await this.session.abort();
+		return {
+			schemaVersion: "rag-ime.pi-session-abort-receipt.v1",
+			sessionId: this.externalSessionId,
+			turnId,
+			cancelledDecisionIds,
+			cancelledUIRequestIds,
+			lifecycle,
+		};
 	}
 
 	async compact(customInstructions?: string): Promise<unknown> {
@@ -1452,10 +1566,26 @@ export class PiProductSession implements PooledSession {
 			throw new RuntimeProtocolError("SESSION_BUSY", "Session must be idle before compaction");
 		}
 		const refreshRevisionBefore = this.sessionContextRefreshRevision;
+		const contextEpochBefore = this.providerContextJournal.snapshot().epoch;
 		const result = await this.session.compact(customInstructions);
+		const compactionEntry = [...this.session.sessionManager.getEntries()]
+			.reverse()
+			.find((entry) => entry.type === "compaction");
+		const contextEpochAfter = this.providerContextJournal.snapshot().epoch;
+		if (this.roomCapability && contextEpochAfter > contextEpochBefore) {
+			this.roomCapability = {
+				...this.roomCapability,
+				contextEpoch: contextEpochAfter,
+				contextEpochReason: "compaction",
+			};
+			this.backendBridge.roomCapability = structuredClone(this.roomCapability);
+		}
 		return {
 			...result,
 			contextRefreshApplied: this.sessionContextRefreshRevision > refreshRevisionBefore,
+			compactionEntryId: compactionEntry?.id,
+			contextEpochBefore,
+			contextEpochAfter,
 		};
 	}
 

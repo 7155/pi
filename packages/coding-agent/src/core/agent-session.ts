@@ -22,6 +22,8 @@ import type {
 	AgentMessage,
 	AgentState,
 	AgentTool,
+	CancelOperationSnapshot,
+	CancelReceipt,
 	ContinuationOptions,
 	PrepareNextTurnContext,
 	ThinkingLevel,
@@ -179,6 +181,21 @@ export interface AgentSettledReceipt {
 	aborted: boolean;
 	pendingOperations: number;
 	operationCounts: Record<string, number>;
+}
+
+/** Complete, machine-checkable proof for one AgentSession abort request. */
+export interface AgentAbortReceipt {
+	schemaVersion: "pi.agent-abort-receipt.v1";
+	scopeId: string;
+	generation: number;
+	reason: string;
+	cancelledContinuationIds: string[];
+	cancelledOperationIds: string[];
+	failedOperationIds: string[];
+	operations: CancelOperationSnapshot[];
+	pendingOperations: CancelOperationSnapshot[];
+	drained: boolean;
+	idle: boolean;
 }
 
 class AgentSettleLifecycleError extends Error {
@@ -1759,12 +1776,38 @@ export class AgentSession {
 	/**
 	 * Abort current operation and wait for agent to become idle.
 	 */
-	async abort(): Promise<void> {
-		await this._cancelScope?.cancel("user_abort");
-		this._applyContinuationCancellation(this.agent.cancelActiveContinuationGeneration("user_abort"));
+	async abort(): Promise<AgentAbortReceipt> {
+		const scope = this._cancelScope;
+		const operations = scope?.snapshot().operations ?? [];
+		const cancellation: CancelReceipt = scope
+			? await scope.cancel("user_abort")
+			: {
+					scopeId: this.sessionId,
+					generation: this._lastSettledReceipt?.generation ?? 0,
+					reason: "user_abort",
+					cancelledOperationIds: [],
+					failedOperationIds: [],
+				};
+		const continuation = this.agent.cancelActiveContinuationGeneration("user_abort");
+		this._applyContinuationCancellation(continuation);
 		this.abortRetry();
 		this.agent.abort();
 		await this.waitForIdle();
+		const drainedWithinDeadline = scope ? await scope.awaitDrained(30_000) : true;
+		const pendingOperations = scope?.snapshot().operations ?? [];
+		return {
+			schemaVersion: "pi.agent-abort-receipt.v1",
+			scopeId: cancellation.scopeId,
+			generation: cancellation.generation,
+			reason: cancellation.reason,
+			cancelledContinuationIds: continuation.cancelledIds,
+			cancelledOperationIds: cancellation.cancelledOperationIds,
+			failedOperationIds: cancellation.failedOperationIds,
+			operations,
+			pendingOperations,
+			drained: drainedWithinDeadline && pendingOperations.length === 0,
+			idle: this.isIdle,
+		};
 	}
 
 	async waitForIdle(): Promise<void> {

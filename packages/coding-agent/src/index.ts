@@ -13,10 +13,12 @@ export {
 	VERSION,
 } from "./config.ts";
 export {
+	type AgentAbortReceipt,
 	AgentSession,
 	type AgentSessionConfig,
 	type AgentSessionEvent,
 	type AgentSessionEventListener,
+	type AgentSettledReceipt,
 	type ModelCycleResult,
 	type ParsedSkillBlock,
 	type PromptOptions,

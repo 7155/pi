@@ -8,6 +8,7 @@ import {
 	createBackendToolDefinition,
 	createBackendToolExtension,
 	diffBackendToolCatalog,
+	rebindGovernedToolReceipts,
 } from "../src/tool-bridge.ts";
 
 function managedFileBlock(sessionId = "session-room") {
@@ -358,6 +359,43 @@ describe("BackendToolRegistry", () => {
 				toolCallId: "call-room",
 				loadReceiptId: "load:room-post",
 				roomCapability: { manifestId: "manifest:1", manifestHash: "a".repeat(64) },
+			});
+		} finally {
+			vi.unstubAllGlobals();
+		}
+	});
+
+	it("rebinds disclosed Tool receipts when the Room Dispatch manifest advances", async () => {
+		const registry = new BackendToolRegistry();
+		registry.sync([tool({ name: "room_post" })]);
+		registry.disclose("room_post");
+		registry.recordLoadReceipt("room_post", "load:old-dispatch");
+		const fetchMock = vi.fn<typeof fetch>().mockResolvedValue(
+			new Response(JSON.stringify({ ok: true, result: { receiptId: "load:new-dispatch" } }), {
+				status: 200,
+				headers: { "Content-Type": "application/json" },
+			}),
+		);
+		vi.stubGlobal("fetch", fetchMock);
+		try {
+			const rebound = await rebindGovernedToolReceipts(
+				{
+					sessionId: "session-room",
+					registry,
+					gatewayUrl: "http://127.0.0.1:8766/api/agent/tool/execute",
+					roomCapability: { manifestId: "manifest:2", manifestHash: "b".repeat(64) },
+				},
+				"dispatch:2",
+			);
+
+			expect(rebound).toEqual([{ name: "room_post", receiptId: "load:new-dispatch" }]);
+			expect(registry.loadReceipt("room_post")).toBe("load:new-dispatch");
+			expect(registry.disclosed().map((item) => item.name)).toEqual(["room_post"]);
+			const request = JSON.parse(String(fetchMock.mock.calls[0]?.[1]?.body)) as Record<string, unknown>;
+			expect(request).toMatchObject({
+				sessionId: "session-room",
+				receiptId: "load:rebind:dispatch:2:room_post",
+				toolName: "room_post",
 			});
 		} finally {
 			vi.unstubAllGlobals();

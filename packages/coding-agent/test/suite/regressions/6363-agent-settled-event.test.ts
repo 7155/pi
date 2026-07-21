@@ -323,9 +323,21 @@ describe("regression #6363: agent settled event and idle waiting", () => {
 
 		const prompt = harness.session.prompt("start");
 		await started;
-		await harness.session.abort();
+		const abortReceipt = await harness.session.abort();
 		await prompt;
 
+		expect(abortReceipt).toMatchObject({
+			schemaVersion: "pi.agent-abort-receipt.v1",
+			reason: "user_abort",
+			cancelledOperationIds: expect.arrayContaining(["provider", expect.stringMatching(/^tool:/)]),
+			failedOperationIds: [],
+			pendingOperations: [],
+			drained: true,
+			idle: true,
+		});
+		expect(abortReceipt.operations.map((operation) => operation.kind)).toEqual(
+			expect.arrayContaining(["provider", "tool"]),
+		);
 		expect(harness.eventsOfType("agent_settled")[0]?.receipt).toMatchObject({
 			aborted: true,
 			generation: 1,

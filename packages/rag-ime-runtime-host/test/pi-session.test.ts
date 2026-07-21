@@ -10,6 +10,7 @@ import {
 	publicPiForkCandidates,
 	publicPiRewriteTarget,
 } from "../src/pi-session.ts";
+import { ProviderContextJournal } from "../src/provider-context-journal.ts";
 
 function assistant(text: string, timestamp: number): AssistantMessage {
 	return {
@@ -310,14 +311,88 @@ describe("request-scoped UI resolution", () => {
 	});
 });
 
+describe("typed Session cancellation", () => {
+	it("cancels pending UI and decisions before returning the exact Agent lifecycle receipt", async () => {
+		const productSession = Object.create(PiProductSession.prototype) as PiProductSession;
+		const pendingUIRequests = new Map<string, { cancel(): void }>();
+		const pendingDecisions = new Map<string, { requestId: string; resolve(value: boolean): void }>();
+		pendingUIRequests.set("ui-1", {
+			cancel: () => pendingUIRequests.delete("ui-1"),
+		});
+		pendingDecisions.set("approval:write-1", {
+			requestId: "decision-1",
+			resolve: () => pendingDecisions.delete("approval:write-1"),
+		});
+		const lifecycle = {
+			schemaVersion: "pi.agent-abort-receipt.v1" as const,
+			scopeId: "pi-session:run:1",
+			generation: 1,
+			reason: "user_abort",
+			cancelledContinuationIds: ["continuation-1"],
+			cancelledOperationIds: ["provider"],
+			failedOperationIds: [],
+			operations: [{ operationId: "provider", kind: "provider", registeredAt: 1 }],
+			pendingOperations: [],
+			drained: true,
+			idle: true,
+		};
+		Object.assign(productSession as unknown as Record<string, unknown>, {
+			externalSessionId: "agent:1",
+			activeTurn: { turnId: "turn:1", clientMessageId: "message:1" },
+			pendingUIRequests,
+			pendingDecisions,
+			session: { abort: vi.fn(async () => lifecycle) },
+		});
+
+		await expect(productSession.abort()).resolves.toEqual({
+			schemaVersion: "rag-ime.pi-session-abort-receipt.v1",
+			sessionId: "agent:1",
+			turnId: "turn:1",
+			cancelledDecisionIds: ["decision-1"],
+			cancelledUIRequestIds: ["ui-1"],
+			lifecycle,
+		});
+		expect(pendingUIRequests.size).toBe(0);
+		expect(pendingDecisions.size).toBe(0);
+	});
+});
+
+describe("prompt preflight diagnostics", () => {
+	it("preserves the concrete AgentSession failure after a rejected preflight", async () => {
+		const productSession = Object.create(PiProductSession.prototype) as PiProductSession;
+		Object.assign(productSession as unknown as Record<string, unknown>, {
+			externalSessionId: "agent:preflight",
+			activeTurn: undefined,
+			sessionContext: "",
+			transientContext: "",
+			session: {
+				isIdle: true,
+				prompt: vi.fn(async (_message, options) => {
+					options.preflightResult(false);
+					throw new Error("Room recovery receipt revision does not match");
+				}),
+			},
+		});
+
+		await expect(productSession.prompt({ message: "run the Room task" })).rejects.toThrow(
+			"Room recovery receipt revision does not match",
+		);
+		expect((productSession as unknown as { activeTurn?: unknown }).activeTurn).toBeUndefined();
+	});
+});
+
 describe("manual compaction context refresh", () => {
 	it("reports when the compaction hook already refreshed Session memory", async () => {
 		const productSession = Object.create(PiProductSession.prototype) as PiProductSession;
 		const mutable = productSession as unknown as Record<string, unknown>;
 		Object.assign(mutable, {
 			sessionContextRefreshRevision: 0,
+			providerContextJournal: new ProviderContextJournal(),
 			session: {
 				isIdle: true,
+				sessionManager: {
+					getEntries: () => [{ type: "compaction", id: "compaction:1" }],
+				},
 				compact: vi.fn(async () => {
 					mutable.sessionContextRefreshRevision = 1;
 					return {
@@ -340,8 +415,12 @@ describe("manual compaction context refresh", () => {
 		const productSession = Object.create(PiProductSession.prototype) as PiProductSession;
 		Object.assign(productSession as unknown as Record<string, unknown>, {
 			sessionContextRefreshRevision: 0,
+			providerContextJournal: new ProviderContextJournal(),
 			session: {
 				isIdle: true,
+				sessionManager: {
+					getEntries: () => [{ type: "compaction", id: "compaction:missed" }],
+				},
 				compact: vi.fn(async () => ({
 					summary: "压缩摘要",
 					firstKeptEntryId: "entry-1",
@@ -352,6 +431,68 @@ describe("manual compaction context refresh", () => {
 
 		await expect(productSession.compact()).resolves.toMatchObject({
 			contextRefreshApplied: false,
+		});
+	});
+});
+
+describe("managed Room context epochs", () => {
+	it("rebases one resident Session for the exact next task-switch epoch", async () => {
+		const productSession = Object.create(PiProductSession.prototype) as PiProductSession;
+		const providerContextJournal = new ProviderContextJournal(2, "compaction");
+		const prompt = vi.fn(async () => ({ turnId: "turn:task-switch" }));
+		Object.assign(productSession as unknown as Record<string, unknown>, {
+			activeRoom: undefined,
+			activeTurn: undefined,
+			roomCapability: {
+				rootId: "root:old",
+				generation: 0,
+				contextEpoch: 2,
+				contextEpochReason: "compaction",
+			},
+			roomContext: "old room context",
+			roomRecoveryContext: "old recovery context",
+			sessionContext: "old session context",
+			providerContextJournal,
+			backendBridge: { roomCapability: {}, gatewayUrl: undefined },
+			roomProviderContext: undefined,
+			roomResourceLimits: undefined,
+			roomSkillLoad: undefined,
+			prompt,
+			session: {
+				isIdle: true,
+				systemPrompt: "stable system prompt",
+				getSessionStats: () => ({ tokens: { input: 10, output: 5 } }),
+			},
+		});
+
+		await expect(
+			productSession.dispatchRoom({
+				message: "start the next task",
+				dispatchId: "dispatch:new",
+				rootId: "root:new",
+				generation: 0,
+				capabilityEpoch: 9,
+				sessionContext: "new session context",
+				roomContext: "new full room context",
+				roomRecoveryContext: "new recovery context",
+				roomCapability: {
+					rootId: "root:new",
+					generation: 0,
+					contextEpoch: 3,
+					contextEpochReason: "task_switch",
+				},
+			}),
+		).resolves.toMatchObject({ delivery: "prompt", turnId: "turn:task-switch" });
+
+		expect(prompt).toHaveBeenCalledOnce();
+		expect(providerContextJournal.snapshot()).toMatchObject({
+			epoch: 3,
+			epochReason: "task_switch",
+			entryCount: 2,
+		});
+		expect((productSession as unknown as { roomCapability: Record<string, unknown> }).roomCapability).toMatchObject({
+			rootId: "root:new",
+			contextEpoch: 3,
 		});
 	});
 });

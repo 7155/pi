@@ -70,7 +70,6 @@ export function createRoomSettleLifecycleExtension(options: RoomSettleLifecycleO
 						correlationId: active.rootId,
 						origin: "room_settle_guard",
 						idempotencyKey: repairKey,
-						cancelGeneration: event.cancelScope.generation,
 						maxAttempts: 1,
 					},
 				},

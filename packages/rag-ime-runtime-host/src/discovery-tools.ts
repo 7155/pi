@@ -145,6 +145,51 @@ function searchScore(query: string, name: string, description: string, extra = "
 	return score;
 }
 
+function queryFragments(query: string): string[] {
+	const normalized = query.trim().toLocaleLowerCase();
+	const fragments = new Set<string>();
+	for (const token of normalized.match(/[\p{L}\p{N}_-]+/gu) ?? []) {
+		fragments.add(token);
+		const characters = Array.from(token);
+		if (characters.length < 2 || !characters.every((character) => /\p{Script=Han}/u.test(character))) continue;
+		for (let index = 0; index < characters.length - 1; index += 1) {
+			fragments.add(characters.slice(index, index + 2).join(""));
+		}
+	}
+	return [...fragments];
+}
+
+function fragmentCoverage(query: string, value: string): number {
+	const fragments = queryFragments(query);
+	if (fragments.length === 0) return 0;
+	const normalizedValue = value.toLocaleLowerCase();
+	return fragments.filter((fragment) => normalizedValue.includes(fragment)).length / fragments.length;
+}
+
+function routingSearchScore(
+	query: string,
+	name: string,
+	when: string[],
+	notFor: string[],
+	supportingText: string,
+): number {
+	const normalizedQuery = query.trim().toLocaleLowerCase();
+	if (!normalizedQuery) return 1;
+	const normalizedName = name.toLocaleLowerCase();
+	if (normalizedName === normalizedQuery) return 1000;
+
+	const excluded = notFor.some((item) => {
+		const normalized = item.toLocaleLowerCase();
+		return normalized.includes(normalizedQuery) || fragmentCoverage(normalizedQuery, normalized) >= 0.75;
+	});
+	if (excluded) return -1;
+
+	let score = searchScore(normalizedQuery, normalizedName, when.join(" "), supportingText);
+	const positiveCoverage = Math.max(0, ...when.map((item) => fragmentCoverage(normalizedQuery, item)));
+	if (positiveCoverage >= 0.5) score += Math.round(positiveCoverage * 100);
+	return score;
+}
+
 function sha256(value: string): string {
 	return createHash("sha256").update(value).digest("hex");
 }
@@ -227,10 +272,15 @@ export function searchSkills(skills: Skill[], args: { query?: unknown; limit?: u
 	const items = visibleSkills(skills)
 		.map((skill) => {
 			const entry = skillCatalogEntry(skill);
-			const routingText = [...entry.when, ...entry.notFor, entry.input, entry.output, entry.does].join(" ");
 			return {
 				entry,
-				score: searchScore(query, skill.name, routingText),
+				score: routingSearchScore(
+					query,
+					skill.name,
+					entry.when,
+					entry.notFor,
+					[entry.input, entry.output, entry.does].join(" "),
+				),
 			};
 		})
 		.filter((item) => !query || item.score > 0)
@@ -288,15 +338,19 @@ export function searchBackendTools(
 	const query = typeof args.query === "string" ? args.query.trim() : "";
 	const limit = normalizedLimit(args.limit);
 	const items = tools
-		.map((tool) => ({
-			tool,
-			score: searchScore(
-				query,
-				tool.name,
-				tool.description,
-				Object.values(backendToolRouteEntry(tool)).flat().join(" "),
-			),
-		}))
+		.map((tool) => {
+			const entry = backendToolRouteEntry(tool);
+			return {
+				tool,
+				score: routingSearchScore(
+					query,
+					tool.name,
+					entry.when,
+					entry.notFor,
+					[tool.description, entry.input, entry.output, entry.does].join(" "),
+				),
+			};
+		})
 		.filter((item) => !query || item.score > 0)
 		.sort((left, right) => right.score - left.score || left.tool.name.localeCompare(right.tool.name))
 		.slice(0, limit)

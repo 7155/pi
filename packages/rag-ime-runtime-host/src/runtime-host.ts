@@ -10,6 +10,7 @@ import {
 	type ModelThinkingLevel,
 } from "@earendil-works/pi-ai";
 import { ModelRuntime } from "@earendil-works/pi-coding-agent";
+import { pendingRoomCancellationSurfaces, roomCancellationSurfaces } from "./cancellation-receipts.ts";
 import { PiProductSession } from "./pi-session.ts";
 import { ManagedPluginManager } from "./plugin-manager.ts";
 import {
@@ -166,6 +167,12 @@ function optionalRoomCapability(params: Record<string, unknown>): Record<string,
 		record.capabilityEpoch < 0
 	) {
 		throw new RuntimeProtocolError("INVALID_PARAMS", "roomCapability.capabilityEpoch is invalid");
+	}
+	if (
+		record.contextEpoch !== undefined &&
+		(typeof record.contextEpoch !== "number" || !Number.isSafeInteger(record.contextEpoch) || record.contextEpoch < 1)
+	) {
+		throw new RuntimeProtocolError("INVALID_PARAMS", "roomCapability.contextEpoch is invalid");
 	}
 	return structuredClone(record);
 }
@@ -546,6 +553,7 @@ export class RagImeRuntimeHost {
 						systemPrompt: optionalString(params, "systemPrompt", 64_000),
 						sessionContext: optionalString(params, "sessionContext", 256_000),
 						roomContext: optionalString(params, "roomContext", 256_000),
+						roomRecoveryContext: optionalString(params, "roomRecoveryContext", 256_000),
 						roomProviderContext: optionalRoomProviderContext(params),
 						roomSkillPolicy: optionalRoomSkillPolicy(params),
 						roomResourceLimits: optionalRoomResourceLimits(params),
@@ -654,8 +662,7 @@ export class RagImeRuntimeHost {
 					images: Array.isArray(params.images) ? (params.images as never) : undefined,
 				});
 			case "session.abort":
-				await this.session(params).abort();
-				return { aborted: true };
+				return this.session(params).abort();
 			case "session.compact":
 				return this.session(params).compact(optionalString(params, "instructions", 4000));
 			case "session.model.set":
@@ -690,6 +697,10 @@ export class RagImeRuntimeHost {
 					capabilityEpoch,
 					sessionContext: optionalString(params, "sessionContext", 256_000),
 					roomContext: optionalString(params, "roomContext", 256_000),
+					roomRecoveryContext: optionalString(params, "roomRecoveryContext", 256_000),
+					roomProviderContext: optionalRoomProviderContext(params),
+					roomCapability: optionalRoomCapability(params),
+					roomResourceLimits: optionalRoomResourceLimits(params),
 				});
 				const receipt = {
 					schemaVersion: "wisdom-weasel.room-runtime-receipt.v1",
@@ -711,14 +722,9 @@ export class RagImeRuntimeHost {
 				const generation = requiredGeneration(params);
 				const target = this.session(params);
 				const cancelled = target.cancelRoom(rootId, generation);
-				if (cancelled.abortRequired) await target.abort();
+				const abortReceipt = cancelled.abortRequired ? await target.abort() : undefined;
 				target.finishRoomCancel(rootId, generation);
-				const termination = (surface: string, targetIds: string[] = []) => ({
-					schemaVersion: "wisdom-weasel.runtime-surface-termination-receipt.v1",
-					surface,
-					state: "terminated",
-					targetIds,
-				});
+				const cancellationSurfaces = roomCancellationSurfaces(sessionId, cancelled.cancelledIds, abortReceipt);
 				return {
 					schemaVersion: "wisdom-weasel.room-runtime-receipt.v1",
 					receiptKind: "cancel_applied",
@@ -728,18 +734,9 @@ export class RagImeRuntimeHost {
 					sessionId,
 					cancelledContinuationIds: cancelled.cancelledIds,
 					activeRunAborted: cancelled.abortRequired,
-					pendingTargets: [],
-					cancellationSurfaces: {
-						provider: termination("provider"),
-						tool: termination("tool"),
-						exec: termination("exec"),
-						retry: termination("retry"),
-						compaction: termination("compaction"),
-						branch_summary: termination("branch_summary"),
-						timer: termination("timer"),
-						continuation: termination("continuation", cancelled.cancelledIds),
-						session: termination("session", [sessionId]),
-					},
+					pendingTargets: pendingRoomCancellationSurfaces(cancellationSurfaces),
+					cancellationSurfaces,
+					sessionAbortReceipt: abortReceipt,
 				};
 			}
 			case "approval.resolve":

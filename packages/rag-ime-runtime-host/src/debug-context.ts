@@ -192,13 +192,11 @@ export class PiDebugContextRecorder {
 
 	extension(): ExtensionFactory {
 		return (pi) => {
-			pi.on("before_agent_start", (event, context) => {
-				const identity = this.activeTurn();
-				if (!identity?.turnId) return;
-				const now = Date.now();
+			const refreshToolSurface = (record: PiDebugContextRecord): void => {
 				const activeTools = pi.getActiveTools();
 				const activeSet = new Set(activeTools);
-				const toolSchemas = pi
+				record.activeTools = [...activeTools];
+				record.toolSchemas = pi
 					.getAllTools()
 					.filter((tool) => activeSet.has(tool.name))
 					.map((tool) => ({
@@ -207,6 +205,12 @@ export class PiDebugContextRecorder {
 						parameters: cloneForInspection(tool.parameters),
 						promptGuidelines: tool.promptGuidelines,
 					}));
+			};
+			pi.on("before_agent_start", (event, context) => {
+				const identity = this.activeTurn();
+				if (!identity?.turnId) return;
+				const now = Date.now();
+				const activeTools = pi.getActiveTools();
 				this.runtimeTurnIndex = undefined;
 				this.eventSequence = 0;
 				this.records.delete(identity.turnId);
@@ -232,7 +236,7 @@ export class PiDebugContextRecorder {
 							}
 						: undefined,
 					activeTools: [...activeTools],
-					toolSchemas,
+					toolSchemas: [],
 					skillCatalog: (promptOptions?.skills ?? []).map((skill) => ({
 						name: String(skill.name ?? ""),
 						description: String(skill.description ?? ""),
@@ -248,6 +252,8 @@ export class PiDebugContextRecorder {
 					toolExecutions: [],
 					toolBatches: [],
 				});
+				const record = this.records.get(identity.turnId);
+				if (record) refreshToolSurface(record);
 				this.trim();
 			});
 
@@ -297,6 +303,7 @@ export class PiDebugContextRecorder {
 				const record = this.current();
 				if (!record) return;
 				const now = Date.now();
+				refreshToolSurface(record);
 				const index = (record.providerRequestReceipts.at(-1)?.index ?? 0) + 1;
 				record.providerRequestReceipts.push({
 					schemaVersion: "rag-ime.provider-request-receipt.v1",

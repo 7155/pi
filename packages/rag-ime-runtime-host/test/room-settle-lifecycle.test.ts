@@ -83,7 +83,6 @@ describe("Room settle lifecycle", () => {
 					correlationId: "root:1",
 					origin: "room_settle_guard",
 					idempotencyKey: "repair:1",
-					cancelGeneration: 3,
 					maxAttempts: 1,
 				},
 			},

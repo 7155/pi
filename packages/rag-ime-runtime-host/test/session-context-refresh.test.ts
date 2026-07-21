@@ -5,8 +5,18 @@ import { createSessionContextRefreshExtension } from "../src/session-context-ref
 describe("session context refresh", () => {
 	afterEach(() => vi.unstubAllGlobals());
 
-	it("bootstraps an empty child Session and refreshes it before a compaction retry", async () => {
+	it("rebases every compaction epoch with exactly one bounded Room recovery snapshot", async () => {
 		let sessionContext = "";
+		let storedRoomRecoveryContext = "过期 Room 恢复包";
+		const roomRecoveryFacts = [
+			"原始需求：完成 Room 上下文回归",
+			"当前任务：验证压缩恢复",
+			"验收：需求与责任不能遗忘",
+			"阻塞：等待测试环境",
+			"continuation：交给 reviewer",
+			"工具回执：load:room-state",
+		];
+		const roomRecoveryContext = roomRecoveryFacts.join("\n");
 		const handlers = new Map<string, (event: any, context?: any) => Promise<unknown>>();
 		const fetchMock = vi
 			.fn()
@@ -18,9 +28,44 @@ describe("session context refresh", () => {
 			.mockResolvedValueOnce({
 				ok: true,
 				status: 200,
-				json: async () => ({ ok: true, result: { sessionContext: "## 压缩后任务记忆" } }),
+				json: async () => ({
+					ok: true,
+					result: {
+						sessionContext: "## 第一次压缩后任务记忆",
+						roomRecoveryContext,
+						contextEpoch: 2,
+						contextEpochReason: "compaction",
+					},
+				}),
+			})
+			.mockResolvedValueOnce({
+				ok: true,
+				status: 200,
+				json: async () => ({
+					ok: true,
+					result: {
+						sessionContext: "## 第二次压缩后任务记忆",
+						roomRecoveryContext,
+						contextEpoch: 3,
+						contextEpochReason: "compaction",
+					},
+				}),
+			})
+			.mockResolvedValueOnce({
+				ok: true,
+				status: 200,
+				json: async () => ({
+					ok: true,
+					result: {
+						sessionContext: "## 第三次压缩后任务记忆",
+						roomRecoveryContext,
+						contextEpoch: 4,
+						contextEpochReason: "compaction",
+					},
+				}),
 			});
 		vi.stubGlobal("fetch", fetchMock);
+		const providerContextJournal = new ProviderContextJournal();
 
 		const extension = createSessionContextRefreshExtension({
 			bridge: {
@@ -34,6 +79,10 @@ describe("session context refresh", () => {
 				sessionContext = value;
 			},
 			getRoomContext: () => "## Room 当前任务",
+			getRoomRecoveryContext: () => storedRoomRecoveryContext,
+			setRoomRecoveryContext: (value) => {
+				storedRoomRecoveryContext = value;
+			},
 			getRecentMessages: () => [
 				{ role: "user", text: "完成检索测试" },
 				{ role: "assistant", text: "已经完成初步实现" },
@@ -45,7 +94,11 @@ describe("session context refresh", () => {
 				contentRevision: "d".repeat(64),
 				loadReason: "stage_required",
 			}),
-			providerContextJournal: new ProviderContextJournal(),
+			getRoomToolRecovery: () => ({
+				schemaVersion: "rag-ime.room-tool-recovery.v1",
+				items: [{ name: "room_state", receiptId: "load:room-state" }],
+			}),
+			providerContextJournal,
 		});
 		extension({
 			on: (event: string, handler: (value: any, context?: any) => Promise<unknown>) => handlers.set(event, handler),
@@ -54,7 +107,7 @@ describe("session context refresh", () => {
 		await handlers.get("before_agent_start")?.({ prompt: "完成检索测试" });
 		expect(sessionContext).toBe("## 子任务记忆");
 		const compactResult = (await handlers.get("session_compact")?.(
-			{ compactionEntry: { summary: "压缩摘要" } },
+			{ compactionEntry: { id: "compaction:1", summary: "压缩摘要" } },
 			{
 				getSystemPrompt: () =>
 					[
@@ -65,16 +118,46 @@ describe("session context refresh", () => {
 					].join("\n"),
 			},
 		)) as { systemPrompt?: string } | undefined;
-		expect(sessionContext).toBe("## 压缩后任务记忆");
-		expect(compactResult?.systemPrompt).toContain("## 压缩后任务记忆");
-		expect(compactResult?.systemPrompt).toContain("## Room 当前任务");
+		expect(sessionContext).toBe("## 第一次压缩后任务记忆");
+		expect(compactResult?.systemPrompt).toContain("## 第一次压缩后任务记忆");
+		for (const fact of roomRecoveryFacts) {
+			expect(compactResult?.systemPrompt?.split(fact)).toHaveLength(2);
+		}
+		expect(compactResult?.systemPrompt).not.toContain("## Room 当前任务");
 		expect(compactResult?.systemPrompt).not.toContain("## 子任务记忆");
+		expect(compactResult?.systemPrompt).not.toContain("过期 Room 恢复包");
+		expect(storedRoomRecoveryContext).toBe(roomRecoveryContext);
 		expect(compactResult?.systemPrompt?.match(/type="room_context"/g)).toHaveLength(1);
 		expect(compactResult?.systemPrompt?.match(/type="session_memory"/g)).toHaveLength(1);
-		expect(fetchMock).toHaveBeenCalledTimes(2);
+		let rebasedPrompt = compactResult?.systemPrompt ?? "";
+		for (const [ordinal, expectedContext] of [
+			[2, "## 第二次压缩后任务记忆"],
+			[3, "## 第三次压缩后任务记忆"],
+		] as const) {
+			const next = (await handlers.get("session_compact")?.(
+				{ compactionEntry: { id: `compaction:${ordinal}`, summary: `压缩摘要 ${ordinal}` } },
+				{ getSystemPrompt: () => rebasedPrompt },
+			)) as { systemPrompt?: string } | undefined;
+			rebasedPrompt = next?.systemPrompt ?? "";
+			expect(sessionContext).toBe(expectedContext);
+			expect(rebasedPrompt).toContain(expectedContext);
+			for (const fact of roomRecoveryFacts) {
+				expect(rebasedPrompt.split(fact)).toHaveLength(2);
+			}
+			expect(rebasedPrompt.match(/type="room_context"/g)).toHaveLength(1);
+			expect(rebasedPrompt.match(/type="session_memory"/g)).toHaveLength(1);
+		}
+		expect(providerContextJournal.snapshot()).toMatchObject({
+			epoch: 4,
+			epochReason: "compaction",
+			entryCount: 2,
+		});
+		expect(fetchMock).toHaveBeenCalledTimes(4);
 		expect(fetchMock.mock.calls[0]?.[0]).toBe("http://127.0.0.1:8766/api/agent/tool/context-refresh");
 		const request = JSON.parse(String(fetchMock.mock.calls[1]?.[1]?.body));
 		expect(request.trigger).toBe("compaction");
+		expect(request.compactionEntryId).toBe("compaction:1");
+		expect(request.expectedContextEpoch).toBe(1);
 		expect(request.summary).toBe("压缩摘要");
 		expect(request.recentMessages).toHaveLength(2);
 		expect(request.roomSkillRecovery).toEqual({
@@ -83,6 +166,10 @@ describe("session context refresh", () => {
 			catalogRevision: "c".repeat(64),
 			contentRevision: "d".repeat(64),
 			loadReason: "stage_required",
+		});
+		expect(request.roomToolRecovery).toEqual({
+			schemaVersion: "rag-ime.room-tool-recovery.v1",
+			items: [{ name: "room_state", receiptId: "load:room-state" }],
 		});
 	});
 
@@ -99,8 +186,11 @@ describe("session context refresh", () => {
 			getSessionContext: () => "existing context",
 			setSessionContext: () => undefined,
 			getRoomContext: () => "room context",
+			getRoomRecoveryContext: () => "room recovery context",
+			setRoomRecoveryContext: () => undefined,
 			getRecentMessages: () => [],
 			getRoomSkillRecovery: () => ({ name: "implementation" }),
+			getRoomToolRecovery: () => undefined,
 			providerContextJournal: new ProviderContextJournal(),
 		});
 		extension({
@@ -109,9 +199,56 @@ describe("session context refresh", () => {
 
 		await expect(
 			handlers.get("session_compact")?.(
-				{ compactionEntry: { summary: "summary" } },
+				{ compactionEntry: { id: "compaction:closed", summary: "summary" } },
 				{ getSystemPrompt: () => "base prompt" },
 			),
 		).rejects.toThrow("gateway offline");
+	});
+
+	it("rejects a managed Room compaction without a product-owned compaction epoch", async () => {
+		const handlers = new Map<string, (event: any, context?: any) => Promise<unknown>>();
+		vi.stubGlobal(
+			"fetch",
+			vi.fn().mockResolvedValue({
+				ok: true,
+				status: 200,
+				json: async () => ({
+					ok: true,
+					result: {
+						sessionContext: "恢复后的 Session 记忆",
+						roomRecoveryContext: "恢复后的 Room 事实",
+						contextEpoch: 2,
+						contextEpochReason: "task_switch",
+					},
+				}),
+			}),
+		);
+		const extension = createSessionContextRefreshExtension({
+			bridge: {
+				sessionId: "agent:managed-room",
+				registry: {} as never,
+				gatewayUrl: "http://127.0.0.1:8766/api/agent/tool/execute",
+				gatewayToken: "test-token",
+			},
+			getSessionContext: () => "existing context",
+			setSessionContext: () => undefined,
+			getRoomContext: () => "room context",
+			getRoomRecoveryContext: () => "room recovery context",
+			setRoomRecoveryContext: () => undefined,
+			getRecentMessages: () => [],
+			getRoomSkillRecovery: () => undefined,
+			getRoomToolRecovery: () => undefined,
+			providerContextJournal: new ProviderContextJournal(),
+		});
+		extension({
+			on: (event: string, handler: (value: any, context?: any) => Promise<unknown>) => handlers.set(event, handler),
+		} as never);
+
+		await expect(
+			handlers.get("session_compact")?.(
+				{ compactionEntry: { id: "compaction:wrong-reason", summary: "summary" } },
+				{ getSystemPrompt: () => "base prompt" },
+			),
+		).rejects.toThrow("invalid contextEpochReason");
 	});
 });

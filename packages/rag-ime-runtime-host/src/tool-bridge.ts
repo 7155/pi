@@ -84,6 +84,13 @@ export class BackendToolRegistry {
 		return this.loadReceiptIds.get(name);
 	}
 
+	governedLoadReceipts(): Array<{ name: string; receiptId: string }> {
+		return this.disclosed()
+			.map((tool) => ({ name: tool.name, receiptId: this.loadReceiptIds.get(tool.name) ?? "" }))
+			.filter((item) => item.receiptId.length > 0)
+			.sort((left, right) => left.name.localeCompare(right.name));
+	}
+
 	revision(): string {
 		return backendToolCatalogRevision(this.manifest);
 	}
@@ -284,6 +291,35 @@ export async function requestProductGateway(
 	const payload = (await response.json()) as ToolGatewayResponse;
 	if (!response.ok || !payload.ok) throw new Error(payload.error || `Tool gateway returned HTTP ${response.status}`);
 	return payload;
+}
+
+/** Rebind disclosed schemas to the active Dispatch without reinjecting them. */
+export async function rebindGovernedToolReceipts(
+	options: BackendToolBridgeOptions,
+	dispatchId: string,
+): Promise<Array<{ name: string; receiptId: string }>> {
+	if (!options.roomCapability || !options.gatewayUrl) return [];
+	const rebound: Array<{ name: string; receiptId: string }> = [];
+	for (const item of options.registry.governedLoadReceipts()) {
+		const governed = await requestProductGateway(
+			options,
+			"load",
+			{
+				sessionId: options.sessionId,
+				receiptId: `load:rebind:${dispatchId}:${item.name}`,
+				toolName: item.name,
+				createdAtMs: Date.now(),
+			},
+			undefined,
+		);
+		const receiptId = typeof governed.result?.receiptId === "string" ? governed.result.receiptId : "";
+		if (!receiptId) {
+			throw new RuntimeProtocolError("INVALID_TOOL_RECEIPT", `Room tool receipt rebind failed: ${item.name}`);
+		}
+		options.registry.recordLoadReceipt(item.name, receiptId);
+		rebound.push({ name: item.name, receiptId });
+	}
+	return rebound;
 }
 
 async function executeGatewayTool(

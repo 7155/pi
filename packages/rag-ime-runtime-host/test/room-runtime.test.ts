@@ -44,6 +44,7 @@ describe("Room runtime RPC", () => {
 					systemPrompt: "stable-layers-1-through-5",
 					sessionContext: "generic-agent-rag",
 					roomContext: "dynamic-room-tail",
+					roomRecoveryContext: "full-room-bootstrap",
 					roomProviderContext: {
 						journalId: "journal:1",
 						throughSequence: 1,
@@ -102,7 +103,26 @@ describe("Room runtime RPC", () => {
 			dispatchRoom: vi.fn(async () => ({ delivery: "prompt", turnId: "turn:1" })),
 			cancelRoom: vi.fn(() => ({ cancelledIds: ["continuation:1"], abortRequired: true })),
 			finishRoomCancel: vi.fn(() => undefined),
-			abort: vi.fn(async () => undefined),
+			abort: vi.fn(async () => ({
+				schemaVersion: "rag-ime.pi-session-abort-receipt.v1" as const,
+				sessionId: "session:target",
+				turnId: "turn:1",
+				cancelledDecisionIds: [],
+				cancelledUIRequestIds: [],
+				lifecycle: {
+					schemaVersion: "pi.agent-abort-receipt.v1" as const,
+					scopeId: "pi-session:run:1",
+					generation: 1,
+					reason: "user_abort",
+					cancelledContinuationIds: ["continuation:2"],
+					cancelledOperationIds: ["provider"],
+					failedOperationIds: [],
+					operations: [{ operationId: "provider", kind: "provider", registeredAt: 1 }],
+					pendingOperations: [],
+					drained: true,
+					idle: true,
+				},
+			})),
 			dispose: vi.fn(async () => undefined),
 		};
 		await host.sessions.open("session:target", async () => target as never);
@@ -120,6 +140,28 @@ describe("Room runtime RPC", () => {
 				message: "Execute the bounded Room task.",
 				sessionContext: "generic-agent-rag",
 				roomContext: "governed-room-task",
+				roomRecoveryContext: "full-governed-room-task",
+				roomProviderContext: {
+					journalId: "journal:dispatch:1",
+					throughSequence: 2,
+					projectionHash: "b".repeat(64),
+				},
+				roomCapability: {
+					manifestId: "manifest:dispatch:1",
+					manifestHash: "c".repeat(64),
+					promptCompileReceiptId: "prompt:dispatch:1",
+					promptPlanHash: "d".repeat(64),
+					capabilityEpoch: 7,
+				},
+				roomResourceLimits: {
+					deadlineAtMs: Date.now() + 60_000,
+					maxInputTokens: 64_000,
+					maxOutputTokens: 1024,
+					maxToolCalls: 2,
+					maxToolCost: 2,
+					retryRemaining: 1,
+					repairRemaining: 1,
+				},
 			};
 			const receipt = await host.handle(request("dispatch", "room.dispatch", params));
 			const duplicate = await host.handle(request("dispatch-again", "room.dispatch", params));
@@ -139,6 +181,10 @@ describe("Room runtime RPC", () => {
 				expect.objectContaining({
 					sessionContext: "generic-agent-rag",
 					roomContext: "governed-room-task",
+					roomRecoveryContext: "full-governed-room-task",
+					roomProviderContext: expect.objectContaining({ journalId: "journal:dispatch:1" }),
+					roomCapability: expect.objectContaining({ manifestId: "manifest:dispatch:1" }),
+					roomResourceLimits: expect.objectContaining({ maxToolCalls: 2 }),
 				}),
 			);
 
@@ -159,6 +205,19 @@ describe("Room runtime RPC", () => {
 				schemaVersion: "wisdom-weasel.runtime-surface-termination-receipt.v1",
 				state: "terminated",
 			});
+			expect((cancelled as Record<string, any>).cancellationSurfaces.provider.targetIds).toEqual([
+				"session:target",
+				"provider",
+			]);
+			expect((cancelled as Record<string, any>).cancellationSurfaces.continuation.targetIds).toEqual([
+				"session:target",
+				"continuation:1",
+				"continuation:2",
+			]);
+			expect((cancelled as Record<string, any>).sessionAbortReceipt).toMatchObject({
+				schemaVersion: "rag-ime.pi-session-abort-receipt.v1",
+				turnId: "turn:1",
+			});
 			expect(Object.keys((cancelled as Record<string, any>).cancellationSurfaces)).toEqual([
 				"provider",
 				"tool",
@@ -170,7 +229,16 @@ describe("Room runtime RPC", () => {
 				"continuation",
 				"session",
 			]);
-			expect(target.abort).toHaveBeenCalledTimes(1);
+			const sessionAbort = await host.handle(
+				request("abort-session", "session.abort", { sessionId: "session:target" }),
+			);
+			expect(sessionAbort).toMatchObject({
+				schemaVersion: "rag-ime.pi-session-abort-receipt.v1",
+				sessionId: "session:target",
+				turnId: "turn:1",
+				lifecycle: { schemaVersion: "pi.agent-abort-receipt.v1", drained: true, idle: true },
+			});
+			expect(target.abort).toHaveBeenCalledTimes(2);
 			expect(target.finishRoomCancel).toHaveBeenCalledWith("root:1", 4);
 		} finally {
 			await host.dispose();

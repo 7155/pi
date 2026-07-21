@@ -41,18 +41,25 @@ describe("PiDebugContextRecorder", () => {
 
 	it("captures the final local request boundary while omitting credentials and binary bodies", () => {
 		let activeTurn = { turnId: "turn-1", clientMessageId: "client-1" };
+		let activeTools = ["read"];
 		const recorder = new PiDebugContextRecorder("session-1", () => activeTurn);
 		const handlers = new Map<string, DebugHandler>();
 		const extension = recorder.extension();
 		extension({
 			on: (name: string, handler: DebugHandler) => handlers.set(name, handler),
-			getActiveTools: () => ["read"],
+			getActiveTools: () => activeTools,
 			getAllTools: () => [
 				{
 					name: "read",
 					description: "Read a file",
 					parameters: { type: "object", properties: { path: { type: "string" } } },
 					promptGuidelines: ["Use an absolute path"],
+				},
+				{
+					name: "write",
+					description: "Write a file",
+					parameters: { type: "object", properties: { path: { type: "string" } } },
+					promptGuidelines: ["Write only after approval"],
 				},
 			],
 		} as never);
@@ -133,6 +140,7 @@ describe("PiDebugContextRecorder", () => {
 				{ role: "toolResult", content: "tool evidence" },
 			],
 		});
+		activeTools = ["read", "write"];
 		handlers.get("before_provider_request")?.({ payload: { model: "gpt-test", input: "follow-up" } });
 		handlers.get("tool_execution_start")?.({ toolCallId: "tool-3", toolName: "read", args: { path: "c.ts" } });
 		handlers.get("tool_execution_end")?.({
@@ -156,8 +164,9 @@ describe("PiDebugContextRecorder", () => {
 			clientMessageId: "client-1",
 			prompt: "raw user prompt",
 			systemPrompt: "assembled system prompt",
-			activeTools: ["read"],
+			activeTools: ["read", "write"],
 		});
+		expect(captured?.toolSchemas.map((tool) => tool.name)).toEqual(["read", "write"]);
 		expect(captured?.contextWindows[0]?.messages).toEqual([
 			{ role: "user", content: "final context" },
 			{ role: "assistant", content: [{ type: "reasoning", omitted: true }] },

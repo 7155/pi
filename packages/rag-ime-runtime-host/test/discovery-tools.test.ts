@@ -9,6 +9,7 @@ import {
 } from "@earendil-works/pi-coding-agent";
 import { describe, expect, it } from "vitest";
 import {
+	type BackendToolRouteEntry,
 	backendToolRouteEntry,
 	createDiscoveryToolsExtension,
 	diffSkillCatalog,
@@ -23,7 +24,7 @@ import {
 	TOOL_LOAD_TOOL_NAME,
 	TOOL_SEARCH_TOOL_NAME,
 } from "../src/runtime-tool-names.ts";
-import { BackendToolRegistry } from "../src/tool-bridge.ts";
+import { type BackendToolManifest, BackendToolRegistry } from "../src/tool-bridge.ts";
 
 function skill(options: {
 	name: string;
@@ -106,6 +107,37 @@ describe("runtime discovery tools", () => {
 			],
 		});
 		expect(JSON.stringify(result)).not.toContain("Compatibility-only description");
+	});
+
+	it("treats notFor as a veto instead of a positive search hit", () => {
+		const tools = [
+			{
+				name: "agent_plan",
+				description: "Maintain the Agent execution checklist.",
+				parameters: { type: "object", properties: {} },
+				when: ["复杂任务需要跨回合维护执行步骤"],
+				notFor: ["修改用户每日计划或简单单步任务"],
+				input: "Agent 清单项",
+				output: "Agent 执行清单",
+				does: "维护 Session 内执行清单。",
+			},
+			{
+				name: "ime_planning",
+				description: "Read and update the user's daily plan.",
+				parameters: { type: "object", properties: {} },
+				when: ["用户要查看每日计划或更新真实任务状态"],
+				notFor: ["维护 Agent 自己的执行清单"],
+				input: "日期与计划动作",
+				output: "用户每日计划",
+				does: "读取并受控更新用户每日规划。",
+			},
+		] as BackendToolManifest[];
+
+		const result = searchBackendTools(tools, { query: "用户每日计划" }, "revision") as {
+			items: BackendToolRouteEntry[];
+		};
+
+		expect(result.items.map((item) => item.name)).toEqual(["ime_planning"]);
 	});
 
 	it("loads a managed Skill by exact name and strips its frontmatter", async () => {

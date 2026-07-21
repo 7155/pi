@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { ProviderContextJournal } from "../src/provider-context-journal.ts";
+import { createProviderContextJournalExtension, ProviderContextJournal } from "../src/provider-context-journal.ts";
 import {
 	decodeRuntimePrompt,
 	formatLocalTimestamp,
@@ -37,16 +37,16 @@ describe("runtime context envelope", () => {
 describe("provider context journal", () => {
 	it("keeps the previous provider prompt as an exact prefix in one epoch", () => {
 		const journal = new ProviderContextJournal();
-		const first = journal.project(
-			"基础角色提示词",
-			{ roomContext: "Room 冻结任务", sessionContext: "第一轮相关记忆", transientContext: "" },
-			new Date("2026-07-18T15:30:45.000Z"),
-		);
-		const second = journal.project(
-			first,
-			{ roomContext: "Room 冻结任务", sessionContext: "第二轮相关记忆", transientContext: "本轮工具证据" },
-			new Date("2026-07-18T15:31:46.000Z"),
-		);
+		const first = journal.project("基础角色提示词", {
+			roomContext: "Room 冻结任务",
+			sessionContext: "第一轮相关记忆",
+			transientContext: "",
+		});
+		const second = journal.project(first, {
+			roomContext: "Room 冻结任务",
+			sessionContext: "第二轮相关记忆",
+			transientContext: "本轮工具证据",
+		});
 
 		expect(second.startsWith(first)).toBe(true);
 		expect(second).toContain("第一轮相关记忆");
@@ -58,38 +58,48 @@ describe("provider context journal", () => {
 		expect(journal.snapshot().entryCount).toBe(4);
 	});
 
-	it("deduplicates identical memory and does not rewrite its timestamp", () => {
+	it("deduplicates identical memory without adding volatile provider metadata", () => {
 		const journal = new ProviderContextJournal();
-		const first = journal.project(
-			"基础角色提示词",
-			{ sessionContext: "同一份记忆", transientContext: "" },
-			new Date("2026-07-18T15:30:45.000Z"),
-		);
-		const second = journal.project(
-			first,
-			{ sessionContext: "同一份记忆", transientContext: "" },
-			new Date("2026-07-18T15:31:46.000Z"),
-		);
+		const first = journal.project("基础角色提示词", { sessionContext: "同一份记忆", transientContext: "" });
+		const second = journal.project(first, { sessionContext: "同一份记忆", transientContext: "" });
 
 		expect(second).toBe(first);
-		expect(second).toContain(":30:45");
-		expect(second).not.toContain(":31:46");
+		expect(second).not.toContain("observed_at");
+		expect(second).not.toContain("current_time");
 		expect(journal.snapshot().entryCount).toBe(1);
+	});
+
+	it("projects Room-only context through the before-agent-start hook", async () => {
+		const handlers = new Map<string, (event: { systemPrompt: string }) => unknown>();
+		const extension = createProviderContextJournalExtension(new ProviderContextJournal(), () => ({
+			roomContext: "Room 当前责任与验收",
+			sessionContext: "",
+			transientContext: "",
+		}));
+		extension({
+			on: (event: string, handler: (value: { systemPrompt: string }) => unknown) => handlers.set(event, handler),
+		} as never);
+
+		const result = (await handlers.get("before_agent_start")?.({ systemPrompt: "基础角色提示词" })) as
+			| { systemPrompt?: string }
+			| undefined;
+
+		expect(result?.systemPrompt).toContain('type="room_context"');
+		expect(result?.systemPrompt).toContain("Room 当前责任与验收");
 	});
 
 	it("starts a recorded new epoch only after compaction", () => {
 		const journal = new ProviderContextJournal();
-		const before = journal.project(
-			"基础角色提示词",
-			{ roomContext: "Room 冻结任务", sessionContext: "压缩前记忆", transientContext: "旧工具证据" },
-			new Date("2026-07-18T15:30:45.000Z"),
-		);
-		const after = journal.beginEpoch(
-			"compaction",
-			before,
-			{ roomContext: "Room 冻结任务", sessionContext: "压缩后任务记忆", transientContext: "" },
-			new Date("2026-07-18T15:31:46.000Z"),
-		);
+		const before = journal.project("基础角色提示词", {
+			roomContext: "Room 冻结任务",
+			sessionContext: "压缩前记忆",
+			transientContext: "旧工具证据",
+		});
+		const after = journal.beginEpoch("compaction", before, {
+			roomContext: "Room 冻结任务",
+			sessionContext: "压缩后任务记忆",
+			transientContext: "",
+		});
 
 		expect(after).not.toContain("压缩前记忆");
 		expect(after).not.toContain("旧工具证据");
@@ -100,5 +110,39 @@ describe("provider context journal", () => {
 			epochReason: "compaction",
 			entryCount: 2,
 		});
+	});
+
+	it("accepts only the exact next product-owned epoch", () => {
+		const journal = new ProviderContextJournal(4, "task_switch");
+		const next = journal.beginEpoch(
+			"compaction",
+			"基础角色提示词",
+			{
+				roomContext: "压缩恢复包",
+				sessionContext: "压缩后记忆",
+				transientContext: "",
+			},
+			5,
+		);
+
+		expect(next).toContain("压缩恢复包");
+		expect(journal.snapshot().epoch).toBe(5);
+		expect(() =>
+			journal.beginEpoch(
+				"compaction",
+				next,
+				{ roomContext: "重复恢复包", sessionContext: "重复记忆", transientContext: "" },
+				5,
+			),
+		).toThrow("stale or non-monotonic");
+		expect(() =>
+			journal.beginEpoch(
+				"compaction",
+				next,
+				{ roomContext: "跳号恢复包", sessionContext: "跳号记忆", transientContext: "" },
+				7,
+			),
+		).toThrow("stale or non-monotonic");
+		expect(journal.snapshot().epoch).toBe(5);
 	});
 });
