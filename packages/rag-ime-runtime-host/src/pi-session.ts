@@ -16,7 +16,12 @@ import {
 	type Theme,
 } from "@earendil-works/pi-coding-agent";
 import { PiDebugContextRecorder } from "./debug-context.ts";
-import { createDiscoveryToolsExtension, diffSkillCatalog, runtimeSkillCatalogRevision } from "./discovery-tools.ts";
+import {
+	createDiscoveryToolsExtension,
+	diffSkillCatalog,
+	loadSkill,
+	runtimeSkillCatalogRevision,
+} from "./discovery-tools.ts";
 import { createLifecycleHookController } from "./lifecycle-hooks.ts";
 import { PROTOCOL_VERSION, type RuntimeEventEnvelope, RuntimeProtocolError } from "./protocol.ts";
 import { TOOL_LOAD_TOOL_NAME } from "./runtime-tool-names.ts";
@@ -56,6 +61,7 @@ export interface PiSessionOpenOptions {
 	toolGatewayUrl?: string;
 	toolGatewayToken?: string;
 	systemPrompt?: string;
+	roomSkillPolicy?: unknown;
 	noContextFiles?: boolean;
 	emitEvent(event: RuntimeEventEnvelope): void;
 }
@@ -85,6 +91,14 @@ export interface PiForkRuntimeProfile {
 	noContextFiles: boolean;
 	piSkillsEnabled: boolean;
 	codexSkillsEnabled: boolean;
+}
+
+export interface RoomSkillLoadReceipt {
+	schemaVersion: "rag-ime.skill-load.v1";
+	name: string;
+	catalogRevision: string;
+	contentRevision: string;
+	loadReason: "stage_required";
 }
 
 const RAG_USER_QUERY_PATTERN = /<rag-ime-user-query>\s*([\s\S]*?)\s*<\/rag-ime-user-query>/i;
@@ -141,6 +155,17 @@ function objectRecord(value: unknown): Record<string, unknown> | undefined {
 	return typeof value === "object" && value !== null && !Array.isArray(value)
 		? (value as Record<string, unknown>)
 		: undefined;
+}
+
+function requiredRoomSkill(value: unknown): { skillId: string; skillHash: string } | undefined {
+	if (value === undefined) return undefined;
+	const policy = objectRecord(value);
+	const skillId = typeof policy?.skillId === "string" ? policy.skillId.trim() : "";
+	const skillHash = typeof policy?.skillHash === "string" ? policy.skillHash.trim().toLowerCase() : "";
+	if (policy?.selection !== "required" || !skillId || !/^[a-f0-9]{64}$/u.test(skillHash)) {
+		throw new RuntimeProtocolError("INVALID_PARAMS", "roomSkillPolicy must pin one exact required Skill revision");
+	}
+	return { skillId, skillHash };
 }
 
 /** Restore only schemas explicitly disclosed by tool_load on the active branch. */
@@ -323,6 +348,7 @@ export class PiProductSession implements PooledSession {
 	readonly externalSessionId: string;
 	readonly cwd: string;
 	readonly toolRegistry: BackendToolRegistry;
+	readonly roomSkillLoad: RoomSkillLoadReceipt | undefined;
 	readonly noContextFiles: boolean;
 	readonly piSkillsEnabled: boolean;
 	readonly codexSkillsEnabled: boolean;
@@ -359,6 +385,7 @@ export class PiProductSession implements PooledSession {
 		resourceLoader: DefaultResourceLoader,
 		settingsManager: SettingsManager,
 		debugContextRecorder: PiDebugContextRecorder,
+		roomSkillLoad: RoomSkillLoadReceipt | undefined,
 	) {
 		this.externalSessionId = options.externalSessionId;
 		this.cwd = options.cwd;
@@ -367,6 +394,7 @@ export class PiProductSession implements PooledSession {
 		this.codexSkillsEnabled = options.codexSkillsEnabled ?? false;
 		this.session = session;
 		this.toolRegistry = registry;
+		this.roomSkillLoad = roomSkillLoad;
 		this.resourceLoader = resourceLoader;
 		this.settingsManager = settingsManager;
 		this.debugContextRecorder = debugContextRecorder;
@@ -414,6 +442,7 @@ export class PiProductSession implements PooledSession {
 			...(options.codexSkillsEnabled ? options.codexSkillPaths : []),
 		];
 		const lifecycleHooks = createLifecycleHookController({ bridge: backendBridge });
+		let requiredSkillPrompt = "";
 		resourceLoader = new DefaultResourceLoader({
 			cwd: options.cwd,
 			agentDir: options.agentDir,
@@ -455,8 +484,33 @@ export class PiProductSession implements PooledSession {
 			noExtensions: true,
 			noContextFiles: options.noContextFiles ?? false,
 			systemPrompt: options.systemPrompt,
+			systemPromptOverride: (base) => [base?.trim(), requiredSkillPrompt].filter(Boolean).join("\n\n") || undefined,
 		});
 		await resourceLoader.reload();
+		let roomSkillLoad: RoomSkillLoadReceipt | undefined;
+		const requiredSkill = requiredRoomSkill(options.roomSkillPolicy);
+		if (requiredSkill) {
+			const loaded = await loadSkill(resourceLoader.getSkills().skills, { name: requiredSkill.skillId });
+			const contentRevision = String(loaded.details.contentRevision ?? "");
+			const catalogRevision = String(loaded.details.catalogRevision ?? "");
+			if (contentRevision !== requiredSkill.skillHash) {
+				throw new RuntimeProtocolError(
+					"SKILL_REVISION_MISMATCH",
+					`Required Room Skill revision changed: ${requiredSkill.skillId}`,
+				);
+			}
+			requiredSkillPrompt = loaded.text;
+			roomSkillLoad = {
+				schemaVersion: "rag-ime.skill-load.v1",
+				name: requiredSkill.skillId,
+				catalogRevision,
+				contentRevision,
+				loadReason: "stage_required",
+			};
+			// Rebuild only the resource projection so the exact loaded body becomes
+			// part of the managed system prompt before AgentSession is created.
+			await resourceLoader.reload();
+		}
 		let model: Model<Api> | undefined;
 		if (options.provider || options.modelId) {
 			if (!options.provider || !options.modelId) {
@@ -492,6 +546,7 @@ export class PiProductSession implements PooledSession {
 			resourceLoader,
 			settingsManager,
 			debugContextRecorder,
+			roomSkillLoad,
 		);
 		await created.session.bindExtensions({
 			mode: "rpc",
@@ -893,6 +948,7 @@ export class PiProductSession implements PooledSession {
 			skillCatalogRevision: runtimeSkillCatalogRevision(this.resourceLoader.getSkills().skills),
 			piSkillsEnabled: this.piSkillsEnabled,
 			codexSkillsEnabled: this.codexSkillsEnabled,
+			roomSkillLoad: this.roomSkillLoad,
 			messages: this.session.messages,
 			entries: this.session.sessionManager.getEntries(),
 			leafId: this.session.sessionManager.getLeafId(),

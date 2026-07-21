@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -24,6 +25,87 @@ function manifest(risk: string, requireQuery = false) {
 }
 
 describe("PiProductSession catalog updates", () => {
+	it("loads one pinned Room Skill body before the Agent starts and returns its receipt", async () => {
+		const root = await mkdtemp(join(tmpdir(), "pi-runtime-required-room-skill-"));
+		const agentDir = join(root, "agent");
+		const sessionDir = join(root, "sessions");
+		const activePluginDir = join(root, "plugins", "active");
+		const skillDir = join(root, "product-skills", "room-structured-handoff");
+		const body = "# Structured Handoff\n\nCarry the exact remaining work and evidence to the next owner.";
+		const skillHash = createHash("sha256").update(body).digest("hex");
+		await Promise.all([
+			mkdir(agentDir, { recursive: true }),
+			mkdir(sessionDir, { recursive: true }),
+			mkdir(activePluginDir, { recursive: true }),
+			mkdir(skillDir, { recursive: true }),
+		]);
+		await writeFile(
+			join(skillDir, "SKILL.md"),
+			[
+				"---",
+				"name: room-structured-handoff",
+				"description: Hand off bounded work.",
+				"when:",
+				"  - another owner must continue",
+				"notFor:",
+				"  - final closure with no next owner",
+				"input: remaining work and evidence",
+				"output: an addressed handoff package",
+				"does: transfer exact ownership and next action",
+				"---",
+				"",
+				body,
+			].join("\n"),
+		);
+		const modelRuntime = await ModelRuntime.create({
+			authPath: join(root, "auth.json"),
+			modelsPath: null,
+			allowModelNetwork: false,
+		});
+		const productSession = await PiProductSession.create({
+			externalSessionId: "required-room-skill-test",
+			cwd: root,
+			sessionDir,
+			agentDir,
+			activePluginDir,
+			skillPaths: [skillDir],
+			piSkillPaths: [],
+			codexSkillPaths: [],
+			modelRuntime,
+			toolManifest: [],
+			systemPrompt: "stable managed prompt",
+			roomSkillPolicy: {
+				selection: "required",
+				skillId: "room-structured-handoff",
+				skillHash,
+			},
+			noContextFiles: true,
+			emitEvent: () => undefined,
+		});
+
+		try {
+			expect(productSession.roomSkillLoad).toEqual({
+				schemaVersion: "rag-ime.skill-load.v1",
+				name: "room-structured-handoff",
+				catalogRevision: expect.stringMatching(/^[a-f0-9]{64}$/u),
+				contentRevision: skillHash,
+				loadReason: "stage_required",
+			});
+			const internal = productSession as unknown as { session: { systemPrompt: string } };
+			expect(internal.session.systemPrompt).toContain("stable managed prompt");
+			expect(internal.session.systemPrompt).toContain(
+				`<loaded_skill name="room-structured-handoff" revision="sha256:${skillHash}">`,
+			);
+			expect(internal.session.systemPrompt).toContain(body);
+			expect(internal.session.systemPrompt).not.toContain("description: Hand off bounded work.");
+			expect(internal.session.systemPrompt.match(/<loaded_skill /gu)).toHaveLength(1);
+			expect(productSession.snapshot()).toMatchObject({ roomSkillLoad: productSession.roomSkillLoad });
+		} finally {
+			productSession.dispose();
+			await rm(root, { recursive: true, force: true });
+		}
+	});
+
 	it("loads product Skills always and Pi/Codex Skills only through their independent settings", async () => {
 		const root = await mkdtemp(join(tmpdir(), "pi-runtime-product-skills-"));
 		const agentDir = join(root, "agent");

@@ -418,11 +418,16 @@ export class RagImeRuntimeHost {
 						toolGatewayUrl: this.options.toolGatewayUrl,
 						toolGatewayToken: this.options.toolGatewayToken,
 						systemPrompt: optionalString(params, "systemPrompt", 64_000),
+						roomSkillPolicy: params.roomSkillPolicy,
 						noContextFiles: optionalBoolean(params, "noContextFiles"),
 						emitEvent: this.options.emitEvent,
 					}),
 				);
-				return { snapshot: opened.session.snapshot(), evictedSessionId: opened.evictedSessionId };
+				return {
+					snapshot: opened.session.snapshot(),
+					evictedSessionId: opened.evictedSessionId,
+					roomSkillLoad: opened.session.roomSkillLoad,
+				};
 			}
 			case "session.snapshot":
 				return this.session(params).snapshot();
