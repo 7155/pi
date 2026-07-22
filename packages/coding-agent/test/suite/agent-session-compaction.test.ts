@@ -164,6 +164,44 @@ describe("AgentSession compaction characterization", () => {
 		expect(providerSystemPrompt).toContain("refreshed after compaction");
 	});
 
+	it("emits the newly appended compaction when consecutive summaries are identical", async () => {
+		const emittedEntryIds: string[] = [];
+		const harness = await createHarness({
+			settings: { compaction: { keepRecentTokens: 1 } },
+			extensionFactories: [
+				(pi) => {
+					pi.on("session_before_compact", async (event) => ({
+						compaction: {
+							summary: "stable recovery summary",
+							firstKeptEntryId: event.preparation.firstKeptEntryId,
+							tokensBefore: event.preparation.tokensBefore,
+							details: {},
+						},
+					}));
+					pi.on("session_compact", async (event) => {
+						emittedEntryIds.push(event.compactionEntry.id);
+					});
+				},
+			],
+		});
+		harnesses.push(harness);
+
+		await harness.session.prompt("first turn");
+		await harness.session.prompt("second turn");
+		await harness.session.compact();
+		await harness.session.prompt("third turn");
+		await harness.session.prompt("fourth turn");
+		await harness.session.compact();
+
+		const storedEntryIds = harness.sessionManager
+			.getEntries()
+			.filter((entry) => entry.type === "compaction")
+			.map((entry) => entry.id);
+		expect(storedEntryIds).toHaveLength(2);
+		expect(emittedEntryIds).toEqual(storedEntryIds);
+		expect(new Set(emittedEntryIds).size).toBe(2);
+	});
+
 	it("throws when compacting without a model", async () => {
 		const harness = await createHarness();
 		harnesses.push(harness);
@@ -235,6 +273,36 @@ describe("AgentSession compaction characterization", () => {
 		};
 		await harness.session.agent.prompt("continue after automatic compaction");
 		expect(providerSystemPrompt).toContain("auto refresh");
+	});
+
+	it("emits the newly appended entry for consecutive automatic compactions with the same summary", async () => {
+		const emittedEntryIds: string[] = [];
+		const harness = await createHarness({
+			withConfiguredAuth: false,
+			extensionFactories: [
+				(pi) => {
+					pi.on("session_compact", async (event) => {
+						emittedEntryIds.push(event.compactionEntry.id);
+					});
+				},
+			],
+		});
+		harnesses.push(harness);
+		useSummaryStreamFn(harness, "stable automatic recovery summary");
+		const sessionInternals = harness.session as unknown as SessionWithCompactionInternals;
+
+		seedCompactableSession(harness);
+		await sessionInternals._runAutoCompaction("threshold", false);
+		seedCompactableSession(harness);
+		await sessionInternals._runAutoCompaction("threshold", false);
+
+		const storedEntryIds = harness.sessionManager
+			.getEntries()
+			.filter((entry) => entry.type === "compaction")
+			.map((entry) => entry.id);
+		expect(storedEntryIds).toHaveLength(2);
+		expect(emittedEntryIds).toEqual(storedEntryIds);
+		expect(new Set(emittedEntryIds).size).toBe(2);
 	});
 
 	it("cancels in-progress manual compaction when abortCompaction is called", async () => {
