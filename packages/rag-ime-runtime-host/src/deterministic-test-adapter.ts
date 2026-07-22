@@ -19,15 +19,25 @@ function activeToolNames(context: Context): Set<string> {
 	return new Set((context.tools ?? []).map((tool) => tool.name));
 }
 
-function currentRoomTask(context: Context): Record<string, unknown> | undefined {
-	const match = (context.systemPrompt ?? "").match(/<room-fact kind="dispatch_state">([\s\S]*?)<\/room-fact>/u);
-	if (!match) return undefined;
-	try {
-		const value = JSON.parse(match[1]) as unknown;
-		return typeof value === "object" && value !== null ? (value as Record<string, unknown>) : undefined;
-	} catch {
-		return undefined;
+function stringsIn(value: unknown): string[] {
+	if (typeof value === "string") return [value];
+	if (Array.isArray(value)) return value.flatMap(stringsIn);
+	if (typeof value === "object" && value !== null) {
+		return Object.values(value).flatMap(stringsIn);
 	}
+	return [];
+}
+
+function currentRoomTask(context: Context): Record<string, unknown> | undefined {
+	for (const source of [context.systemPrompt ?? "", ...stringsIn(context.messages)]) {
+		const match = source.match(/<room-fact kind="dispatch_state">([\s\S]*?)<\/room-fact>/u);
+		if (!match) continue;
+		try {
+			const value = JSON.parse(match[1]) as unknown;
+			if (typeof value === "object" && value !== null) return value as Record<string, unknown>;
+		} catch {}
+	}
+	return undefined;
 }
 
 function currentEpochMarker(task: Record<string, unknown>): string {

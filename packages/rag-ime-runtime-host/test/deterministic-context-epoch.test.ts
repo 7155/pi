@@ -23,6 +23,14 @@ function context(tools: string[], history = ""): Context {
 	};
 }
 
+function messageContext(tools: string[]): Context {
+	return {
+		systemPrompt: "stable system prompt",
+		messages: [{ role: "user", content: taskPrompt, timestamp: 1 }] as Context["messages"],
+		tools: tools.map(tool),
+	};
+}
+
 function calls(response: ReturnType<typeof contextEpochCanaryResponse>) {
 	return response.content.filter((item) => item.type === "toolCall");
 }
@@ -58,5 +66,11 @@ describe("deterministic context epoch Provider", () => {
 				requirementCoverage: ["criterion:1", "criterion:2", "criterion:3"],
 			},
 		});
+	});
+
+	it("finds provider-only Room facts outside the stable system prompt", () => {
+		expect(calls(contextEpochCanaryResponse(messageContext(["tool_load"])))).toEqual([
+			expect.objectContaining({ name: "tool_load", arguments: { name: "workspace_read" } }),
+		]);
 	});
 });
