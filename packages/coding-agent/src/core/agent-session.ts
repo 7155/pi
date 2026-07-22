@@ -2325,8 +2325,12 @@ export class AgentSession {
 	 */
 	private async _runAutoCompaction(reason: "overflow" | "threshold", willRetry: boolean): Promise<boolean> {
 		const settings = this.settingsManager.getCompactionSettings();
+		const operationScope = this._beginOperationScope("auto_compaction");
+		this._autoCompactionAbortController = new AbortController();
+		const unregisterAutoCompaction = this._registerCancelOperation("auto-compaction", "auto_compaction", () =>
+			this._autoCompactionAbortController?.abort(),
+		);
 		let started = false;
-		let unregisterAutoCompaction = () => {};
 
 		try {
 			if (!this.model) {
@@ -2354,10 +2358,6 @@ export class AgentSession {
 			}
 
 			this._emit({ type: "compaction_start", reason });
-			this._autoCompactionAbortController = new AbortController();
-			unregisterAutoCompaction = this._registerCancelOperation("auto-compaction", "auto_compaction", () =>
-				this._autoCompactionAbortController?.abort(),
-			);
 			started = true;
 
 			let extensionCompaction: CompactionResult | undefined;
@@ -2497,6 +2497,7 @@ export class AgentSession {
 		} finally {
 			unregisterAutoCompaction();
 			this._autoCompactionAbortController = undefined;
+			this._finishOperationScope(operationScope.scope, operationScope.owned);
 		}
 	}
 

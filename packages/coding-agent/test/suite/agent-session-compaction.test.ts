@@ -294,6 +294,50 @@ describe("AgentSession compaction characterization", () => {
 		});
 	});
 
+	it("cancels pre-prompt auto-compaction through the total run scope", async () => {
+		let markStarted = () => {};
+		const started = new Promise<void>((resolve) => {
+			markStarted = resolve;
+		});
+		const harness = await createHarness({
+			settings: { compaction: { keepRecentTokens: 1 } },
+			extensionFactories: [
+				(pi) => {
+					pi.on("session_before_compact", async (event) => {
+						markStarted();
+						return await new Promise<{ cancel: true }>((resolve) => {
+							if (event.signal.aborted) resolve({ cancel: true });
+							else event.signal.addEventListener("abort", () => resolve({ cancel: true }), { once: true });
+						});
+					});
+				},
+			],
+		});
+		harnesses.push(harness);
+		seedCompactableSession(harness);
+		const sessionInternals = harness.session as unknown as SessionWithCompactionInternals;
+
+		const compaction = sessionInternals._runAutoCompaction("threshold", false);
+		await started;
+		const [compacted, abortReceipt] = await Promise.all([compaction, harness.session.abort()]);
+
+		expect(compacted).toBe(false);
+		expect(abortReceipt).toMatchObject({
+			schemaVersion: "pi.agent-abort-receipt.v1",
+			cancelledOperationIds: ["auto-compaction"],
+			failedOperationIds: [],
+			pendingOperations: [],
+			drained: true,
+			idle: true,
+		});
+		expect(abortReceipt.operations.map((operation) => operation.kind)).toEqual(["auto_compaction"]);
+		expect(harness.session.getRuntimeLifecycleSnapshot().lastSettledReceipt).toMatchObject({
+			aborted: true,
+			pendingOperations: 0,
+			operationCounts: { auto_compaction: 1 },
+		});
+	});
+
 	it("resumes after threshold compaction when only agent-level queued messages exist", async () => {
 		vi.useFakeTimers();
 		const harness = await createHarness({

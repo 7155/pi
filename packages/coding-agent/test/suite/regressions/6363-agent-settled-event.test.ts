@@ -66,6 +66,42 @@ describe("regression #6363: agent settled event and idle waiting", () => {
 		expect(publicEvents).toEqual(["agent_settled"]);
 	});
 
+	it("cancels an in-flight retry delay through the total run scope", async () => {
+		let markRetryStarted = () => {};
+		const retryStarted = new Promise<void>((resolve) => {
+			markRetryStarted = resolve;
+		});
+		const harness = await createHarness({
+			settings: { retry: { enabled: true, maxRetries: 3, baseDelayMs: 60_000 } },
+		});
+		harnesses.push(harness);
+		harness.session.subscribe((event) => {
+			if (event.type === "auto_retry_start") markRetryStarted();
+		});
+		harness.setResponses([fauxAssistantMessage("", { stopReason: "error", errorMessage: "overloaded_error" })]);
+
+		const prompt = harness.session.prompt("test");
+		await retryStarted;
+		const [abortReceipt] = await Promise.all([harness.session.abort(), prompt]);
+
+		expect(abortReceipt).toMatchObject({
+			schemaVersion: "pi.agent-abort-receipt.v1",
+			cancelledOperationIds: expect.arrayContaining(["provider", "retry-sleep"]),
+			failedOperationIds: [],
+			pendingOperations: [],
+			drained: true,
+			idle: true,
+		});
+		expect(abortReceipt.operations.map((operation) => operation.kind)).toEqual(
+			expect.arrayContaining(["provider", "retry_sleep"]),
+		);
+		expect(harness.eventsOfType("agent_settled")[0]?.receipt).toMatchObject({
+			aborted: true,
+			pendingOperations: 0,
+			operationCounts: { provider: 1, retry_sleep: 1 },
+		});
+	});
+
 	it("settles only after follow-ups queued by agent_end handlers run", async () => {
 		let queuedFollowUp = false;
 		const settledIdleStates: boolean[] = [];
