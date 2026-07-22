@@ -1,4 +1,4 @@
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
@@ -277,6 +277,65 @@ describe("PiDebugContextRecorder", () => {
 				prompt: "persist me",
 			});
 			expect(restored.list()).toHaveLength(1);
+		} finally {
+			rmSync(directory, { recursive: true, force: true });
+		}
+	});
+
+	it("returns a structurally valid record when the complete inspection exceeds the per-value clone cap", () => {
+		const activeTurn = { turnId: "turn-large" };
+		const recorder = new PiDebugContextRecorder("session-large", () => activeTurn);
+		const handlers = new Map<string, DebugHandler>();
+		recorder.extension()({
+			on: (name: string, handler: DebugHandler) => handlers.set(name, handler),
+			getActiveTools: () => [],
+			getAllTools: () => [],
+		} as never);
+		handlers.get("before_agent_start")?.({ prompt: "large", systemPrompt: "system", systemPromptOptions: {} }, {});
+		const content = "x".repeat(800_000);
+		for (let index = 0; index < 4; index += 1) {
+			handlers.get("context")?.({ messages: [{ role: "user", content, index }] });
+			handlers.get("provider_context_inspection")?.({
+				context: { systemPrompt: "system", messages: [{ role: "user", content, index }], tools: [] },
+			});
+		}
+
+		const captured = recorder.get();
+		expect(JSON.stringify(captured).length).toBeGreaterThan(6_000_000);
+		expect(captured?.schemaVersion).toBe("rag-ime.context-inspection.v2");
+		expect(captured?.modelCalls).toHaveLength(4);
+		expect(captured?.modelCalls.at(-1)?.contextDelta).toBeDefined();
+	});
+
+	it("normalizes incomplete legacy snapshots before exposing or mutating them", async () => {
+		const directory = mkdtempSync(join(tmpdir(), "pi-debug-context-legacy-"));
+		try {
+			const sessionDirectory = join(directory, "session-legacy");
+			mkdirSync(sessionDirectory, { recursive: true });
+			writeFileSync(
+				join(sessionDirectory, "1-turn-legacy.json"),
+				JSON.stringify({
+					schemaVersion: "rag-ime.pi-debug-context.v1",
+					sessionId: "session-legacy",
+					turnId: "turn-legacy",
+					capturedAtMs: 1,
+					prompt: "legacy",
+					systemPrompt: "system",
+				}),
+			);
+			const restored = new PiDebugContextRecorder("session-legacy", () => undefined, { directory });
+			await restored.flush();
+
+			expect(restored.get("turn-legacy")).toMatchObject({
+				schemaVersion: "rag-ime.context-inspection.v2",
+				turnId: "turn-legacy",
+				modelCalls: [],
+				contributionRefs: [],
+				toolExecutions: [],
+			});
+			expect(restored.list()).toEqual([
+				expect.objectContaining({ modelCallCount: 0, providerRequestCount: 0, toolCallCount: 0 }),
+			]);
 		} finally {
 			rmSync(directory, { recursive: true, force: true });
 		}

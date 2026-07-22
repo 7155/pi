@@ -443,7 +443,9 @@ export class PiDebugContextRecorder {
 
 	get(turnId?: string): PiDebugContextRecord | undefined {
 		const record = turnId ? this.records.get(turnId) : [...this.records.values()].at(-1);
-		return record ? (cloneForInspection(record) as PiDebugContextRecord) : undefined;
+		// Every field is sanitized when captured. Preserve the record contract here:
+		// cloneForInspection() may replace a large value with a truncation receipt.
+		return record ? structuredClone(record) : undefined;
 	}
 
 	list(): PiDebugContextSummary[] {
@@ -609,7 +611,8 @@ export class PiDebugContextRecorder {
 			for (const file of latest) {
 				try {
 					const parsed = JSON.parse(await readFile(file.path, "utf8")) as unknown;
-					if (isDebugContextRecord(parsed) && parsed.sessionId === this.sessionId) restored.push(parsed);
+					const normalized = normalizeDebugContextRecord(parsed);
+					if (normalized?.sessionId === this.sessionId) restored.push(normalized);
 				} catch {
 					// A damaged snapshot must not hide the remaining usable history.
 				}
@@ -686,16 +689,146 @@ function safePathSegment(value: string): string {
 	return value.replace(/[^A-Za-z0-9._-]+/gu, "_").slice(0, 180) || "unknown";
 }
 
-function isDebugContextRecord(value: unknown): value is PiDebugContextRecord {
-	if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+function normalizeDebugContextRecord(value: unknown): PiDebugContextRecord | undefined {
+	if (!value || typeof value !== "object" || Array.isArray(value)) return undefined;
 	const record = value as Record<string, unknown>;
-	return (
-		(record.schemaVersion === "rag-ime.context-inspection.v2" ||
-			record.schemaVersion === "rag-ime.pi-debug-context.v1") &&
-		typeof record.sessionId === "string" &&
-		typeof record.turnId === "string" &&
-		typeof record.capturedAtMs === "number"
-	);
+	if (
+		(record.schemaVersion !== "rag-ime.context-inspection.v2" &&
+			record.schemaVersion !== "rag-ime.pi-debug-context.v1") ||
+		typeof record.sessionId !== "string" ||
+		typeof record.turnId !== "string" ||
+		typeof record.capturedAtMs !== "number"
+	) {
+		return undefined;
+	}
+
+	const modelCalls = normalizeModelCalls(record.modelCalls, record.capturedAtMs);
+	const toolExecutions = normalizeToolExecutions(record.toolExecutions, record.capturedAtMs);
+	return {
+		schemaVersion: "rag-ime.context-inspection.v2",
+		sessionId: record.sessionId,
+		turnId: record.turnId,
+		clientMessageId: typeof record.clientMessageId === "string" ? record.clientMessageId : "",
+		capturedAtMs: record.capturedAtMs,
+		updatedAtMs: finiteNumber(record.updatedAtMs, record.capturedAtMs),
+		prompt: typeof record.prompt === "string" ? record.prompt : "",
+		systemPrompt: typeof record.systemPrompt === "string" ? record.systemPrompt : "",
+		systemPromptOptions: record.systemPromptOptions ?? {},
+		model: plainRecord(record.model),
+		activeTools: stringArray(record.activeTools),
+		toolSchemas: recordArray(record.toolSchemas),
+		skillCatalog: recordArray(record.skillCatalog),
+		loadedSkillReceipts: recordArray(record.loadedSkillReceipts),
+		contributionRefs: recordArray(record.contributionRefs),
+		contextWindows: recordArray(record.contextWindows) as PiDebugContextRecord["contextWindows"],
+		providerRequests: recordArray(record.providerRequests) as PiDebugContextRecord["providerRequests"],
+		providerRequestReceipts: recordArray(record.providerRequestReceipts) as unknown as PiProviderRequestReceipt[],
+		cacheEvidence: recordArray(record.cacheEvidence) as PiDebugContextRecord["cacheEvidence"],
+		modelCalls,
+		toolExecutions,
+		toolBatches: buildToolBatches(toolExecutions),
+	};
+}
+
+function normalizeModelCalls(value: unknown, capturedAtMs: number): PiDebugModelCall[] {
+	let previousMessages: unknown;
+	let previousIndex: number | undefined;
+	return recordArray(value)
+		.slice(-MAX_CALLS_PER_TURN)
+		.map((call, position) => {
+			const index = finiteNumber(call.index, position + 1);
+			const contextMessages = call.contextMessages ?? [];
+			const fallbackDelta = contextDelta(previousMessages, contextMessages, previousIndex);
+			const contextDeltaRecord = plainRecord(call.contextDelta);
+			const normalized: PiDebugModelCall = {
+				index,
+				runtimeTurnIndex: optionalFiniteNumber(call.runtimeTurnIndex),
+				capturedAtMs: finiteNumber(call.capturedAtMs, capturedAtMs),
+				updatedAtMs: finiteNumber(call.updatedAtMs, capturedAtMs),
+				completedAtMs: optionalFiniteNumber(call.completedAtMs),
+				contextMessages,
+				providerContext: call.providerContext,
+				contextDelta: {
+					baseCallIndex: optionalFiniteNumber(contextDeltaRecord?.baseCallIndex),
+					commonPrefixMessages: finiteNumber(
+						contextDeltaRecord?.commonPrefixMessages,
+						fallbackDelta.commonPrefixMessages,
+					),
+					removedMessageCount: finiteNumber(
+						contextDeltaRecord?.removedMessageCount,
+						fallbackDelta.removedMessageCount,
+					),
+					addedMessageCount: finiteNumber(contextDeltaRecord?.addedMessageCount, fallbackDelta.addedMessageCount),
+					addedMessages: Array.isArray(contextDeltaRecord?.addedMessages)
+						? contextDeltaRecord.addedMessages
+						: fallbackDelta.addedMessages,
+					prefixBytes: finiteNumber(contextDeltaRecord?.prefixBytes, fallbackDelta.prefixBytes),
+					prefixSha256:
+						typeof contextDeltaRecord?.prefixSha256 === "string"
+							? contextDeltaRecord.prefixSha256
+							: fallbackDelta.prefixSha256,
+					currentBytes: finiteNumber(contextDeltaRecord?.currentBytes, fallbackDelta.currentBytes),
+					deltaBytes: finiteNumber(contextDeltaRecord?.deltaBytes, fallbackDelta.deltaBytes),
+					duplicateBytes: finiteNumber(contextDeltaRecord?.duplicateBytes, fallbackDelta.duplicateBytes),
+				},
+				providerExchanges: recordArray(call.providerExchanges) as unknown as PiDebugProviderExchange[],
+				assistantMessage: call.assistantMessage,
+			};
+			previousMessages = contextMessages;
+			previousIndex = index;
+			return normalized;
+		});
+}
+
+function normalizeToolExecutions(value: unknown, capturedAtMs: number): PiDebugToolExecution[] {
+	return recordArray(value)
+		.slice(-MAX_TOOLS_PER_TURN)
+		.filter((tool) => typeof tool.toolCallId === "string" && typeof tool.toolName === "string")
+		.map((tool, position) => ({
+			toolCallId: String(tool.toolCallId),
+			toolName: String(tool.toolName),
+			modelCallIndex: optionalFiniteNumber(tool.modelCallIndex),
+			runtimeTurnIndex: optionalFiniteNumber(tool.runtimeTurnIndex),
+			startedAtMs: finiteNumber(tool.startedAtMs, capturedAtMs),
+			endedAtMs: optionalFiniteNumber(tool.endedAtMs),
+			startSequence: finiteNumber(tool.startSequence, position + 1),
+			endSequence: optionalFiniteNumber(tool.endSequence),
+			args: tool.args,
+			result: tool.result,
+			isError: typeof tool.isError === "boolean" ? tool.isError : undefined,
+			status:
+				tool.status === "running" || tool.status === "failed" || tool.status === "completed"
+					? tool.status
+					: "completed",
+			updates: recordArray(tool.updates)
+				.slice(-MAX_TOOL_UPDATES)
+				.map((update) => ({
+					capturedAtMs: finiteNumber(update.capturedAtMs, capturedAtMs),
+					partialResult: update.partialResult,
+				})),
+		}));
+}
+
+function plainRecord(value: unknown): Record<string, unknown> | undefined {
+	return value && typeof value === "object" && !Array.isArray(value) ? (value as Record<string, unknown>) : undefined;
+}
+
+function recordArray(value: unknown): Array<Record<string, unknown>> {
+	return Array.isArray(value)
+		? value.filter((item): item is Record<string, unknown> => Boolean(plainRecord(item)))
+		: [];
+}
+
+function stringArray(value: unknown): string[] {
+	return Array.isArray(value) ? value.filter((item): item is string => typeof item === "string") : [];
+}
+
+function finiteNumber(value: unknown, fallback: number): number {
+	return typeof value === "number" && Number.isFinite(value) ? value : fallback;
+}
+
+function optionalFiniteNumber(value: unknown): number | undefined {
+	return typeof value === "number" && Number.isFinite(value) ? value : undefined;
 }
 
 export function buildToolBatches(tools: PiDebugToolExecution[]): PiDebugToolBatch[] {

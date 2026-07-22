@@ -1059,7 +1059,9 @@ export class PiProductSession implements PooledSession {
 	debugContext(turnId?: string): Record<string, unknown> {
 		const context = this.debugContextRecorder.get(turnId);
 		const storage = this.debugContextRecorder.storage();
-		const latestCall = context?.modelCalls.at(-1);
+		const modelCalls = Array.isArray(context?.modelCalls) ? context.modelCalls : [];
+		const contributionRefs = Array.isArray(context?.contributionRefs) ? context.contributionRefs : [];
+		const latestCall = modelCalls.at(-1);
 		const pending = this.messageQueue();
 		const contextProjection = latestCall
 			? {
@@ -1068,17 +1070,16 @@ export class PiProductSession implements PooledSession {
 					stablePrefixBytes: latestCall.contextDelta.prefixBytes,
 					dynamicTailMessages: latestCall.contextDelta.addedMessageCount,
 					dynamicTailBytes: latestCall.contextDelta.deltaBytes,
-					sealedMessages: context?.contributionRefs.length ?? 0,
+					sealedMessages: contributionRefs.length,
 					pendingMessages:
 						(Array.isArray(pending.steering) ? pending.steering.length : 0) +
 						(Array.isArray(pending.followUp) ? pending.followUp.length : 0),
 					compactionState: this.latestCompaction?.status ?? "not_started",
 					providerContextJournal: this.providerContextJournal.snapshot(),
-					recoveryState:
-						context?.contributionRefs.some((item) => item.kind === "room-provider-context") === true
-							? "ready"
-							: "not_required",
-					sourceRefs: context?.contributionRefs ?? [],
+					recoveryState: contributionRefs.some((item) => item.kind === "room-provider-context")
+						? "ready"
+						: "not_required",
+					sourceRefs: contributionRefs,
 				}
 			: undefined;
 		return {
