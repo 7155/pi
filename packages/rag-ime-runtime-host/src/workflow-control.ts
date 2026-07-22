@@ -7,7 +7,6 @@ const WORKFLOW_BLOCK_PATTERN = /\n*<rag-ime-context type="workflow_control"[^>]*
 interface WorkflowControlOptions {
 	bridge: BackendToolBridgeOptions;
 	onProjectComplete?(details: Record<string, unknown>): Promise<void>;
-	now?: () => Date;
 }
 
 interface WorkflowSnapshot {
@@ -37,16 +36,6 @@ function optionalNumber(value: unknown): number | undefined {
 	return Number.isFinite(parsed) ? Math.max(0, parsed) : undefined;
 }
 
-function localTimestamp(date: Date): string {
-	const offsetMinutes = -date.getTimezoneOffset();
-	const sign = offsetMinutes >= 0 ? "+" : "-";
-	const absoluteOffset = Math.abs(offsetMinutes);
-	const offsetHours = String(Math.floor(absoluteOffset / 60)).padStart(2, "0");
-	const offsetRemainder = String(absoluteOffset % 60).padStart(2, "0");
-	const local = new Date(date.getTime() + offsetMinutes * 60_000).toISOString().slice(0, 19);
-	return `${local}${sign}${offsetHours}:${offsetRemainder}`;
-}
-
 function publicPlanItems(value: unknown): string[] {
 	if (!Array.isArray(value)) return [];
 	return value.slice(0, 12).flatMap((item, index) => {
@@ -66,15 +55,17 @@ function renderWorkflow(snapshot: WorkflowSnapshot): string {
 	const planStatus = text(plan.status);
 	const goalStatus = text(goal.status);
 	const lines = ["## 当前工作流"];
+	const planItems = publicPlanItems(plan.items);
+	const showPlan = Boolean(planStatus) && (planStatus !== "draft" || planItems.length > 0);
 
-	if (planStatus) {
+	if (showPlan) {
 		lines.push(`### Plan · ${planStatus}`);
 		const title = text(plan.title);
 		if (title) lines.push(title.slice(0, 320));
-		lines.push(...publicPlanItems(plan.items));
+		lines.push(...planItems);
 		lines.push(
-			plan.actApproved === true
-				? "执行边界：计划已批准；写操作仍须通过产品权限与审批。"
+			gate.allowed === true
+				? text(gate.message) || "执行边界：当前工作已授权；写操作仍须通过产品权限与审批。"
 				: "执行边界：计划尚未批准，只能调研、阅读和修改计划，不得执行写操作。",
 		);
 	}
@@ -99,23 +90,16 @@ function renderWorkflow(snapshot: WorkflowSnapshot): string {
 		if (goalStatus === "paused") lines.push("Goal 已暂停，不要自行继续执行。");
 	}
 
-	if (gate.allowed === false) {
+	if (!showPlan || gate.allowed === false) {
 		lines.push(`### Act Gate\n${text(gate.message) || text(gate.reason) || "当前写操作未获批准。"}`);
 	}
 	return lines.join("\n").trim();
 }
 
-function replaceWorkflowBlock(systemPrompt: string, body: string, now: Date): string {
+function replaceWorkflowBlock(systemPrompt: string, body: string): string {
 	const base = systemPrompt.replace(WORKFLOW_BLOCK_PATTERN, "\n").trimEnd();
 	if (!body) return base;
-	return [
-		base,
-		`<rag-ime-context type="workflow_control" current_time="${localTimestamp(now)}">`,
-		body,
-		"</rag-ime-context>",
-	]
-		.filter(Boolean)
-		.join("\n");
+	return [base, '<rag-ime-context type="workflow_control">', body, "</rag-ime-context>"].filter(Boolean).join("\n");
 }
 
 function lastAssistantUsage(messages: readonly unknown[]): { tokenDelta: number } {
@@ -205,11 +189,7 @@ export function createWorkflowControlExtension(options: WorkflowControlOptions):
 				goalActive = goal.configured === true && text(goal.status) === "active";
 				await observeCompletion(snapshot);
 				return {
-					systemPrompt: replaceWorkflowBlock(
-						event.systemPrompt,
-						renderWorkflow(snapshot),
-						(options.now ?? (() => new Date()))(),
-					),
+					systemPrompt: replaceWorkflowBlock(event.systemPrompt, renderWorkflow(snapshot)),
 				};
 			} catch {
 				// Workflow state is advisory in the prompt. The Product gateway

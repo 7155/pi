@@ -58,7 +58,6 @@ describe("workflow control", () => {
 					gatewayUrl: "http://127.0.0.1:8766/api/agent/tool/execute",
 					gatewayToken: "token",
 				},
-				now: () => new Date("2026-07-19T02:00:00.000Z"),
 			}),
 		);
 
@@ -159,5 +158,44 @@ describe("workflow control", () => {
 			messages: [{ role: "assistant", usage: { totalTokens: 500 } }],
 		});
 		expect(fetchMock).toHaveBeenCalledTimes(1);
+	});
+
+	it("renders a fenced Room Dispatch as the work authority instead of an empty draft plan", async () => {
+		const fetchMock = vi.fn(async () => ({
+			ok: true,
+			status: 200,
+			json: async () => ({
+				ok: true,
+				result: {
+					plan: { status: "draft", title: "执行计划", items: [] },
+					goal: { configured: false, status: "cleared" },
+					actGate: {
+						allowed: true,
+						reason: "approved",
+						message: "当前受管 Room Dispatch 已授权执行；写操作仍受原生审批。",
+					},
+				},
+			}),
+		}));
+		vi.stubGlobal("fetch", fetchMock);
+		const handlers = register(
+			createWorkflowControlExtension({
+				bridge: {
+					sessionId: "agent:room",
+					registry: {} as never,
+					gatewayUrl: "http://127.0.0.1:8766/api/agent/tool/execute",
+				},
+			}),
+		);
+
+		const result = (await handlers.get("before_agent_start")?.({
+			prompt: "执行 Room 任务",
+			systemPrompt: "基础提示词",
+		})) as { systemPrompt?: string };
+
+		expect(result.systemPrompt).toContain("当前受管 Room Dispatch 已授权执行");
+		expect(result.systemPrompt).not.toContain("Plan · draft");
+		expect(result.systemPrompt).not.toContain("不得执行写操作");
+		expect(result.systemPrompt).not.toContain("current_time");
 	});
 });

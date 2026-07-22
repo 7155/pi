@@ -23,7 +23,7 @@ export interface LifecycleHookController {
 
 interface LifecycleHookOptions {
 	bridge: BackendToolBridgeOptions;
-	now?: () => Date;
+	isManagedRoom?(): boolean;
 	setTimer?: typeof setTimeout;
 	clearTimer?: typeof clearTimeout;
 	stateDirectory?: string;
@@ -52,16 +52,6 @@ function asRecord(value: unknown): Record<string, unknown> {
 
 function text(value: unknown): string {
 	return typeof value === "string" ? value.trim() : "";
-}
-
-function localTimestamp(date: Date): string {
-	const offsetMinutes = -date.getTimezoneOffset();
-	const sign = offsetMinutes >= 0 ? "+" : "-";
-	const absoluteOffset = Math.abs(offsetMinutes);
-	const local = new Date(date.getTime() + offsetMinutes * 60_000).toISOString().slice(0, 19);
-	return `${local}${sign}${String(Math.floor(absoluteOffset / 60)).padStart(2, "0")}:${String(
-		absoluteOffset % 60,
-	).padStart(2, "0")}`;
 }
 
 function bounded(value: string, maximum: number): string {
@@ -195,15 +185,10 @@ function completionFacts(details: Record<string, unknown>): Array<Record<string,
 	return facts;
 }
 
-function replaceHookBlock(systemPrompt: string, context: string, now: Date): string {
+function replaceHookBlock(systemPrompt: string, context: string): string {
 	const base = systemPrompt.replace(HOOK_BLOCK_PATTERN, "\n").trimEnd();
 	if (!context.trim()) return base;
-	return [
-		base,
-		`<rag-ime-context type="lifecycle_hook" current_time="${localTimestamp(now)}">`,
-		context.trim(),
-		"</rag-ime-context>",
-	]
+	return [base, '<rag-ime-context type="lifecycle_hook">', context.trim(), "</rag-ime-context>"]
 		.filter(Boolean)
 		.join("\n");
 }
@@ -222,6 +207,7 @@ export function createLifecycleHookController(options: LifecycleHookOptions): Li
 	let persistenceQueue: Promise<void> = Promise.resolve();
 	const schedule = options.setTimer ?? setTimeout;
 	const cancel = options.clearTimer ?? clearTimeout;
+	const isManagedRoom = (): boolean => options.isManagedRoom?.() === true;
 
 	async function writePendingState(events: LifecycleEventEnvelope[]): Promise<void> {
 		if (!stateFile) return;
@@ -416,11 +402,18 @@ export function createLifecycleHookController(options: LifecycleHookOptions): Li
 					// block the user's first provider request.
 				}
 			}
+			if (isManagedRoom()) {
+				// Room context epochs own task recovery. Keep lifecycle events auditable,
+				// but never let an old generic suggestion become a second recovery packet.
+				pendingContext = "";
+				const systemPrompt = replaceHookBlock(event.systemPrompt, "");
+				return systemPrompt === event.systemPrompt ? undefined : { systemPrompt };
+			}
 			if (!pendingContext) return;
 			const context = pendingContext;
 			pendingContext = "";
 			return {
-				systemPrompt: replaceHookBlock(event.systemPrompt, context, (options.now ?? (() => new Date()))()),
+				systemPrompt: replaceHookBlock(event.systemPrompt, context),
 			};
 		});
 
@@ -446,15 +439,26 @@ export function createLifecycleHookController(options: LifecycleHookOptions): Li
 
 		pi.on("session_compact", async (event, ctx) => {
 			const summary = redactSensitiveText(event.compactionEntry.summary, 800);
+			const managedRoom = isManagedRoom();
 			try {
 				await send(
 					"compaction",
-					{
-						reason: event.reason,
-						willRetry: event.willRetry,
-						summary,
-						facts: summary ? [{ text: summary, evidence: `pi-compaction:${event.reason}` }] : [],
-					},
+					managedRoom
+						? {
+								reason: event.reason,
+								willRetry: event.willRetry,
+								summaryLength: summary.length,
+								summarySha256: digest(summary),
+								auditOnly: true,
+								facts: [],
+								contextOwner: "room_context_epoch",
+							}
+						: {
+								reason: event.reason,
+								willRetry: event.willRetry,
+								summary,
+								facts: summary ? [{ text: summary, evidence: `pi-compaction:${event.reason}` }] : [],
+							},
 					{
 						reason: event.reason,
 						summarySha256: digest(summary),
@@ -464,11 +468,17 @@ export function createLifecycleHookController(options: LifecycleHookOptions): Li
 			} catch {
 				return undefined;
 			}
+			if (managedRoom) {
+				pendingContext = "";
+				return {
+					systemPrompt: replaceHookBlock(ctx.getSystemPrompt(), ""),
+				};
+			}
 			if (!pendingContext) return undefined;
 			const context = pendingContext;
 			pendingContext = "";
 			return {
-				systemPrompt: replaceHookBlock(ctx.getSystemPrompt(), context, (options.now ?? (() => new Date()))()),
+				systemPrompt: replaceHookBlock(ctx.getSystemPrompt(), context),
 			};
 		});
 

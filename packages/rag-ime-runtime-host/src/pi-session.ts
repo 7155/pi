@@ -491,7 +491,17 @@ export class PiProductSession implements PooledSession {
 			...(options.piSkillsEnabled ? options.piSkillPaths : []),
 			...(options.codexSkillsEnabled ? options.codexSkillPaths : []),
 		];
-		const lifecycleHooks = createLifecycleHookController({ bridge: backendBridge });
+		const lifecycleHooks = createLifecycleHookController({
+			bridge: backendBridge,
+			isManagedRoom: () =>
+				Boolean(
+					productSession?.roomCapability ||
+						productSession?.roomContext.trim() ||
+						productSession?.roomRecoveryContext.trim() ||
+						productSession?.roomSkillLoadReceipt() ||
+						productSession?.roomToolRecoveryReceipt(),
+				),
+		});
 		const initialContextEpoch = Number(options.roomCapability?.contextEpoch ?? 1);
 		const initialContextEpochReason = String(options.roomCapability?.contextEpochReason ?? "session_open");
 		const providerContextJournal = new ProviderContextJournal(initialContextEpoch, initialContextEpochReason);
