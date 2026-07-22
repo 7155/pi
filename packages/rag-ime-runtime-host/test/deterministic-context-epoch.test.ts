@@ -8,12 +8,14 @@ const tool = (name: string): Tool => ({
 	parameters: { type: "object" },
 });
 
-const taskPrompt = `<room-fact kind="dispatch_state">${JSON.stringify({
-	acceptance: {
-		criteria: [{ criterionId: "criterion:1" }, { criterionId: "criterion:2" }, { criterionId: "criterion:3" }],
-	},
-	task: { expectedOutput: "CANARY-2-OK" },
-})}</room-fact>`;
+const taskPrompt = `<room-fact kind="dispatch_state">## Room 任务
+当前任务：
+- 预期产物：CANARY-2-OK
+验收条件 acceptance.criteria（提交时原样使用 criterionId）：
+- criterionId: "criterion:1" | 待验收 | 有界读取第一份源码
+- criterionId: "criterion:2" | 待验收 | 有界读取第二份源码
+- criterionId: "criterion:3" | 待验收 | 公开结果并提交
+</room-fact>`;
 
 function context(tools: string[], history = ""): Context {
 	return {
@@ -35,12 +37,15 @@ function calls(response: ReturnType<typeof contextEpochCanaryResponse>) {
 	return response.content.filter((item) => item.type === "toolCall");
 }
 
-const projectTaskPrompt = `<room-fact kind="dispatch_state">${JSON.stringify({
-	acceptance: {
-		criteria: [{ criterionId: "project:1" }, { criterionId: "project:2" }],
-	},
-	task: { objective: "PROJECT-TASK-CANARY" },
-})}</room-fact>`;
+const projectTaskPrompt = `<room-fact kind="dispatch_state">## Room 任务
+原始需求（不可改写）：
+- 执行 PROJECT-TASK-CANARY。
+当前任务：
+- 目标：PROJECT-TASK-CANARY
+验收条件 acceptance.criteria（提交时原样使用 criterionId）：
+- criterionId: "project:1" | 待验收 | 修改并测试
+- criterionId: "project:2" | 待验收 | 公开结果并提交
+</room-fact>`;
 
 function projectContext(tools: string[], history = ""): Context {
 	return {
@@ -87,6 +92,23 @@ describe("deterministic context epoch Provider", () => {
 		expect(calls(contextEpochCanaryResponse(messageContext(["tool_load"])))).toEqual([
 			expect.objectContaining({ name: "tool_load", arguments: { name: "workspace_read" } }),
 		]);
+	});
+
+	it("keeps compatibility with an older JSON task projection without requiring it", () => {
+		const legacyPrompt = `<room-fact kind="dispatch_state">${JSON.stringify({
+			acceptance: { criteria: [{ criterionId: "legacy:1" }] },
+			task: { expectedOutput: "CANARY-7-OK" },
+		})}</room-fact>`;
+		const legacyContext = {
+			systemPrompt: legacyPrompt,
+			messages: [{ role: "user", content: '"id":"epoch-7-read-a" "id":"epoch-7-post"', timestamp: 1 }],
+			tools: ["tool_load", "workspace_read", "room_post", "room_commit"].map(tool),
+		} as Context;
+		const commit = calls(contextEpochCanaryResponse(legacyContext))[0];
+		expect(commit).toMatchObject({
+			name: "room_commit",
+			arguments: { requirementCoverage: ["legacy:1"] },
+		});
 	});
 
 	it("drives a real project through discovery, approved patch, test and settle", () => {

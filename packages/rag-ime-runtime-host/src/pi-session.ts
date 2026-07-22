@@ -460,6 +460,7 @@ export class PiProductSession implements PooledSession {
 			{
 				directory: process.env.RAG_IME_PI_DEBUG_CONTEXT_DIR,
 				maxBytes: Number.parseInt(process.env.RAG_IME_PI_DEBUG_CONTEXT_MAX_BYTES ?? "", 10),
+				maxCallsPerTurn: Number.parseInt(process.env.RAG_IME_PI_DEBUG_CONTEXT_MAX_CALLS ?? "", 10),
 				contributionRefs: [
 					...(options.roomCapability ? [{ kind: "room-capability", ...options.roomCapability }] : []),
 					...(options.roomProviderContext
@@ -1090,6 +1091,11 @@ export class PiProductSession implements PooledSession {
 			transient: !storage.persistent,
 			storage,
 			availableTurns: this.debugContextRecorder.list(),
+			currentProviderContext: {
+				systemPrompt: this.session.systemPrompt,
+				providerContextJournal: this.providerContextJournal.snapshot(),
+				disclosedBackendTools: this.toolRegistry.disclosed().map((tool) => tool.name),
+			},
 			context: context ? { ...context, contextProjection } : null,
 			transcript: this.transcriptInspectionReceipt(),
 			telemetry: this.telemetry(),

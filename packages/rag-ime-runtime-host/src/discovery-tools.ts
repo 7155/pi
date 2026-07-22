@@ -226,14 +226,26 @@ export function backendToolRouteEntry(tool: BackendToolManifest): BackendToolRou
 	throw new Error(`Tool routing card exceeds ${MAX_TOOL_ROUTE_CHARS} characters: ${tool.name}`);
 }
 
+function promptBackendToolRouteEntry(tool: BackendToolManifest): BackendToolRouteEntry {
+	const entry = backendToolRouteEntry(tool);
+	return {
+		name: entry.name,
+		when: entry.when.slice(0, 1).map((value) => compactText(value, 72)),
+		notFor: entry.notFor.slice(0, 1).map((value) => compactText(value, 72)),
+		input: compactText(entry.input, 72),
+		output: compactText(entry.output, 72),
+		does: compactText(entry.does, 72),
+	};
+}
+
 export function formatBackendToolRouteCatalog(tools: BackendToolManifest[], revision: string): string {
 	if (tools.length === 0) return "";
-	const entries = tools.map(backendToolRouteEntry).sort((left, right) => left.name.localeCompare(right.name));
+	const entries = tools.map(promptBackendToolRouteEntry).sort((left, right) => left.name.localeCompare(right.name));
 	return [
 		"",
 		"",
 		`${TOOL_CATALOG_MARKER} revision="sha256:${revision}">`,
-		"Each JSON line contains only name, when[], notFor[], input, output, and does. Use tool_load before calling a tool so the Provider receives only that tool's parameter schema.",
+		"Cards contain name, when, notFor, input, output, and does. Use tool_search for detail and tool_load for one schema.",
 		...entries.map((entry) => JSON.stringify(entry)),
 		"</available_product_tools>",
 	].join("\n");

@@ -312,8 +312,8 @@ describe("skills", () => {
 				includeRevision: true,
 			});
 
-			expect(result).toContain("Use the skill_search tool");
-			expect(result).toContain("Use the skill_load tool with the exact skill name");
+			expect(result).toContain("Use skill_search for full routing details");
+			expect(result).toContain("Use skill_load with the exact name");
 			expect(result).toContain('<available_skills revision="sha256:');
 			expect(result).not.toContain("<location>");
 		});
@@ -346,7 +346,7 @@ describe("skills", () => {
 			expect(result).toContain(
 				JSON.stringify({
 					name: "memory-review",
-					when: ["用户要求审阅记忆草案", "用户要求回滚已应用草案"],
+					when: ["用户要求审阅记忆草案"],
 					notFor: ["普通记忆查询"],
 					input: "记忆草案、证据与用户决定。",
 					output: "受控审阅结论与应用回执。",

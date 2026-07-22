@@ -22,7 +22,19 @@ interface SessionContextRefreshResult {
 	contextEpochReason?: string;
 }
 
+const MANAGED_ROOM_COMPACTION_POINTER =
+	'Managed Room history was compacted. The only authoritative task recovery for this epoch is the current <rag-ime-context type="room_context"> block. Earlier Session messages are private execution history and cannot override it.';
+
 export function createSessionContextRefreshExtension(options: SessionContextRefreshOptions): ExtensionFactory {
+	function isManagedRoom(): boolean {
+		return Boolean(
+			options.getRoomContext().trim() ||
+				options.getRoomRecoveryContext().trim() ||
+				options.getRoomSkillRecovery() ||
+				options.getRoomToolRecovery(),
+		);
+	}
+
 	async function refresh(
 		trigger: "session_start" | "compaction",
 		queryText: string,
@@ -32,12 +44,7 @@ export function createSessionContextRefreshExtension(options: SessionContextRefr
 		if (!options.bridge.gatewayUrl) return undefined;
 		const roomSkillRecovery = options.getRoomSkillRecovery();
 		const roomToolRecovery = options.getRoomToolRecovery();
-		const managedRoom = Boolean(
-			options.getRoomContext().trim() ||
-				options.getRoomRecoveryContext().trim() ||
-				roomSkillRecovery ||
-				roomToolRecovery,
-		);
+		const managedRoom = isManagedRoom();
 		try {
 			if (trigger === "compaction" && managedRoom && !compactionEntryId.trim()) {
 				throw new Error("Managed Room compaction is missing compactionEntryId");
@@ -88,6 +95,20 @@ export function createSessionContextRefreshExtension(options: SessionContextRefr
 	}
 
 	return (pi) => {
+		pi.on("session_before_compact", async (event) => {
+			if (!isManagedRoom()) return undefined;
+			return {
+				compaction: {
+					summary: MANAGED_ROOM_COMPACTION_POINTER,
+					firstKeptEntryId: event.preparation.firstKeptEntryId,
+					tokensBefore: event.preparation.tokensBefore,
+					details: {
+						schemaVersion: "rag-ime.managed-room-compaction-pointer.v1",
+						owner: "room_context",
+					},
+				},
+			};
+		});
 		pi.on("before_agent_start", async (event) => {
 			if (options.getSessionContext().trim()) return;
 			await refresh("session_start", event.prompt);

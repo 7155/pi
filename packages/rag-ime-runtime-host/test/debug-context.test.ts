@@ -307,6 +307,33 @@ describe("PiDebugContextRecorder", () => {
 		expect(captured?.modelCalls.at(-1)?.contextDelta).toBeDefined();
 	});
 
+	it("retains every provider call when an audit raises the bounded per-turn cap", () => {
+		const activeTurn = { turnId: "turn-full-audit" };
+		const recorder = new PiDebugContextRecorder("session-full-audit", () => activeTurn, {
+			maxCallsPerTurn: 24,
+		});
+		const handlers = new Map<string, DebugHandler>();
+		recorder.extension()({
+			on: (name: string, handler: DebugHandler) => handlers.set(name, handler),
+			getActiveTools: () => [],
+			getAllTools: () => [],
+		} as never);
+		handlers.get("before_agent_start")?.({ prompt: "audit", systemPrompt: "system", systemPromptOptions: {} }, {});
+		for (let index = 0; index < 20; index += 1) {
+			handlers.get("context")?.({ messages: [{ role: "user", content: `call-${index}` }] });
+			handlers.get("before_provider_request")?.({ payload: { model: "test", index } });
+			handlers.get("message_end")?.({
+				message: { role: "assistant", content: [], usage: { input: 1, output: 1 } },
+			});
+		}
+
+		const captured = recorder.get();
+		expect(captured?.modelCalls).toHaveLength(20);
+		expect(captured?.providerRequests).toHaveLength(20);
+		expect(captured?.providerRequestReceipts).toHaveLength(20);
+		expect(captured?.cacheEvidence).toHaveLength(20);
+	});
+
 	it("normalizes incomplete legacy snapshots before exposing or mutating them", async () => {
 		const directory = mkdtempSync(join(tmpdir(), "pi-debug-context-legacy-"));
 		try {

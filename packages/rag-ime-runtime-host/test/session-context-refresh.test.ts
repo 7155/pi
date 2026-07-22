@@ -106,6 +106,24 @@ describe("session context refresh", () => {
 
 		await handlers.get("before_agent_start")?.({ prompt: "完成检索测试" });
 		expect(sessionContext).toBe("## 子任务记忆");
+		const beforeCompact = (await handlers.get("session_before_compact")?.({
+			preparation: {
+				firstKeptEntryId: "entry:kept",
+				tokensBefore: 42_000,
+			},
+		})) as { compaction?: { summary?: string; firstKeptEntryId?: string; tokensBefore?: number; details?: unknown } };
+		expect(beforeCompact.compaction).toMatchObject({
+			firstKeptEntryId: "entry:kept",
+			tokensBefore: 42_000,
+			details: {
+				schemaVersion: "rag-ime.managed-room-compaction-pointer.v1",
+				owner: "room_context",
+			},
+		});
+		expect(beforeCompact.compaction?.summary).toContain('type="room_context"');
+		for (const fact of roomRecoveryFacts) {
+			expect(beforeCompact.compaction?.summary).not.toContain(fact);
+		}
 		const compactResult = (await handlers.get("session_compact")?.(
 			{ compactionEntry: { id: "compaction:1", summary: "压缩摘要" } },
 			{
@@ -171,6 +189,36 @@ describe("session context refresh", () => {
 			schemaVersion: "rag-ime.room-tool-recovery.v1",
 			items: [{ name: "room_state", receiptId: "load:room-state" }],
 		});
+	});
+
+	it("leaves ordinary Agent compaction on Pi's normal summarizer", async () => {
+		const handlers = new Map<string, (event: any, context?: any) => Promise<unknown>>();
+		const extension = createSessionContextRefreshExtension({
+			bridge: {
+				sessionId: "agent:ordinary",
+				registry: {} as never,
+				gatewayUrl: "http://127.0.0.1:8766/api/agent/tool/execute",
+				gatewayToken: "test-token",
+			},
+			getSessionContext: () => "ordinary memory",
+			setSessionContext: () => undefined,
+			getRoomContext: () => "",
+			getRoomRecoveryContext: () => "",
+			setRoomRecoveryContext: () => undefined,
+			getRecentMessages: () => [],
+			getRoomSkillRecovery: () => undefined,
+			getRoomToolRecovery: () => undefined,
+			providerContextJournal: new ProviderContextJournal(),
+		});
+		extension({
+			on: (event: string, handler: (value: any, context?: any) => Promise<unknown>) => handlers.set(event, handler),
+		} as never);
+
+		await expect(
+			handlers.get("session_before_compact")?.({
+				preparation: { firstKeptEntryId: "entry:ordinary", tokensBefore: 1_000 },
+			}),
+		).resolves.toBeUndefined();
 	});
 
 	it("fails closed when governed Room skill recovery cannot reach the product", async () => {

@@ -45,35 +45,23 @@ function contextHasJsonField(context: Context, field: string, expected: unknown)
 	return false;
 }
 
-function currentRoomTask(context: Context): Record<string, unknown> | undefined {
+function currentRoomTask(context: Context): string | undefined {
 	for (const source of [context.systemPrompt ?? "", ...stringsIn(context.messages)]) {
 		const match = source.match(/<room-fact kind="dispatch_state">([\s\S]*?)<\/room-fact>/u);
-		if (!match) continue;
-		try {
-			const value = JSON.parse(match[1]) as unknown;
-			if (typeof value === "object" && value !== null) return value as Record<string, unknown>;
-		} catch {}
+		if (match?.[1].trim()) return match[1].trim();
 	}
 	return undefined;
 }
 
-function currentEpochMarker(task: Record<string, unknown>): string {
-	const match = JSON.stringify(task).match(/CANARY-(\d+)-OK/u);
+function currentEpochMarker(task: string): string {
+	const match = task.match(/CANARY-(\d+)-OK/u);
 	return match?.[1] ?? "";
 }
 
-function acceptanceCriterionIds(task: Record<string, unknown>): string[] {
-	const acceptance = task.acceptance;
-	if (typeof acceptance !== "object" || acceptance === null) return [];
-	const criteria = (acceptance as Record<string, unknown>).criteria;
-	if (!Array.isArray(criteria)) return [];
-	return criteria
-		.map((criterion) =>
-			typeof criterion === "object" && criterion !== null
-				? String((criterion as Record<string, unknown>).criterionId ?? "")
-				: "",
-		)
-		.filter(Boolean);
+function acceptanceCriterionIds(task: string): string[] {
+	return [...task.matchAll(/"?criterionId"?\s*:\s*"([^"]+)"/gu)]
+		.map((match) => match[1])
+		.filter((value, index, values) => value.length > 0 && values.indexOf(value) === index);
 }
 
 function executionReceiptIds(serialized: string, limit = 2): string[] {
@@ -163,7 +151,7 @@ export function contextEpochCanaryResponse(context: Context): AssistantMessage {
 /** Drive an approved read, patch, test, publish and settle task in an isolated project. */
 export function projectTaskCanaryResponse(context: Context): AssistantMessage {
 	const task = currentRoomTask(context);
-	if (!task || !JSON.stringify(task).includes("PROJECT-TASK-CANARY")) {
+	if (!task || !task.includes("PROJECT-TASK-CANARY")) {
 		return fauxAssistantMessage("A managed PROJECT-TASK-CANARY dispatch is required.");
 	}
 	const serialized = contextText(context);

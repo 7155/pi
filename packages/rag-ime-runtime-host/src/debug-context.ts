@@ -132,6 +132,7 @@ export interface PiDebugContextSummary {
 export interface PiDebugContextStorageOptions {
 	directory?: string;
 	maxBytes?: number;
+	maxCallsPerTurn?: number;
 	contributionRefs?: Array<Record<string, unknown>>;
 }
 
@@ -147,6 +148,7 @@ export interface PiDebugContextStorageStatus {
 
 const MAX_TURNS = 8;
 const MAX_CALLS_PER_TURN = 12;
+const MAX_CONFIGURED_CALLS_PER_TURN = 256;
 const MAX_TOOLS_PER_TURN = 96;
 const MAX_TOOL_UPDATES = 12;
 const MAX_SERIALIZED_CHARS = 6_000_000;
@@ -164,6 +166,7 @@ export class PiDebugContextRecorder {
 	private readonly activeTurn: () => DebugTurnIdentity | undefined;
 	private readonly storageDirectory: string;
 	private readonly storageMaxBytes: number;
+	private readonly maxCallsPerTurn: number;
 	private persistTimer: ReturnType<typeof setTimeout> | undefined;
 	private pendingPersistence: Promise<void> = Promise.resolve();
 	private storageUsedBytes = 0;
@@ -186,6 +189,8 @@ export class PiDebugContextRecorder {
 		this.storageDirectory = storage.directory?.trim() ?? "";
 		const requestedMax = Number.isFinite(storage.maxBytes) ? Math.floor(storage.maxBytes ?? 0) : 0;
 		this.storageMaxBytes = Math.min(MAX_STORAGE_BYTES, Math.max(1, requestedMax || MAX_STORAGE_BYTES));
+		const requestedCalls = Number.isFinite(storage.maxCallsPerTurn) ? Math.floor(storage.maxCallsPerTurn ?? 0) : 0;
+		this.maxCallsPerTurn = Math.min(MAX_CONFIGURED_CALLS_PER_TURN, Math.max(1, requestedCalls || MAX_CALLS_PER_TURN));
 		this.contributionRefs = cloneForInspection(storage.contributionRefs ?? []) as Array<Record<string, unknown>>;
 		this.pendingPersistence = this.queueStorageTask(() => this.restorePersistedRecords());
 	}
@@ -270,7 +275,7 @@ export class PiDebugContextRecorder {
 				const previousIndex = this.providerCallSequence || undefined;
 				const index = ++this.providerCallSequence;
 				record.contextWindows.push({ index, capturedAtMs: now, messages });
-				if (record.contextWindows.length > MAX_CALLS_PER_TURN) record.contextWindows.shift();
+				if (record.contextWindows.length > this.maxCallsPerTurn) record.contextWindows.shift();
 				record.modelCalls.push({
 					index,
 					runtimeTurnIndex: this.runtimeTurnIndex,
@@ -281,7 +286,7 @@ export class PiDebugContextRecorder {
 					providerExchanges: [],
 				});
 				this.previousContextMessages = messages;
-				if (record.modelCalls.length > MAX_CALLS_PER_TURN) record.modelCalls.shift();
+				if (record.modelCalls.length > this.maxCallsPerTurn) record.modelCalls.shift();
 				record.updatedAtMs = now;
 			});
 
@@ -313,10 +318,12 @@ export class PiDebugContextRecorder {
 					streamOptions: {},
 					payload: cloneForInspection(event.payload),
 				});
-				if (record.providerRequestReceipts.length > MAX_CALLS_PER_TURN) record.providerRequestReceipts.shift();
+				if (record.providerRequestReceipts.length > this.maxCallsPerTurn) {
+					record.providerRequestReceipts.shift();
+				}
 				const payload = cloneForInspection(event.payload);
 				record.providerRequests.push({ index, capturedAtMs: now, payload });
-				if (record.providerRequests.length > MAX_CALLS_PER_TURN) record.providerRequests.shift();
+				if (record.providerRequests.length > this.maxCallsPerTurn) record.providerRequests.shift();
 				const call = this.ensureModelCall(record, now);
 				call.providerExchanges.push({ index, capturedAtMs: now, payload });
 				call.updatedAtMs = now;
@@ -371,7 +378,7 @@ export class PiDebugContextRecorder {
 							: "unsupported",
 					cacheHitProven: (usage.cacheRead ?? 0) > 0,
 				});
-				if (record.cacheEvidence.length > MAX_CALLS_PER_TURN) record.cacheEvidence.shift();
+				if (record.cacheEvidence.length > this.maxCallsPerTurn) record.cacheEvidence.shift();
 				call.updatedAtMs = now;
 				record.updatedAtMs = now;
 				this.schedulePersist(250);
@@ -611,7 +618,7 @@ export class PiDebugContextRecorder {
 			for (const file of latest) {
 				try {
 					const parsed = JSON.parse(await readFile(file.path, "utf8")) as unknown;
-					const normalized = normalizeDebugContextRecord(parsed);
+					const normalized = normalizeDebugContextRecord(parsed, this.maxCallsPerTurn);
 					if (normalized?.sessionId === this.sessionId) restored.push(normalized);
 				} catch {
 					// A damaged snapshot must not hide the remaining usable history.
@@ -689,7 +696,10 @@ function safePathSegment(value: string): string {
 	return value.replace(/[^A-Za-z0-9._-]+/gu, "_").slice(0, 180) || "unknown";
 }
 
-function normalizeDebugContextRecord(value: unknown): PiDebugContextRecord | undefined {
+function normalizeDebugContextRecord(
+	value: unknown,
+	maxCallsPerTurn = MAX_CALLS_PER_TURN,
+): PiDebugContextRecord | undefined {
 	if (!value || typeof value !== "object" || Array.isArray(value)) return undefined;
 	const record = value as Record<string, unknown>;
 	if (
@@ -702,7 +712,7 @@ function normalizeDebugContextRecord(value: unknown): PiDebugContextRecord | und
 		return undefined;
 	}
 
-	const modelCalls = normalizeModelCalls(record.modelCalls, record.capturedAtMs);
+	const modelCalls = normalizeModelCalls(record.modelCalls, record.capturedAtMs, maxCallsPerTurn);
 	const toolExecutions = normalizeToolExecutions(record.toolExecutions, record.capturedAtMs);
 	return {
 		schemaVersion: "rag-ime.context-inspection.v2",
@@ -720,21 +730,31 @@ function normalizeDebugContextRecord(value: unknown): PiDebugContextRecord | und
 		skillCatalog: recordArray(record.skillCatalog),
 		loadedSkillReceipts: recordArray(record.loadedSkillReceipts),
 		contributionRefs: recordArray(record.contributionRefs),
-		contextWindows: recordArray(record.contextWindows) as PiDebugContextRecord["contextWindows"],
-		providerRequests: recordArray(record.providerRequests) as PiDebugContextRecord["providerRequests"],
-		providerRequestReceipts: recordArray(record.providerRequestReceipts) as unknown as PiProviderRequestReceipt[],
-		cacheEvidence: recordArray(record.cacheEvidence) as PiDebugContextRecord["cacheEvidence"],
+		contextWindows: recordArray(record.contextWindows).slice(
+			-maxCallsPerTurn,
+		) as PiDebugContextRecord["contextWindows"],
+		providerRequests: recordArray(record.providerRequests).slice(
+			-maxCallsPerTurn,
+		) as PiDebugContextRecord["providerRequests"],
+		providerRequestReceipts: recordArray(record.providerRequestReceipts).slice(
+			-maxCallsPerTurn,
+		) as unknown as PiProviderRequestReceipt[],
+		cacheEvidence: recordArray(record.cacheEvidence).slice(-maxCallsPerTurn) as PiDebugContextRecord["cacheEvidence"],
 		modelCalls,
 		toolExecutions,
 		toolBatches: buildToolBatches(toolExecutions),
 	};
 }
 
-function normalizeModelCalls(value: unknown, capturedAtMs: number): PiDebugModelCall[] {
+function normalizeModelCalls(
+	value: unknown,
+	capturedAtMs: number,
+	maxCallsPerTurn = MAX_CALLS_PER_TURN,
+): PiDebugModelCall[] {
 	let previousMessages: unknown;
 	let previousIndex: number | undefined;
 	return recordArray(value)
-		.slice(-MAX_CALLS_PER_TURN)
+		.slice(-maxCallsPerTurn)
 		.map((call, position) => {
 			const index = finiteNumber(call.index, position + 1);
 			const contextMessages = call.contextMessages ?? [];

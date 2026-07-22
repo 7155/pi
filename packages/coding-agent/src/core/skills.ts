@@ -447,6 +447,25 @@ export function skillCatalogEntry(skill: Skill): SkillCatalogEntry {
 	};
 }
 
+function compactPromptRoutingText(value: string, maximum = 72): string {
+	const normalized = value.replace(/\s+/gu, " ").trim();
+	const characters = Array.from(normalized);
+	if (characters.length <= maximum) return normalized;
+	return `${characters.slice(0, Math.max(1, maximum - 3)).join("")}...`;
+}
+
+function promptSkillCatalogEntry(skill: Skill): SkillCatalogEntry {
+	const entry = skillCatalogEntry(skill);
+	return {
+		name: entry.name,
+		when: entry.when.slice(0, 1).map((value) => compactPromptRoutingText(value)),
+		notFor: entry.notFor.slice(0, 1).map((value) => compactPromptRoutingText(value)),
+		input: compactPromptRoutingText(entry.input),
+		output: compactPromptRoutingText(entry.output),
+		does: compactPromptRoutingText(entry.does),
+	};
+}
+
 export function skillCatalogRevision(skills: Skill[]): string {
 	const catalog = visibleSkillsInStableOrder(skills).map(skillCatalogEntry);
 	return createHash("sha256").update(JSON.stringify(catalog)).digest("hex");
@@ -475,11 +494,13 @@ export function formatSkillsForPrompt(skills: Skill[], options: FormatSkillsForP
 		...(compactRoutingCards ? ['format="routing-card-jsonl"'] : []),
 	];
 	const catalogTag = `<available_skills${catalogAttributes.length ? ` ${catalogAttributes.join(" ")}` : ""}>`;
-	const lines = ["\n\nThe following skills provide specialized instructions for specific tasks."];
+	const lines = [
+		compactRoutingCards
+			? "\n\nThe following compact cards list optional Skills."
+			: "\n\nThe following skills provide specialized instructions for specific tasks.",
+	];
 	if (options.searchToolName) {
-		lines.push(
-			`Use the ${options.searchToolName} tool when you need to find the best matching skill from this catalog.`,
-		);
+		lines.push(`Use ${options.searchToolName} for full routing details when a card is ambiguous.`);
 	}
 	if (loadToolName === "read") {
 		lines.push("Use the read tool to load a skill's file when the task matches its catalog entry.");
@@ -487,19 +508,16 @@ export function formatSkillsForPrompt(skills: Skill[], options: FormatSkillsForP
 			"When a skill file references a relative path, resolve it against the skill directory (parent of SKILL.md / dirname of the path) and use that absolute path in tool commands.",
 		);
 	} else {
-		lines.push(`Use the ${loadToolName} tool with the exact skill name before following that skill's instructions.`);
-		lines.push("Do not guess or reconstruct a skill body from its routing card.");
+		lines.push(`Use ${loadToolName} with the exact name before following a Skill; never reconstruct its body.`);
 	}
 	if (compactRoutingCards) {
-		lines.push(
-			"Each JSON line contains only name, when[], notFor[], input, output, and does. Load a skill when a when condition matches and no notFor condition excludes the task.",
-		);
+		lines.push("Cards contain name, when, notFor, input, output, and does; load only on a positive match.");
 	}
 	lines.push("", catalogTag);
 
 	if (compactRoutingCards) {
 		for (const skill of visibleSkills) {
-			lines.push(JSON.stringify(skillCatalogEntry(skill)));
+			lines.push(JSON.stringify(promptSkillCatalogEntry(skill)));
 		}
 	} else {
 		for (const skill of visibleSkills) {
