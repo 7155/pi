@@ -198,4 +198,49 @@ describe("workflow control", () => {
 		expect(result.systemPrompt).not.toContain("不得执行写操作");
 		expect(result.systemPrompt).not.toContain("current_time");
 	});
+
+	it("renders a completed plan with the authoritative completion gate exactly once", async () => {
+		const completionMessage = "当前计划已经完成；开始新任务前请创建并审批新计划。";
+		const fetchMock = vi.fn(async () => ({
+			ok: true,
+			status: 200,
+			json: async () => ({
+				ok: true,
+				result: {
+					plan: {
+						status: "completed",
+						title: "完成当前任务",
+						items: [{ text: "运行验收", status: "completed" }],
+					},
+					goal: { configured: false, status: "cleared" },
+					actGate: {
+						allowed: false,
+						reason: "plan_completed",
+						message: completionMessage,
+					},
+				},
+			}),
+		}));
+		vi.stubGlobal("fetch", fetchMock);
+		const handlers = register(
+			createWorkflowControlExtension({
+				bridge: {
+					sessionId: "agent:completed",
+					registry: {} as never,
+					gatewayUrl: "http://127.0.0.1:8766/api/agent/tool/execute",
+				},
+			}),
+		);
+
+		const result = (await handlers.get("before_agent_start")?.({
+			prompt: "继续聊天",
+			systemPrompt: "基础提示词",
+		})) as { systemPrompt?: string };
+
+		expect(result.systemPrompt).toContain("### Plan · completed");
+		expect(result.systemPrompt).toContain("### Act Gate");
+		expect(result.systemPrompt?.match(new RegExp(completionMessage, "gu"))).toHaveLength(1);
+		expect(result.systemPrompt).not.toContain("计划尚未批准");
+		expect(result.systemPrompt).not.toContain("计划尚未获得用户批准");
+	});
 });

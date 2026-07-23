@@ -18,14 +18,14 @@ interface SessionContextRefreshOptions {
 }
 
 interface SessionContextRefreshResult {
-	sessionContext: string;
-	roomRecoveryContext: string;
+	sessionContext?: string;
+	roomRecoveryContext?: string;
 	contextEpoch?: number;
 	contextEpochReason?: string;
 }
 
 const MANAGED_ROOM_COMPACTION_POINTER =
-	'Managed Room history was compacted. The only authoritative task recovery for this epoch is the current <rag-ime-context type="room_context"> block. Earlier Session messages are private execution history and cannot override it.';
+	"Managed Room history was compacted. The only authoritative task recovery for this epoch is the current managed Provider context. It may be projected as active Room context or, after Room release, as the same Session's bounded recovery memory. Earlier Session messages cannot override it.";
 
 export function createSessionContextRefreshExtension(options: SessionContextRefreshOptions): ExtensionFactory {
 	let preCompactionMessages: Array<{ role: "user" | "assistant"; text: string }> | undefined;
@@ -47,8 +47,11 @@ export function createSessionContextRefreshExtension(options: SessionContextRefr
 		recentMessages = options.getRecentMessages(),
 	): Promise<SessionContextRefreshResult | undefined> {
 		if (!options.bridge.gatewayUrl) return undefined;
-		const roomSkillRecovery = options.getRoomSkillRecovery();
-		const roomToolRecovery = options.getRoomToolRecovery();
+		// Room Skill/Tool receipts are recovery evidence for a completed
+		// compaction epoch. Sending them during session_start races the product
+		// side durable pin that is recorded after dispatch preflight.
+		const roomSkillRecovery = trigger === "compaction" ? options.getRoomSkillRecovery() : undefined;
+		const roomToolRecovery = trigger === "compaction" ? options.getRoomToolRecovery() : undefined;
 		const managedRoom = isManagedRoom();
 		try {
 			if (trigger === "compaction" && managedRoom && !compactionEntryId.trim()) {
@@ -73,14 +76,23 @@ export function createSessionContextRefreshExtension(options: SessionContextRefr
 				},
 				undefined,
 			);
-			const sessionContext = String(response.result?.sessionContext ?? "").trim();
-			const roomRecoveryContext = String(response.result?.roomRecoveryContext ?? "").trim();
-			const contextEpochValue = response.result?.contextEpoch;
+			const result = response.result ?? {};
+			const hasSessionContext = Object.hasOwn(result, "sessionContext");
+			const hasRoomRecoveryContext = Object.hasOwn(result, "roomRecoveryContext");
+			if (hasSessionContext && typeof result.sessionContext !== "string") {
+				throw new Error("Context refresh response has an invalid sessionContext");
+			}
+			if (hasRoomRecoveryContext && typeof result.roomRecoveryContext !== "string") {
+				throw new Error("Context refresh response has an invalid roomRecoveryContext");
+			}
+			const sessionContext = hasSessionContext ? (result.sessionContext as string).trim() : undefined;
+			const roomRecoveryContext = hasRoomRecoveryContext ? (result.roomRecoveryContext as string).trim() : undefined;
+			const contextEpochValue = result.contextEpoch;
 			const contextEpoch =
 				typeof contextEpochValue === "number" && Number.isSafeInteger(contextEpochValue) && contextEpochValue > 0
 					? contextEpochValue
 					: undefined;
-			const contextEpochReason = String(response.result?.contextEpochReason ?? "").trim() || undefined;
+			const contextEpochReason = String(result.contextEpochReason ?? "").trim() || undefined;
 			if (trigger === "compaction" && managedRoom) {
 				if (contextEpoch === undefined) {
 					throw new Error("Managed Room compaction response is missing contextEpoch");
@@ -88,10 +100,13 @@ export function createSessionContextRefreshExtension(options: SessionContextRefr
 				if (contextEpochReason !== "compaction") {
 					throw new Error("Managed Room compaction response has an invalid contextEpochReason");
 				}
+				if (!hasSessionContext || !hasRoomRecoveryContext) {
+					throw new Error("Managed Room compaction response is missing authoritative context");
+				}
 			}
-			if (!sessionContext && !roomRecoveryContext) return undefined;
-			if (sessionContext) options.setSessionContext(sessionContext);
-			if (roomRecoveryContext) options.setRoomRecoveryContext(roomRecoveryContext);
+			if (!hasSessionContext && !hasRoomRecoveryContext) return undefined;
+			if (sessionContext !== undefined) options.setSessionContext(sessionContext);
+			if (roomRecoveryContext !== undefined) options.setRoomRecoveryContext(roomRecoveryContext);
 			return { sessionContext, roomRecoveryContext, contextEpoch, contextEpochReason };
 		} catch (error) {
 			if ((trigger === "compaction" && managedRoom) || roomSkillRecovery || roomToolRecovery) throw error;
@@ -138,8 +153,8 @@ export function createSessionContextRefreshExtension(options: SessionContextRefr
 						"compaction",
 						ctx.getSystemPrompt(),
 						{
-							sessionContext: refreshed?.sessionContext || options.getSessionContext(),
-							roomContext: refreshed?.roomRecoveryContext || options.getRoomRecoveryContext(),
+							sessionContext: refreshed?.sessionContext ?? options.getSessionContext(),
+							roomContext: refreshed?.roomRecoveryContext ?? options.getRoomRecoveryContext(),
 							transientContext: "",
 						},
 						refreshed?.contextEpoch,

@@ -229,6 +229,45 @@ describe("AgentSession compaction characterization", () => {
 		expect(getStreamCallCount()).toBe(1);
 	});
 
+	it("forwards Provider audit callbacks to manual compaction", async () => {
+		const harness = await createHarness({ withConfiguredAuth: false });
+		harnesses.push(harness);
+		seedCompactableSession(harness);
+		const onPayload = vi.fn((payload: unknown) => payload);
+		const onResponse = vi.fn();
+		harness.session.agent.onPayload = onPayload;
+		harness.session.agent.onResponse = onResponse;
+		let captured:
+			| {
+					onPayload?: unknown;
+					onResponse?: unknown;
+			  }
+			| undefined;
+		harness.session.agent.streamFn = (model, _context, options) => {
+			captured = options;
+			const stream = createAssistantMessageEventStream();
+			queueMicrotask(() => {
+				stream.push({
+					type: "done",
+					reason: "stop",
+					message: {
+						...fauxAssistantMessage("summary with Provider audit"),
+						api: model.api,
+						provider: model.provider,
+						model: model.id,
+						usage: createUsage(10),
+					},
+				});
+			});
+			return stream;
+		};
+
+		await harness.session.compact();
+
+		expect(captured?.onPayload).toBe(onPayload);
+		expect(captured?.onResponse).toBe(onResponse);
+	});
+
 	it("auto-compacts with a custom streamFn when registry auth is absent", async () => {
 		const harness = await createHarness({
 			withConfiguredAuth: false,

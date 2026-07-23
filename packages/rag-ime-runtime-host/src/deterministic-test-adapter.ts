@@ -73,6 +73,21 @@ function parsedContextRecords(context: Context): Array<Record<string, unknown>> 
 	return values.flatMap(recordsIn);
 }
 
+function latestWorkspaceReadReceipt(context: Context, fileName: string): Record<string, unknown> | undefined {
+	return parsedContextRecords(context)
+		.filter((record) => {
+			const path = String(record.path ?? "");
+			return (
+				(path === fileName || path.endsWith(`/${fileName}`)) &&
+				typeof record.nextOffset === "number" &&
+				typeof record.truncated === "boolean" &&
+				record.toolName === undefined
+			);
+		})
+		.sort((left, right) => Number(left.nextOffset) - Number(right.nextOffset))
+		.at(-1);
+}
+
 function participantIdForRole(context: Context, collaborationRole: string): string {
 	const participant = parsedContextRecords(context).find((record) => {
 		const id = String(record.id ?? record.participantId ?? "");
@@ -675,21 +690,68 @@ export function agentSessionCanaryResponse(context: Context): AssistantMessage {
 			{ stopReason: "toolUse" },
 		);
 	}
+	const boundaryReceipt = latestWorkspaceReadReceipt(context, "read-boundary.txt");
+	if (!boundaryReceipt) {
+		if (serialized.includes("agent-read-boundary-0")) {
+			throw new Error("The Agent Session boundary read did not return a structured receipt");
+		}
+		return fauxAssistantMessage(
+			fauxToolCall(
+				"workspace_read",
+				{ op: "read", path: "read-boundary.txt", offset: 0, limit: 65_536 },
+				{ id: "agent-read-boundary-0" },
+			),
+			{ stopReason: "toolUse" },
+		);
+	}
+	if (
+		Number(boundaryReceipt.contentBytes) > 50 * 1024 ||
+		Number(boundaryReceipt.contentLines) > 2_000 ||
+		Number(boundaryReceipt.modelResultLimitBytes) !== 50 * 1024 ||
+		Buffer.byteLength(JSON.stringify(boundaryReceipt), "utf8") > 50 * 1024
+	) {
+		throw new Error("workspace_read exceeded the Pi model-visible result budget");
+	}
+	if (boundaryReceipt.truncated === true) {
+		const nextOffset = Number(boundaryReceipt.nextOffset);
+		const currentOffset = Number(boundaryReceipt.offset);
+		if (!Number.isSafeInteger(nextOffset) || nextOffset <= currentOffset) {
+			throw new Error("workspace_read did not advance its UTF-8 continuation offset");
+		}
+		const callId = `agent-read-boundary-${nextOffset}`;
+		if (serialized.includes(`"id":"${callId}"`)) {
+			throw new Error("The Agent Session boundary continuation did not advance");
+		}
+		return fauxAssistantMessage(
+			fauxToolCall(
+				"workspace_read",
+				{ op: "read", path: "read-boundary.txt", offset: nextOffset, limit: 65_536 },
+				{ id: callId },
+			),
+			{ stopReason: "toolUse" },
+		);
+	}
+	if (Number(boundaryReceipt.nextOffset) !== Number(boundaryReceipt.byteSize)) {
+		throw new Error("workspace_read ended before the boundary fixture was fully consumed");
+	}
 
 	if (!tools.has("agent_plan")) {
 		return fauxAssistantMessage(fauxToolCall("tool_load", { name: "agent_plan" }, { id: "agent-load-plan" }), {
 			stopReason: "toolUse",
 		});
 	}
-	for (const [id, title] of [
-		["agent-plan-baseline", "运行失败基线测试"],
-		["agent-plan-patch", "精确修改 normalize_scores"],
-		["agent-plan-regression", "运行回归测试并交付"],
+	for (const [id, itemId, title] of [
+		["agent-plan-baseline", "agent-plan-item-baseline", "运行失败基线测试"],
+		["agent-plan-patch", "agent-plan-item-patch", "精确修改 normalize_scores"],
+		["agent-plan-regression", "agent-plan-item-regression", "运行回归测试并交付"],
 	] as const) {
 		if (!serialized.includes(id)) {
-			return fauxAssistantMessage(fauxToolCall("agent_plan", { op: "update", title, status: "pending" }, { id }), {
-				stopReason: "toolUse",
-			});
+			return fauxAssistantMessage(
+				fauxToolCall("agent_plan", { op: "update", itemId, title, status: "pending" }, { id }),
+				{
+					stopReason: "toolUse",
+				},
+			);
 		}
 	}
 	if (!serialized.includes("agent-plan-review")) {
@@ -727,6 +789,16 @@ export function agentSessionCanaryResponse(context: Context): AssistantMessage {
 			{ stopReason: "toolUse" },
 		);
 	}
+	if (!serialized.includes("agent-plan-baseline-done")) {
+		return fauxAssistantMessage(
+			fauxToolCall(
+				"agent_plan",
+				{ op: "update", itemId: "agent-plan-item-baseline", status: "completed" },
+				{ id: "agent-plan-baseline-done" },
+			),
+			{ stopReason: "toolUse" },
+		);
+	}
 	if (!tools.has("workspace_patch")) {
 		return fauxAssistantMessage(fauxToolCall("tool_load", { name: "workspace_patch" }, { id: "agent-load-patch" }), {
 			stopReason: "toolUse",
@@ -752,6 +824,16 @@ export function agentSessionCanaryResponse(context: Context): AssistantMessage {
 	if (!contextHasJsonField(context, "mutationApplied", true)) {
 		throw new Error("The approved Agent Session patch did not produce an applied receipt");
 	}
+	if (!serialized.includes("agent-plan-patch-done")) {
+		return fauxAssistantMessage(
+			fauxToolCall(
+				"agent_plan",
+				{ op: "update", itemId: "agent-plan-item-patch", status: "completed" },
+				{ id: "agent-plan-patch-done" },
+			),
+			{ stopReason: "toolUse" },
+		);
+	}
 	if (!serialized.includes("agent-regression-shell")) {
 		return fauxAssistantMessage(
 			fauxToolCall(
@@ -770,6 +852,22 @@ export function agentSessionCanaryResponse(context: Context): AssistantMessage {
 	}
 	if (!contextHasJsonField(context, "exitCode", 0)) {
 		throw new Error("The Agent Session regression command did not pass");
+	}
+	if (!serialized.includes("agent-plan-regression-done")) {
+		return fauxAssistantMessage(
+			fauxToolCall(
+				"agent_plan",
+				{ op: "update", itemId: "agent-plan-item-regression", status: "completed" },
+				{ id: "agent-plan-regression-done" },
+			),
+			{ stopReason: "toolUse" },
+		);
+	}
+	if (!serialized.includes("agent-plan-complete")) {
+		return fauxAssistantMessage(
+			fauxToolCall("agent_plan", { op: "complete", note: "全部计划项和验收已完成" }, { id: "agent-plan-complete" }),
+			{ stopReason: "toolUse" },
+		);
 	}
 	return fauxAssistantMessage(
 		`${AGENT_SESSION_FINAL_MARKER}；失败读取与失败基线均已确认，修复已获批，回归测试通过；无剩余风险。`,

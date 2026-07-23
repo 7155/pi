@@ -518,8 +518,9 @@ function createSummarizationOptions(
 	env: Record<string, string> | undefined,
 	signal: AbortSignal | undefined,
 	thinkingLevel: ThinkingLevel | undefined,
+	sessionId?: string,
 ): SimpleStreamOptions {
-	const options: SimpleStreamOptions = { maxTokens, signal, apiKey, headers, env };
+	const options: SimpleStreamOptions = { maxTokens, signal, apiKey, headers, env, sessionId };
 	if (model.reasoning && thinkingLevel && thinkingLevel !== "off") {
 		options.reasoning = thinkingLevel;
 	}
@@ -542,6 +543,7 @@ export async function generateSummary(
 	thinkingLevel?: ThinkingLevel,
 	streamFn?: StreamFn,
 	env?: Record<string, string>,
+	sessionId?: string,
 ): Promise<string> {
 	const maxTokens = Math.min(
 		Math.floor(0.8 * reserveTokens),
@@ -574,7 +576,16 @@ export async function generateSummary(
 		},
 	];
 
-	const completionOptions = createSummarizationOptions(model, maxTokens, apiKey, headers, env, signal, thinkingLevel);
+	const completionOptions = createSummarizationOptions(
+		model,
+		maxTokens,
+		apiKey,
+		headers,
+		env,
+		signal,
+		thinkingLevel,
+		sessionId,
+	);
 
 	const response = await completeSummarizationWithRetry(
 		model,
@@ -734,6 +745,7 @@ export async function compact(
 	thinkingLevel?: ThinkingLevel,
 	streamFn?: StreamFn,
 	env?: Record<string, string>,
+	sessionId?: string,
 ): Promise<CompactionResult> {
 	const {
 		firstKeptEntryId,
@@ -764,6 +776,7 @@ export async function compact(
 						thinkingLevel,
 						streamFn,
 						env,
+						sessionId,
 					)
 				: "No prior history.";
 		const turnPrefixResult = await generateTurnPrefixSummary(
@@ -776,6 +789,7 @@ export async function compact(
 			signal,
 			thinkingLevel,
 			streamFn,
+			sessionId,
 		);
 		// Merge into single summary
 		summary = `${historyResult}\n\n---\n\n**Turn Context (split turn):**\n\n${turnPrefixResult}`;
@@ -793,6 +807,7 @@ export async function compact(
 			thinkingLevel,
 			streamFn,
 			env,
+			sessionId,
 		);
 	}
 
@@ -825,6 +840,7 @@ async function generateTurnPrefixSummary(
 	signal?: AbortSignal,
 	thinkingLevel?: ThinkingLevel,
 	streamFn?: StreamFn,
+	sessionId?: string,
 ): Promise<string> {
 	const maxTokens = Math.min(
 		Math.floor(0.5 * reserveTokens),
@@ -844,7 +860,7 @@ async function generateTurnPrefixSummary(
 	const response = await completeSummarizationWithRetry(
 		model,
 		{ systemPrompt: SUMMARIZATION_SYSTEM_PROMPT, messages: summarizationMessages },
-		createSummarizationOptions(model, maxTokens, apiKey, headers, env, signal, thinkingLevel),
+		createSummarizationOptions(model, maxTokens, apiKey, headers, env, signal, thinkingLevel, sessionId),
 		streamFn,
 	);
 

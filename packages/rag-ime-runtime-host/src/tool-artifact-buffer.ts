@@ -1,4 +1,5 @@
 const MAX_ARTIFACT_BLOCKS = 16;
+export const MAX_MODEL_VISIBLE_TOOL_RESULT_BYTES = 50 * 1024;
 const MEDIA_ID_PATTERN = /^media_[A-Za-z0-9_-]{12,80}$/u;
 const SESSION_ID_PATTERN = /^[A-Za-z0-9._:-]{1,240}$/u;
 const SHA256_PATTERN = /^[0-9a-f]{64}$/u;
@@ -94,12 +95,58 @@ export function toolAgentBlocks(...values: unknown[]): Record<string, unknown>[]
 
 /** Remove opaque UI receipts before a product result enters model context. */
 export function modelVisibleResult(value: unknown): unknown {
-	if (Array.isArray(value)) return value.map(modelVisibleResult);
+	const projected = stripAgentBlocks(value);
+	const serialized = JSON.stringify(projected);
+	const originalBytes = Buffer.byteLength(serialized, "utf8");
+	if (originalBytes <= MAX_MODEL_VISIBLE_TOOL_RESULT_BYTES) return projected;
+
+	const scalars = isRecord(projected)
+		? Object.fromEntries(
+				Object.entries(projected).filter(([key, item]) => {
+					if (
+						["modelResultTruncated", "truncated", "truncatedBy", "originalBytes", "maxBytes", "preview"].includes(
+							key,
+						)
+					) {
+						return false;
+					}
+					if (typeof item === "number" || typeof item === "boolean" || item === null) return true;
+					return typeof item === "string" && item.length <= 512;
+				}),
+			)
+		: {};
+	const base = {
+		...scalars,
+		truncated: true,
+		modelResultTruncated: true,
+		truncatedBy: "model_result_bytes",
+		originalBytes,
+		maxBytes: MAX_MODEL_VISIBLE_TOOL_RESULT_BYTES,
+	};
+	const codePoints = Array.from(serialized);
+	let low = 0;
+	let high = codePoints.length;
+	let best = { ...base, preview: "" };
+	while (low <= high) {
+		const middle = Math.floor((low + high) / 2);
+		const candidate = { ...base, preview: codePoints.slice(0, middle).join("") };
+		if (Buffer.byteLength(JSON.stringify(candidate), "utf8") <= MAX_MODEL_VISIBLE_TOOL_RESULT_BYTES) {
+			best = candidate;
+			low = middle + 1;
+		} else {
+			high = middle - 1;
+		}
+	}
+	return best;
+}
+
+function stripAgentBlocks(value: unknown): unknown {
+	if (Array.isArray(value)) return value.map(stripAgentBlocks);
 	if (!isRecord(value)) return value;
 	return Object.fromEntries(
 		Object.entries(value)
 			.filter(([key]) => key !== "agentBlocks")
-			.map(([key, item]) => [key, modelVisibleResult(item)]),
+			.map(([key, item]) => [key, stripAgentBlocks(item)]),
 	);
 }
 

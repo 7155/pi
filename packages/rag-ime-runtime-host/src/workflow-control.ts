@@ -63,11 +63,6 @@ function renderWorkflow(snapshot: WorkflowSnapshot): string {
 		const title = text(plan.title);
 		if (title) lines.push(title.slice(0, 320));
 		lines.push(...planItems);
-		lines.push(
-			gate.allowed === true
-				? text(gate.message) || "执行边界：当前工作已授权；写操作仍须通过产品权限与审批。"
-				: "执行边界：计划尚未批准，只能调研、阅读和修改计划，不得执行写操作。",
-		);
 	}
 
 	if (goal.configured === true && goalStatus) {
@@ -90,8 +85,10 @@ function renderWorkflow(snapshot: WorkflowSnapshot): string {
 		if (goalStatus === "paused") lines.push("Goal 已暂停，不要自行继续执行。");
 	}
 
-	if (!showPlan || gate.allowed === false) {
-		lines.push(`### Act Gate\n${text(gate.message) || text(gate.reason) || "当前写操作未获批准。"}`);
+	if (Object.keys(gate).length > 0) {
+		const fallback =
+			gate.allowed === true ? "当前工作已授权；写操作仍须通过产品权限与审批。" : "当前写操作未获批准。";
+		lines.push(`### Act Gate\n${text(gate.message) || text(gate.reason) || fallback}`);
 	}
 	return lines.join("\n").trim();
 }

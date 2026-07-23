@@ -64,6 +64,7 @@ export interface HarnessOptions {
 	models?: FauxModelDefinition[];
 	settings?: Partial<Settings>;
 	systemPrompt?: string;
+	providerSessionId?: string;
 	tools?: AgentTool[];
 	initialActiveToolNames?: string[];
 	allowedToolNames?: string[];
@@ -142,6 +143,7 @@ export async function createHarness(options: HarnessOptions = {}): Promise<Harne
 			systemPrompt: options.systemPrompt ?? "You are a test assistant.",
 			tools: [],
 		},
+		sessionId: options.providerSessionId,
 		convertToLlm,
 		onPayload: async (payload) => {
 			const runner = extensionRunnerRef.current;

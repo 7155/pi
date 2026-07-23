@@ -1,7 +1,7 @@
 import type { AgentTool } from "@earendil-works/pi-agent-core";
 import { fauxAssistantMessage, fauxThinking, fauxToolCall } from "@earendil-works/pi-ai";
 import { Type } from "typebox";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { createHarness, type Harness } from "./harness.ts";
 
 function normalizeEventOrder(events: Harness["events"]): string[] {
@@ -25,6 +25,7 @@ describe("AgentSession retry and event characterization", () => {
 	const harnesses: Harness[] = [];
 
 	afterEach(() => {
+		vi.useRealTimers();
 		while (harnesses.length > 0) {
 			harnesses.pop()?.cleanup();
 		}
@@ -52,6 +53,102 @@ describe("AgentSession retry and event characterization", () => {
 		expect(harness.session.isRetrying).toBe(false);
 	});
 
+	it("backs off explicit upstream gateway failures without slowing ordinary retries", async () => {
+		const harness = await createHarness({ settings: { retry: { enabled: true, maxRetries: 3, baseDelayMs: 1 } } });
+		harnesses.push(harness);
+		harness.setResponses([
+			fauxAssistantMessage("", {
+				stopReason: "error",
+				errorMessage: 'OpenAI API error (400): {"message":"Upstream request failed","type":"upstream_error"}',
+			}),
+		]);
+
+		const retryStarted = new Promise<number>((resolve) => {
+			const unsubscribe = harness.session.subscribe((event) => {
+				if (event.type === "auto_retry_start") {
+					unsubscribe();
+					resolve(event.delayMs);
+				}
+			});
+		});
+		const prompt = harness.session.prompt("test");
+
+		expect(await retryStarted).toBe(8_000);
+		harness.session.abortRetry();
+		await prompt;
+
+		expect(harness.faux.state.callCount).toBe(1);
+		expect(harness.session.isRetrying).toBe(false);
+	});
+
+	it("rotates only Provider affinity after an upstream failure and keeps the logical Session id", async () => {
+		vi.useFakeTimers();
+		const providerSessionId = "provider-session-affinity";
+		const harness = await createHarness({
+			providerSessionId,
+			settings: { retry: { enabled: true, maxRetries: 3, baseDelayMs: 1 } },
+		});
+		harnesses.push(harness);
+		const logicalSessionId = harness.session.sessionId;
+		harness.setResponses([
+			fauxAssistantMessage("", {
+				stopReason: "error",
+				errorMessage: 'OpenAI API error (400): {"message":"Upstream request failed","type":"upstream_error"}',
+			}),
+			fauxAssistantMessage("recovered"),
+		]);
+
+		const retryStarted = new Promise<void>((resolve) => {
+			const unsubscribe = harness.session.subscribe((event) => {
+				if (event.type === "auto_retry_start") {
+					unsubscribe();
+					resolve();
+				}
+			});
+		});
+		const prompt = harness.session.prompt("test");
+		await retryStarted;
+		await vi.advanceTimersByTimeAsync(8_000);
+		await prompt;
+
+		expect(harness.session.sessionId).toBe(logicalSessionId);
+		expect(harness.session.agent.sessionId).toBe(`${providerSessionId}:retry:1`);
+		expect(harness.faux.state.callCount).toBe(2);
+	});
+
+	it("rotates Provider affinity after an explicit transient gateway status", async () => {
+		vi.useFakeTimers();
+		const providerSessionId = "provider-session-affinity";
+		const harness = await createHarness({
+			providerSessionId,
+			settings: { retry: { enabled: true, maxRetries: 1, baseDelayMs: 1 } },
+		});
+		harnesses.push(harness);
+		harness.setResponses([
+			fauxAssistantMessage("", {
+				stopReason: "error",
+				errorMessage: "OpenAI API error (503): Service unavailable",
+			}),
+			fauxAssistantMessage("recovered"),
+		]);
+
+		const retryStarted = new Promise<void>((resolve) => {
+			const unsubscribe = harness.session.subscribe((event) => {
+				if (event.type === "auto_retry_start") {
+					unsubscribe();
+					resolve();
+				}
+			});
+		});
+		const prompt = harness.session.prompt("test");
+		await retryStarted;
+		await vi.advanceTimersByTimeAsync(8_000);
+		await prompt;
+
+		expect(harness.session.agent.sessionId).toBe(`${providerSessionId}:retry:1`);
+		expect(harness.faux.state.callCount).toBe(2);
+	});
+
 	it("retries multiple transient failures and succeeds on the final attempt", async () => {
 		const harness = await createHarness({ settings: { retry: { enabled: true, maxRetries: 3, baseDelayMs: 1 } } });
 		harnesses.push(harness);
@@ -71,6 +168,23 @@ describe("AgentSession retry and event characterization", () => {
 
 		expect(retryEvents).toEqual(["start:1", "start:2", "end:true"]);
 		expect(harness.faux.state.callCount).toBe(3);
+	});
+
+	it("caps retries to a caller-owned lifecycle budget", async () => {
+		const harness = await createHarness({ settings: { retry: { enabled: true, maxRetries: 3, baseDelayMs: 1 } } });
+		harnesses.push(harness);
+		harness.session.setRetryLimitOverride(1);
+		harness.setResponses([
+			fauxAssistantMessage("", { stopReason: "error", errorMessage: "overloaded_error" }),
+			fauxAssistantMessage("", { stopReason: "error", errorMessage: "overloaded_error" }),
+			fauxAssistantMessage("must not run"),
+		]);
+
+		await harness.session.prompt("test");
+
+		expect(harness.faux.state.callCount).toBe(2);
+		expect(harness.eventsOfType("auto_retry_start").map((event) => event.attempt)).toEqual([1]);
+		expect(harness.eventsOfType("auto_retry_end")).toEqual([expect.objectContaining({ success: false, attempt: 1 })]);
 	});
 
 	it("exhausts max retries and emits a failure event", async () => {

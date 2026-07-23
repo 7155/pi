@@ -128,10 +128,64 @@ describe("generateSummary reasoning options", () => {
 			.mockResolvedValueOnce(mockSummaryResponse);
 
 		try {
-			const summaryPromise = generateSummary(messages, createModel(false), 2000, "test-key");
+			const summaryPromise = generateSummary(
+				messages,
+				createModel(false),
+				2000,
+				"test-key",
+				undefined,
+				undefined,
+				undefined,
+				undefined,
+				undefined,
+				undefined,
+				undefined,
+				"summary-session",
+			);
 			await vi.runAllTimersAsync();
 			await expect(summaryPromise).resolves.toContain("Test summary");
 			expect(completeSimpleMock).toHaveBeenCalledTimes(2);
+			expect(completeSimpleMock.mock.calls.map((call) => call[2]?.sessionId)).toEqual([
+				"summary-session",
+				"summary-session:retry:1",
+			]);
+		} finally {
+			vi.useRealTimers();
+		}
+	});
+
+	it("rotates summary Provider affinity after an explicit transient gateway status", async () => {
+		vi.useFakeTimers();
+		completeSimpleMock
+			.mockResolvedValueOnce({
+				...mockSummaryResponse,
+				content: [],
+				stopReason: "error",
+				errorMessage: "OpenAI API error (502): 502 status code (no body)",
+			})
+			.mockResolvedValueOnce(mockSummaryResponse);
+
+		try {
+			const summaryPromise = generateSummary(
+				messages,
+				createModel(false),
+				2000,
+				"test-key",
+				undefined,
+				undefined,
+				undefined,
+				undefined,
+				undefined,
+				undefined,
+				undefined,
+				"summary-session",
+			);
+			await vi.runAllTimersAsync();
+			await expect(summaryPromise).resolves.toContain("Test summary");
+			expect(completeSimpleMock.mock.calls.map((call) => call[2]?.sessionId)).toEqual([
+				"summary-session",
+				"summary-session:retry:1",
+			]);
 		} finally {
 			vi.useRealTimers();
 		}

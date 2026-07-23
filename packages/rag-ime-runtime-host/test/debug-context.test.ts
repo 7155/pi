@@ -7,6 +7,58 @@ import { PiDebugContextRecorder } from "../src/debug-context.ts";
 type DebugHandler = (event: Record<string, unknown>, context?: Record<string, unknown>) => unknown;
 
 describe("PiDebugContextRecorder", () => {
+	it("captures unbound compaction Provider calls as a first-class lifecycle record", () => {
+		const recorder = new PiDebugContextRecorder("session-compaction", () => undefined);
+		const handlers = new Map<string, DebugHandler>();
+		recorder.extension()({
+			on: (name: string, handler: DebugHandler) => handlers.set(name, handler),
+			getActiveTools: () => [],
+			getAllTools: () => [],
+		} as never);
+
+		const lifecycleTurnId = recorder.beginLifecycle("compaction", { reason: "manual" });
+		for (const index of [1, 2]) {
+			handlers.get("provider_context_inspection")?.({
+				model: { provider: "openai", id: "gpt-test", api: "openai-responses" },
+				context: {
+					systemPrompt: "summarize safely",
+					messages: [{ role: "user", content: `summary part ${index}` }],
+					tools: [],
+				},
+			});
+			handlers.get("before_provider_request")?.({
+				payload: { model: "gpt-test", input: `wire part ${index}`, stream: true },
+			});
+			handlers.get("after_provider_response")?.({
+				status: 200,
+				headers: { "x-request-id": `request-${index}` },
+			});
+		}
+		recorder.endLifecycle("compaction", "completed");
+
+		const captured = recorder.get(lifecycleTurnId);
+		expect(captured?.lifecycle).toEqual({
+			kind: "compaction",
+			reason: "manual",
+			status: "completed",
+			error: undefined,
+		});
+		expect(captured?.model).toMatchObject({ provider: "openai", id: "gpt-test" });
+		expect(captured?.modelCalls).toHaveLength(2);
+		expect(captured?.modelCalls.map((call) => call.index)).toEqual([1, 2]);
+		expect(captured?.providerRequests.map((request) => request.payload)).toEqual([
+			expect.objectContaining({ input: "wire part 1" }),
+			expect.objectContaining({ input: "wire part 2" }),
+		]);
+		expect(recorder.list()).toEqual([
+			expect.objectContaining({
+				turnId: lifecycleTurnId,
+				modelCallCount: 2,
+				providerRequestCount: 2,
+			}),
+		]);
+	});
+
 	it("distinguishes a reported no-hit usage block from unavailable all-zero usage", () => {
 		let activeTurn = { turnId: "turn-zero" };
 		const recorder = new PiDebugContextRecorder("session-cache-capability", () => activeTurn);

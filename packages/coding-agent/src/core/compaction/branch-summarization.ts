@@ -81,6 +81,8 @@ export interface GenerateBranchSummaryOptions {
 	reserveTokens?: number;
 	/** Optional session stream function. Used to preserve SDK request behavior without mutating agent state. */
 	streamFn?: StreamFn;
+	/** Provider affinity key for cache-aware and gateway-routed summary requests. */
+	sessionId?: string;
 }
 
 // ============================================================================
@@ -298,6 +300,7 @@ export async function generateBranchSummary(
 		replaceInstructions,
 		reserveTokens = 16384,
 		streamFn,
+		sessionId,
 	} = options;
 
 	// Token budget = context window minus reserved space for prompt + response
@@ -338,7 +341,7 @@ export async function generateBranchSummary(
 	// request behavior (timeouts, retries, attribution headers) stays consistent
 	// without running through agent state/events.
 	const context = { systemPrompt: SUMMARIZATION_SYSTEM_PROMPT, messages: summarizationMessages };
-	const requestOptions: SimpleStreamOptions = { apiKey, headers, env, signal, maxTokens: 2048 };
+	const requestOptions: SimpleStreamOptions = { apiKey, headers, env, signal, maxTokens: 2048, sessionId };
 	const response = await completeSummarizationWithRetry(model, context, requestOptions, streamFn);
 
 	// Check if aborted or errored

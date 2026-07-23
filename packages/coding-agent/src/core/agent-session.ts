@@ -26,6 +26,7 @@ import type {
 	CancelReceipt,
 	ContinuationOptions,
 	PrepareNextTurnContext,
+	StreamFn,
 	ThinkingLevel,
 } from "@earendil-works/pi-agent-core";
 import { CancelScope } from "@earendil-works/pi-agent-core";
@@ -100,6 +101,7 @@ import type { BashExecutionMessage, CustomMessage } from "./messages.ts";
 import { ModelRegistry } from "./model-registry.ts";
 import type { ModelRuntime } from "./model-runtime.ts";
 import { expandPromptTemplate, type PromptTemplate } from "./prompt-templates.ts";
+import { isUpstreamProviderError, rotateProviderSessionAffinity } from "./provider-session-affinity.ts";
 import type { ResourceExtensionPaths, ResourceLoader } from "./resource-loader.ts";
 import type { BranchSummaryEntry, SessionEntry, SessionManager } from "./session-manager.ts";
 import { CURRENT_SESSION_VERSION, getLatestCompactionEntry, type SessionHeader } from "./session-manager.ts";
@@ -110,6 +112,8 @@ import { type BuildSystemPromptOptions, buildSystemPrompt } from "./system-promp
 import { type BashOperations, createLocalBashOperations } from "./tools/bash.ts";
 import { createAllToolDefinitions } from "./tools/index.ts";
 import { createToolDefinitionFromAgentTool } from "./tools/tool-definition-wrapper.ts";
+
+const UPSTREAM_ERROR_RETRY_BASE_DELAY_MS = 8_000;
 
 // ============================================================================
 // Skill Block Parsing
@@ -355,6 +359,9 @@ export class AgentSession {
 	// Retry state
 	private _retryAbortController: AbortController | undefined = undefined;
 	private _retryAttempt = 0;
+	private _retryLimitOverride: number | undefined;
+	private _providerSessionAffinityBase: string | undefined;
+	private _providerSessionAffinityGeneration = 0;
 	private _cancelScope: CancelScope | undefined;
 	private _cancelScopeSequence = 0;
 	private _beforeSettleAttempt = 0;
@@ -410,6 +417,7 @@ export class AgentSession {
 		this._customTools = config.customTools ?? [];
 		this._cwd = config.cwd;
 		this._modelRuntime = config.modelRuntime;
+		this._providerSessionAffinityBase = config.agent.sessionId;
 		this._extensionRunnerRef = config.extensionRunnerRef;
 		this._initialActiveToolNames = config.initialActiveToolNames;
 		this._allowedToolNames = config.allowedToolNames ? new Set(config.allowedToolNames) : undefined;
@@ -489,6 +497,24 @@ export class AgentSession {
 		} catch {
 			return {};
 		}
+	}
+
+	/**
+	 * Keep lifecycle summaries on the same Provider audit path as Agent turns.
+	 *
+	 * Compaction and branch summarization call the stream function directly,
+	 * outside the Agent loop that normally supplies these callbacks.
+	 */
+	private _getLifecycleStreamFn(): StreamFn {
+		const streamFn = this.agent.streamFn;
+		const onPayload = this.agent.onPayload;
+		const onResponse = this.agent.onResponse;
+		return (model, context, options) =>
+			streamFn(model, context, {
+				...options,
+				onPayload: options?.onPayload ?? onPayload,
+				onResponse: options?.onResponse ?? onResponse,
+			});
 	}
 
 	/**
@@ -719,7 +745,7 @@ export class AgentSession {
 	};
 
 	private _willRetryAfterAgentEnd(event: Extract<AgentEvent, { type: "agent_end" }>): boolean {
-		const settings = this.settingsManager.getRetrySettings();
+		const settings = this._effectiveRetrySettings();
 		if (!settings.enabled || this._retryAttempt >= settings.maxRetries) {
 			return false;
 		}
@@ -2130,8 +2156,9 @@ export class AgentSession {
 					customInstructions,
 					this._compactionAbortController.signal,
 					this.thinkingLevel,
-					this.agent.streamFn,
+					this._getLifecycleStreamFn(),
 					env,
+					this.agent.sessionId,
 				);
 				summary = result.summary;
 				firstKeptEntryId = result.firstKeptEntryId;
@@ -2415,8 +2442,9 @@ export class AgentSession {
 					undefined,
 					this._autoCompactionAbortController.signal,
 					this.thinkingLevel,
-					this.agent.streamFn,
+					this._getLifecycleStreamFn(),
 					env,
+					this.agent.sessionId,
 				);
 				summary = compactResult.summary;
 				firstKeptEntryId = compactResult.firstKeptEntryId;
@@ -2931,11 +2959,12 @@ export class AgentSession {
 	 * @returns true if the caller should continue the agent, false otherwise
 	 */
 	private async _prepareRetry(message: AssistantMessage): Promise<boolean> {
-		const settings = this.settingsManager.getRetrySettings();
+		const settings = this._effectiveRetrySettings();
 		if (!settings.enabled) {
 			return false;
 		}
 
+		const rotatesProviderAffinity = isUpstreamProviderError(message.errorMessage);
 		this._retryAttempt++;
 
 		if (this._retryAttempt > settings.maxRetries) {
@@ -2944,7 +2973,10 @@ export class AgentSession {
 			return false;
 		}
 
-		const delayMs = settings.baseDelayMs * 2 ** (this._retryAttempt - 1);
+		const retryBaseDelayMs = rotatesProviderAffinity
+			? Math.max(settings.baseDelayMs, UPSTREAM_ERROR_RETRY_BASE_DELAY_MS)
+			: settings.baseDelayMs;
+		const delayMs = retryBaseDelayMs * 2 ** (this._retryAttempt - 1);
 
 		this._emit({
 			type: "auto_retry_start",
@@ -2983,7 +3015,47 @@ export class AgentSession {
 			this._retryAbortController = undefined;
 		}
 
+		if (rotatesProviderAffinity) {
+			this._rotateProviderSessionAffinity();
+		}
+
 		return true;
+	}
+
+	private _effectiveRetrySettings(): { enabled: boolean; maxRetries: number; baseDelayMs: number } {
+		const settings = this.settingsManager.getRetrySettings();
+		return {
+			...settings,
+			maxRetries:
+				this._retryLimitOverride === undefined
+					? settings.maxRetries
+					: Math.min(settings.maxRetries, this._retryLimitOverride),
+		};
+	}
+
+	/**
+	 * Apply or clear a caller-owned retry ceiling for the active lifecycle.
+	 * Product runtimes use this to bind one Room Dispatch to its remaining Root budget.
+	 */
+	setRetryLimitOverride(maxRetries?: number): void {
+		if (maxRetries === undefined) {
+			this._retryLimitOverride = undefined;
+			return;
+		}
+		if (!Number.isSafeInteger(maxRetries) || maxRetries < 0) {
+			throw new Error(`Invalid retry limit override: ${String(maxRetries)}`);
+		}
+		this._retryLimitOverride = maxRetries;
+	}
+
+	private _rotateProviderSessionAffinity(): void {
+		const base = this._providerSessionAffinityBase;
+		if (!base) return;
+
+		this._providerSessionAffinityGeneration++;
+		// SessionManager keeps the logical Session id. Only the Provider affinity key
+		// changes, and the successful lane remains stable for the rest of this Session.
+		this.agent.sessionId = rotateProviderSessionAffinity(base, this._providerSessionAffinityGeneration);
 	}
 
 	/**
@@ -3252,7 +3324,8 @@ export class AgentSession {
 					customInstructions,
 					replaceInstructions,
 					reserveTokens: branchSummarySettings.reserveTokens,
-					streamFn: this.agent.streamFn,
+					streamFn: this._getLifecycleStreamFn(),
+					sessionId: this.agent.sessionId,
 				});
 				if (result.aborted) {
 					return { cancelled: true, aborted: true };

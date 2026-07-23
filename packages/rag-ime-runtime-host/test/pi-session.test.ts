@@ -381,6 +381,49 @@ describe("prompt preflight diagnostics", () => {
 	});
 });
 
+describe("managed Room retry budget", () => {
+	it("caps the Agent lifecycle and reports each retry to Kernel settlement", () => {
+		const productSession = Object.create(PiProductSession.prototype) as PiProductSession;
+		const setRetryLimitOverride = vi.fn();
+		const mutable = productSession as unknown as Record<string, any>;
+		Object.assign(mutable, {
+			activeTurn: undefined,
+			activeRoom: undefined,
+			roomResourceLimits: { retryRemaining: 3 },
+			roomRetryCount: 0,
+			sequence: 0,
+			emitEvent: vi.fn(),
+			telemetry: vi.fn(() => ({})),
+			session: {
+				getSessionStats: () => ({ tokens: { input: 12, output: 7 } }),
+				setRetryLimitOverride,
+			},
+		});
+
+		mutable.beginRoomDispatch({
+			dispatchId: "dispatch:retry",
+			rootId: "root:retry",
+			generation: 0,
+			capabilityEpoch: 1,
+			roomResourceLimits: { retryRemaining: 1 },
+		});
+		mutable.onSessionEvent({
+			type: "auto_retry_start",
+			attempt: 1,
+			maxAttempts: 1,
+			delayMs: 8_000,
+			errorMessage: "OpenAI API error (502): 502 status code (no body)",
+		});
+
+		expect(setRetryLimitOverride).toHaveBeenCalledWith(1);
+		expect(mutable.roomResourceUsage()).toMatchObject({
+			inputTokens: 0,
+			outputTokens: 0,
+			retryCount: 1,
+		});
+	});
+});
+
 describe("manual compaction context refresh", () => {
 	it("reports when the compaction hook already refreshed Session memory", async () => {
 		const productSession = Object.create(PiProductSession.prototype) as PiProductSession;
@@ -462,6 +505,7 @@ describe("managed Room context epochs", () => {
 				isIdle: true,
 				systemPrompt: "stable system prompt",
 				getSessionStats: () => ({ tokens: { input: 10, output: 5 } }),
+				setRetryLimitOverride: vi.fn(),
 			},
 		});
 

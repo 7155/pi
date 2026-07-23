@@ -1,6 +1,7 @@
 import type { StreamFn } from "@earendil-works/pi-agent-core";
 import type { AssistantMessage, Context, Model, SimpleStreamOptions } from "@earendil-works/pi-ai/compat";
 import { completeSimple, isRetryableAssistantError } from "@earendil-works/pi-ai/compat";
+import { isUpstreamProviderError, rotateProviderSessionAffinity } from "../provider-session-affinity.ts";
 
 const DEFAULT_MAX_RETRIES = 3;
 const DEFAULT_BASE_DELAY_MS = 1000;
@@ -55,12 +56,20 @@ export async function completeSummarizationWithRetry(
 ): Promise<AssistantMessage> {
 	const maxRetries = Math.max(0, retryOptions.maxRetries ?? DEFAULT_MAX_RETRIES);
 	const baseDelayMs = Math.max(0, retryOptions.baseDelayMs ?? DEFAULT_BASE_DELAY_MS);
-	let response = await completeOnce(model, context, options, streamFn);
+	const affinityBase = options.sessionId;
+	let requestOptions = options;
+	let response = await completeOnce(model, context, requestOptions, streamFn);
 
 	for (let retry = 0; retry < maxRetries && isRetryableAssistantError(response); retry += 1) {
 		const delayMs = Math.min(baseDelayMs * 2 ** retry, MAX_DELAY_MS);
 		await waitForRetry(delayMs, options.signal);
-		response = await completeOnce(model, context, options, streamFn);
+		if (isUpstreamProviderError(response.errorMessage)) {
+			requestOptions = {
+				...requestOptions,
+				sessionId: rotateProviderSessionAffinity(affinityBase, retry + 1),
+			};
+		}
+		response = await completeOnce(model, context, requestOptions, streamFn);
 	}
 	return response;
 }

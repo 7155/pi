@@ -86,6 +86,12 @@ export interface PiDebugContextRecord {
 	sessionId: string;
 	turnId: string;
 	clientMessageId: string;
+	lifecycle?: {
+		kind: "compaction";
+		reason?: string;
+		status: "running" | "completed" | "failed" | "aborted";
+		error?: string;
+	};
 	capturedAtMs: number;
 	updatedAtMs: number;
 	prompt: string;
@@ -177,6 +183,8 @@ export class PiDebugContextRecorder {
 	private eventSequence = 0;
 	private providerCallSequence = 0;
 	private previousContextMessages: unknown;
+	private lifecycleTurnId: string | undefined;
+	private lifecycleSequence = 0;
 	private readonly contributionRefs: Array<Record<string, unknown>>;
 
 	constructor(
@@ -298,9 +306,21 @@ export class PiDebugContextRecorder {
 				const record = this.current();
 				if (!record) return;
 				const now = Date.now();
-				const call = this.ensureModelCall(record, now);
+				const inspection = event as {
+					model?: Record<string, unknown>;
+					context: { systemPrompt?: string; messages?: unknown };
+				};
+				const call = record.lifecycle
+					? this.startModelCall(record, now, inspection.context.messages ?? [])
+					: this.ensureModelCall(record, now);
 				call.providerContext = cloneForInspection(event.context);
 				call.updatedAtMs = now;
+				if (record.lifecycle) {
+					record.systemPrompt = String(inspection.context.systemPrompt ?? "");
+					record.model = inspection.model
+						? (cloneForInspection(inspection.model) as Record<string, unknown>)
+						: undefined;
+				}
 				record.updatedAtMs = now;
 			});
 
@@ -455,6 +475,61 @@ export class PiDebugContextRecorder {
 		return record ? structuredClone(record) : undefined;
 	}
 
+	beginLifecycle(kind: "compaction", details: { reason?: string } = {}): string {
+		const now = Date.now();
+		const turnId = `lifecycle:${kind}:${now}:${++this.lifecycleSequence}`;
+		this.lifecycleTurnId = turnId;
+		this.runtimeTurnIndex = undefined;
+		this.eventSequence = 0;
+		this.records.set(turnId, {
+			schemaVersion: "rag-ime.context-inspection.v2",
+			sessionId: this.sessionId,
+			turnId,
+			clientMessageId: "",
+			lifecycle: {
+				kind,
+				reason: details.reason,
+				status: "running",
+			},
+			capturedAtMs: now,
+			updatedAtMs: now,
+			prompt: "",
+			systemPrompt: "",
+			systemPromptOptions: {},
+			activeTools: [],
+			toolSchemas: [],
+			skillCatalog: [],
+			loadedSkillReceipts: [],
+			contributionRefs: structuredClone(this.contributionRefs),
+			contextWindows: [],
+			providerRequests: [],
+			providerRequestReceipts: [],
+			cacheEvidence: [],
+			modelCalls: [],
+			toolExecutions: [],
+			toolBatches: [],
+		});
+		this.trim();
+		return turnId;
+	}
+
+	endLifecycle(kind: "compaction", status: "completed" | "failed" | "aborted", error?: string): void {
+		const turnId = this.lifecycleTurnId;
+		const record = turnId ? this.records.get(turnId) : undefined;
+		if (!record || record.lifecycle?.kind !== kind) return;
+		const now = Date.now();
+		record.lifecycle.status = status;
+		record.lifecycle.error = error;
+		record.updatedAtMs = now;
+		const call = record.modelCalls.at(-1);
+		if (call && call.completedAtMs === undefined) {
+			call.completedAtMs = now;
+			call.updatedAtMs = now;
+		}
+		this.queuePersist(record);
+		this.lifecycleTurnId = undefined;
+	}
+
 	list(): PiDebugContextSummary[] {
 		return [...this.records.values()].reverse().map((record) => ({
 			turnId: record.turnId,
@@ -506,6 +581,8 @@ export class PiDebugContextRecorder {
 		this.eventSequence = 0;
 		this.providerCallSequence = 0;
 		this.previousContextMessages = undefined;
+		this.lifecycleTurnId = undefined;
+		this.lifecycleSequence = 0;
 	}
 
 	async flush(): Promise<void> {
@@ -518,6 +595,9 @@ export class PiDebugContextRecorder {
 	}
 
 	private current(): PiDebugContextRecord | undefined {
+		if (this.lifecycleTurnId) {
+			return this.records.get(this.lifecycleTurnId);
+		}
 		const identity = this.activeTurn();
 		return identity?.turnId ? this.records.get(identity.turnId) : undefined;
 	}
@@ -525,15 +605,23 @@ export class PiDebugContextRecorder {
 	private ensureModelCall(record: PiDebugContextRecord, now: number): PiDebugModelCall {
 		const current = record.modelCalls.at(-1);
 		if (current) return current;
+		return this.startModelCall(record, now, []);
+	}
+
+	private startModelCall(record: PiDebugContextRecord, now: number, messages: unknown): PiDebugModelCall {
+		const previousIndex = this.providerCallSequence || undefined;
+		const index = ++this.providerCallSequence;
+		const contextMessages = cloneForInspection(messages);
 		const call: PiDebugModelCall = {
-			index: 1,
+			index,
 			runtimeTurnIndex: this.runtimeTurnIndex,
 			capturedAtMs: now,
 			updatedAtMs: now,
-			contextMessages: [],
-			contextDelta: contextDelta(undefined, []),
+			contextMessages,
+			contextDelta: contextDelta(this.previousContextMessages, contextMessages, previousIndex),
 			providerExchanges: [],
 		};
+		this.previousContextMessages = contextMessages;
 		record.modelCalls.push(call);
 		return call;
 	}
@@ -734,6 +822,24 @@ function normalizeDebugContextRecord(
 		sessionId: record.sessionId,
 		turnId: record.turnId,
 		clientMessageId: typeof record.clientMessageId === "string" ? record.clientMessageId : "",
+		lifecycle:
+			record.lifecycle &&
+			typeof record.lifecycle === "object" &&
+			!Array.isArray(record.lifecycle) &&
+			(record.lifecycle as Record<string, unknown>).kind === "compaction"
+				? {
+						kind: "compaction",
+						reason:
+							typeof (record.lifecycle as Record<string, unknown>).reason === "string"
+								? String((record.lifecycle as Record<string, unknown>).reason)
+								: undefined,
+						status: normalizeLifecycleStatus((record.lifecycle as Record<string, unknown>).status),
+						error:
+							typeof (record.lifecycle as Record<string, unknown>).error === "string"
+								? String((record.lifecycle as Record<string, unknown>).error)
+								: undefined,
+					}
+				: undefined,
 		capturedAtMs: record.capturedAtMs,
 		updatedAtMs: finiteNumber(record.updatedAtMs, record.capturedAtMs),
 		prompt: typeof record.prompt === "string" ? record.prompt : "",
@@ -759,6 +865,10 @@ function normalizeDebugContextRecord(
 		toolExecutions,
 		toolBatches: buildToolBatches(toolExecutions),
 	};
+}
+
+function normalizeLifecycleStatus(value: unknown): "running" | "completed" | "failed" | "aborted" {
+	return value === "completed" || value === "failed" || value === "aborted" ? value : "running";
 }
 
 function normalizeModelCalls(

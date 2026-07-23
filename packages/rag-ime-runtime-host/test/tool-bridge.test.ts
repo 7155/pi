@@ -1,6 +1,11 @@
 import type { ToolDefinition } from "@earendil-works/pi-coding-agent";
 import { describe, expect, it, vi } from "vitest";
-import { modelVisibleResult, ToolArtifactBuffer, toolAgentBlocks } from "../src/tool-artifact-buffer.ts";
+import {
+	MAX_MODEL_VISIBLE_TOOL_RESULT_BYTES,
+	modelVisibleResult,
+	ToolArtifactBuffer,
+	toolAgentBlocks,
+} from "../src/tool-artifact-buffer.ts";
 import {
 	BackendToolRegistry,
 	backendToolCatalogRevision,
@@ -325,6 +330,59 @@ describe("BackendToolRegistry", () => {
 				definition.execute("call-post", { content: "交付" } as never, undefined, undefined, {} as never),
 			).rejects.toThrow("gateway unavailable");
 			expect(artifacts.size()).toBe(1);
+		} finally {
+			vi.unstubAllGlobals();
+		}
+	});
+
+	it("keeps every model-visible product Tool result inside Pi's 50 KiB budget", async () => {
+		const output = '长输出"\\\n'.repeat(40_000);
+		const fetchMock = vi.fn<typeof fetch>().mockResolvedValue(
+			new Response(
+				JSON.stringify({
+					ok: true,
+					result: {
+						summary: "测试输出已完成",
+						exitCode: 0,
+						mutationApplied: false,
+						output,
+					},
+				}),
+				{ status: 200, headers: { "Content-Type": "application/json" } },
+			),
+		);
+		vi.stubGlobal("fetch", fetchMock);
+		try {
+			const definition = createBackendToolDefinition(
+				{
+					sessionId: "session-bounded-result",
+					registry: new BackendToolRegistry(),
+					gatewayUrl: "http://127.0.0.1:8768/api/agent/tool/execute",
+				},
+				tool({ name: "workspace_shell" }),
+			);
+			const result = await definition.execute(
+				"call-large-output",
+				{ command: "test" } as never,
+				undefined,
+				undefined,
+				{} as never,
+			);
+			const text = result.content.find((item) => item.type === "text")?.text ?? "";
+			const visible = JSON.parse(text) as Record<string, unknown>;
+
+			expect(Buffer.byteLength(text, "utf8")).toBeLessThanOrEqual(MAX_MODEL_VISIBLE_TOOL_RESULT_BYTES);
+			expect(visible).toMatchObject({
+				summary: "测试输出已完成",
+				exitCode: 0,
+				mutationApplied: false,
+				truncated: true,
+				modelResultTruncated: true,
+				truncatedBy: "model_result_bytes",
+				maxBytes: MAX_MODEL_VISIBLE_TOOL_RESULT_BYTES,
+			});
+			expect(String(visible.preview)).toContain("长输出");
+			expect(result.details).toMatchObject({ output });
 		} finally {
 			vi.unstubAllGlobals();
 		}

@@ -120,7 +120,8 @@ describe("session context refresh", () => {
 				owner: "room_context",
 			},
 		});
-		expect(beforeCompact.compaction?.summary).toContain('type="room_context"');
+		expect(beforeCompact.compaction?.summary).toContain("current managed Provider context");
+		expect(beforeCompact.compaction?.summary).toContain("after Room release");
 		for (const fact of roomRecoveryFacts) {
 			expect(beforeCompact.compaction?.summary).not.toContain(fact);
 		}
@@ -172,6 +173,10 @@ describe("session context refresh", () => {
 		});
 		expect(fetchMock).toHaveBeenCalledTimes(4);
 		expect(fetchMock.mock.calls[0]?.[0]).toBe("http://127.0.0.1:8766/api/agent/tool/context-refresh");
+		const sessionStartRequest = JSON.parse(String(fetchMock.mock.calls[0]?.[1]?.body));
+		expect(sessionStartRequest.trigger).toBe("session_start");
+		expect(sessionStartRequest).not.toHaveProperty("roomSkillRecovery");
+		expect(sessionStartRequest).not.toHaveProperty("roomToolRecovery");
 		const request = JSON.parse(String(fetchMock.mock.calls[1]?.[1]?.body));
 		expect(request.trigger).toBe("compaction");
 		expect(request.compactionEntryId).toBe("compaction:1");
@@ -311,6 +316,66 @@ describe("session context refresh", () => {
 				{ getSystemPrompt: () => "base prompt" },
 			),
 		).rejects.toThrow("gateway offline");
+	});
+
+	it("treats an empty refreshed Session context as an authoritative clear", async () => {
+		let sessionContext = "stale Session memory";
+		let refreshCount = 0;
+		const handlers = new Map<string, (event: any, context?: any) => Promise<unknown>>();
+		const fetchMock = vi.fn().mockResolvedValue({
+			ok: true,
+			status: 200,
+			json: async () => ({
+				ok: true,
+				result: {
+					sessionContext: "",
+					roomRecoveryContext: "authoritative Room recovery",
+					contextEpoch: 2,
+					contextEpochReason: "compaction",
+				},
+			}),
+		});
+		vi.stubGlobal("fetch", fetchMock);
+		const providerContextJournal = new ProviderContextJournal();
+		const extension = createSessionContextRefreshExtension({
+			bridge: {
+				sessionId: "agent:empty-session-recovery",
+				registry: {} as never,
+				gatewayUrl: "http://127.0.0.1:8766/api/agent/tool/execute",
+				gatewayToken: "test-token",
+			},
+			getSessionContext: () => sessionContext,
+			setSessionContext: (value) => {
+				sessionContext = value;
+				refreshCount += 1;
+			},
+			getRoomContext: () => "active Room context",
+			getRoomRecoveryContext: () => "stale Room recovery",
+			setRoomRecoveryContext: () => undefined,
+			getRecentMessages: () => [],
+			getRoomSkillRecovery: () => ({ name: "room-independent-vision-review" }),
+			getRoomToolRecovery: () => ({ items: [{ name: "room_state", receiptId: "load:state" }] }),
+			providerContextJournal,
+		});
+		extension({
+			on: (event: string, handler: (value: any, context?: any) => Promise<unknown>) => handlers.set(event, handler),
+		} as never);
+
+		const compactResult = (await handlers.get("session_compact")?.(
+			{ compactionEntry: { id: "compaction:empty-session", summary: "summary" } },
+			{ getSystemPrompt: () => "base prompt" },
+		)) as { systemPrompt?: string } | undefined;
+
+		expect(refreshCount).toBe(1);
+		expect(sessionContext).toBe("");
+		expect(compactResult?.systemPrompt).toContain("authoritative Room recovery");
+		expect(compactResult?.systemPrompt).not.toContain("stale Session memory");
+		expect(compactResult?.systemPrompt).not.toContain('type="session_memory"');
+		expect(providerContextJournal.snapshot()).toMatchObject({
+			epoch: 2,
+			epochReason: "compaction",
+			entryCount: 1,
+		});
 	});
 
 	it("rejects a managed Room compaction without a product-owned compaction epoch", async () => {

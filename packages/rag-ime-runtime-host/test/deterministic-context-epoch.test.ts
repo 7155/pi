@@ -74,6 +74,39 @@ function agentContext(tools: string[], history = "", systemPrompt = ""): Context
 	};
 }
 
+function agentReceiptContext(tools: string[], receipt: Record<string, unknown>, systemPrompt = ""): Context {
+	return {
+		systemPrompt,
+		messages: [
+			{
+				role: "user",
+				content: "AGENT-SESSION-RESILIENCE",
+				timestamp: 1,
+			},
+			{
+				role: "user",
+				content: JSON.stringify(receipt),
+				timestamp: 2,
+			},
+		] as Context["messages"],
+		tools: tools.map(tool),
+	};
+}
+
+function completeBoundaryReceipt(history: string): Record<string, unknown> {
+	return {
+		history,
+		path: "/workspace/read-boundary.txt",
+		offset: 1024,
+		nextOffset: 2048,
+		byteSize: 2048,
+		contentBytes: 1024,
+		contentLines: 20,
+		modelResultLimitBytes: 50 * 1024,
+		truncated: false,
+	};
+}
+
 function collaborationContext(task: string, tools: string[], history: Record<string, unknown> = {}): Context {
 	return {
 		systemPrompt: `<room-fact kind="dispatch_state">${task}</room-fact>`,
@@ -240,9 +273,153 @@ describe("deterministic context epoch Provider", () => {
 		const planTools = ["tool_load", "workspace_read", "workspace_list", "workspace_search", "agent_plan"];
 		expect(calls(agentSessionCanaryResponse(agentContext(planTools, `${loadedSkill} ${planHistory}`)))).toEqual([
 			expect.objectContaining({
+				name: "workspace_read",
+				id: "agent-read-boundary-0",
+				arguments: expect.objectContaining({
+					path: "read-boundary.txt",
+					offset: 0,
+					limit: 65_536,
+				}),
+			}),
+		]);
+		expect(
+			calls(
+				agentSessionCanaryResponse(
+					agentReceiptContext(planTools, completeBoundaryReceipt(planHistory), loadedSkill),
+				),
+			),
+		).toEqual([
+			expect.objectContaining({
 				name: "agent_plan",
 				id: "agent-plan-review",
 				arguments: { op: "submit_review", note: expect.any(String) },
+			}),
+		]);
+
+		const firstPlanItem = calls(
+			agentSessionCanaryResponse(
+				agentReceiptContext(
+					planTools,
+					completeBoundaryReceipt(`${afterMissing} "id":"agent-list" "id":"agent-search" "id":"agent-read-app"`),
+					loadedSkill,
+				),
+			),
+		)[0];
+		expect(firstPlanItem).toMatchObject({
+			name: "agent_plan",
+			id: "agent-plan-baseline",
+			arguments: {
+				op: "update",
+				itemId: "agent-plan-item-baseline",
+				status: "pending",
+			},
+		});
+	});
+
+	it("completes every ordinary Agent plan item before final delivery", () => {
+		const loadedSkill = '<loaded_skill name="room-test-driven-implementation">';
+		const baseHistory = [
+			loadedSkill,
+			'"id":"agent-missing-read"',
+			'"id":"agent-list"',
+			'"id":"agent-search"',
+			'"id":"agent-read-app"',
+			'"id":"agent-plan-baseline"',
+			'"id":"agent-plan-patch"',
+			'"id":"agent-plan-regression"',
+			'"id":"agent-plan-review"',
+			"原生控制中心已经批准当前执行计划",
+			'"id":"agent-baseline-shell"',
+		].join(" ");
+		const shellTools = [
+			"tool_load",
+			"workspace_read",
+			"workspace_list",
+			"workspace_search",
+			"agent_plan",
+			"workspace_shell",
+		];
+		expect(
+			calls(
+				agentSessionCanaryResponse(
+					agentReceiptContext(shellTools, completeBoundaryReceipt(baseHistory), loadedSkill),
+				),
+			),
+		).toEqual([
+			expect.objectContaining({
+				name: "agent_plan",
+				id: "agent-plan-baseline-done",
+				arguments: {
+					op: "update",
+					itemId: "agent-plan-item-baseline",
+					status: "completed",
+				},
+			}),
+		]);
+
+		const patchedReceipt = {
+			...completeBoundaryReceipt(`${baseHistory} "id":"agent-plan-baseline-done" "id":"agent-patch"`),
+			mutationApplied: true,
+		};
+		expect(
+			calls(
+				agentSessionCanaryResponse(
+					agentReceiptContext([...shellTools, "workspace_patch"], patchedReceipt, loadedSkill),
+				),
+			),
+		).toEqual([
+			expect.objectContaining({
+				name: "agent_plan",
+				id: "agent-plan-patch-done",
+				arguments: {
+					op: "update",
+					itemId: "agent-plan-item-patch",
+					status: "completed",
+				},
+			}),
+		]);
+
+		const testedReceipt = {
+			...completeBoundaryReceipt(
+				`${JSON.stringify(patchedReceipt)} "id":"agent-plan-patch-done" "id":"agent-regression-shell"`,
+			),
+			mutationApplied: true,
+			exitCode: 0,
+		};
+		expect(
+			calls(
+				agentSessionCanaryResponse(
+					agentReceiptContext([...shellTools, "workspace_patch"], testedReceipt, loadedSkill),
+				),
+			),
+		).toEqual([
+			expect.objectContaining({
+				name: "agent_plan",
+				id: "agent-plan-regression-done",
+				arguments: {
+					op: "update",
+					itemId: "agent-plan-item-regression",
+					status: "completed",
+				},
+			}),
+		]);
+
+		const completedItems = {
+			...completeBoundaryReceipt(`${JSON.stringify(testedReceipt)} "id":"agent-plan-regression-done"`),
+			mutationApplied: true,
+			exitCode: 0,
+		};
+		expect(
+			calls(
+				agentSessionCanaryResponse(
+					agentReceiptContext([...shellTools, "workspace_patch"], completedItems, loadedSkill),
+				),
+			),
+		).toEqual([
+			expect.objectContaining({
+				name: "agent_plan",
+				id: "agent-plan-complete",
+				arguments: expect.objectContaining({ op: "complete" }),
 			}),
 		]);
 	});

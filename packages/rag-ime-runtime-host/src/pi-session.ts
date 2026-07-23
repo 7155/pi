@@ -400,6 +400,7 @@ export class PiProductSession implements PooledSession {
 	private roomResourceLimits?: RoomResourceLimits;
 	private roomToolCalls = 0;
 	private roomToolCost = 0;
+	private roomRetryCount = 0;
 	private latestCompaction: PublicCompactionState | undefined;
 	private readonly pendingDecisions = new Map<
 		string,
@@ -907,21 +908,28 @@ export class PiProductSession implements PooledSession {
 				? (event.message as unknown as Record<string, unknown>)
 				: undefined;
 		if (event.type === "compaction_start") {
+			this.debugContextRecorder.beginLifecycle("compaction", {
+				reason: event.reason,
+			});
 			this.latestCompaction = {
 				reason: event.reason,
 				status: "running",
 				updatedAtMs: Date.now(),
 			};
 		} else if (event.type === "compaction_end") {
+			const compactionStatus = event.aborted ? "aborted" : event.errorMessage ? "failed" : "completed";
+			this.debugContextRecorder.endLifecycle("compaction", compactionStatus, event.errorMessage);
 			this.latestCompaction = {
 				reason: event.reason,
-				status: event.aborted ? "aborted" : event.errorMessage ? "failed" : "completed",
+				status: compactionStatus,
 				tokensBefore: event.result?.tokensBefore,
 				estimatedTokensAfter: event.result?.estimatedTokensAfter,
 				willRetry: event.willRetry,
 				error: event.errorMessage,
 				updatedAtMs: Date.now(),
 			};
+		} else if (event.type === "auto_retry_start" && this.activeRoom) {
+			this.roomRetryCount += 1;
 		}
 		this.emitEvent({
 			protocolVersion: PROTOCOL_VERSION,
@@ -942,9 +950,11 @@ export class PiProductSession implements PooledSession {
 			this.activeTurn = undefined;
 			this.activeRoom = undefined;
 			this.roomUsageBaseline = undefined;
+			this.session.setRetryLimitOverride(undefined);
 			this.transientContext = "";
 		} else if (event.type === "agent_settle_failed" && !this.activeRoom) {
 			this.activeTurn = undefined;
+			this.session.setRetryLimitOverride(undefined);
 			this.transientContext = "";
 		}
 	}
@@ -1478,6 +1488,7 @@ export class PiProductSession implements PooledSession {
 			if (this.activeRoom?.dispatchId === options.dispatchId) {
 				this.activeRoom = undefined;
 				this.roomUsageBaseline = undefined;
+				this.session.setRetryLimitOverride(undefined);
 			}
 			throw error;
 		}
@@ -1499,6 +1510,7 @@ export class PiProductSession implements PooledSession {
 				if (this.activeRoom?.dispatchId === options.dispatchId) {
 					this.activeRoom = undefined;
 					this.roomUsageBaseline = undefined;
+					this.session.setRetryLimitOverride(undefined);
 				}
 				throw error;
 			}
@@ -1511,15 +1523,24 @@ export class PiProductSession implements PooledSession {
 		return { delivery: "followUp", turnId: this.activeTurn.turnId, continuationId: continuation.id };
 	}
 
-	private beginRoomDispatch(options: ActiveRoomDispatch): void {
+	private beginRoomDispatch(options: ActiveRoomDispatch & { roomResourceLimits?: RoomResourceLimits }): void {
 		const stats = this.session.getSessionStats();
-		this.activeRoom = { ...options };
+		this.activeRoom = {
+			dispatchId: options.dispatchId,
+			rootId: options.rootId,
+			generation: options.generation,
+			capabilityEpoch: options.capabilityEpoch,
+		};
 		this.roomUsageBaseline = {
 			input: stats.tokens.input,
 			output: stats.tokens.output,
 		};
 		this.roomToolCalls = 0;
 		this.roomToolCost = 0;
+		this.roomRetryCount = 0;
+		this.session.setRetryLimitOverride(
+			options.roomResourceLimits?.retryRemaining ?? this.roomResourceLimits?.retryRemaining,
+		);
 	}
 
 	private roomResourceUsage(): Record<string, number> {
@@ -1530,7 +1551,7 @@ export class PiProductSession implements PooledSession {
 			outputTokens: Math.max(0, stats.tokens.output - (baseline?.output ?? stats.tokens.output)),
 			toolCalls: this.roomToolCalls,
 			toolCost: this.roomToolCost,
-			retryCount: 0,
+			retryCount: this.roomRetryCount,
 		};
 	}
 
