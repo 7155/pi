@@ -26,6 +26,8 @@ describe("Room runtime RPC", () => {
 			modelsPath: null,
 			allowModelNetwork: false,
 		});
+		const advertisedModel = modelRuntime.getModels().find((model) => model.maxTokens > 1024);
+		expect(advertisedModel).toBeDefined();
 		const host = await RagImeRuntimeHost.create({
 			agentDir: join(root, "agent"),
 			sessionDir: join(root, "sessions"),
@@ -64,6 +66,8 @@ describe("Room runtime RPC", () => {
 						retryRemaining: 1,
 						repairRemaining: 1,
 					},
+					provider: advertisedModel?.provider,
+					modelId: advertisedModel?.id,
 				}),
 			)) as Record<string, any>;
 
@@ -76,6 +80,7 @@ describe("Room runtime RPC", () => {
 				journalId: "journal:1",
 				throughSequence: 1,
 			});
+			expect(opened.snapshot.model.maxTokens).toBe(advertisedModel?.maxTokens);
 		} finally {
 			await host.dispose();
 			await rm(root, { recursive: true, force: true });

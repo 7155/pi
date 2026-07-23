@@ -99,6 +99,13 @@ describe("PiDebugContextRecorder", () => {
 			payload: {
 				model: "gpt-test",
 				input: "final provider input",
+				reasoning: {
+					effort: "high",
+					summary: "auto",
+					content: "private rationale",
+					encrypted_content: "encrypted-rationale",
+				},
+				usage: { output_tokens_details: { reasoning_tokens: 17 } },
 				authorization: "Bearer secret",
 				api_key: "secret-key",
 				headers: { Authorization: "Bearer nested-secret", "x-api-key": "x-secret" },
@@ -190,6 +197,8 @@ describe("PiDebugContextRecorder", () => {
 			api_key: "[credential omitted]",
 			headers: { Authorization: "[credential omitted]", "x-api-key": "[credential omitted]" },
 			image: expect.stringContaining("binary data omitted"),
+			reasoning: { effort: "high", summary: "auto" },
+			usage: { output_tokens_details: { reasoning_tokens: 17 } },
 		});
 		expect(captured?.modelCalls).toHaveLength(2);
 		expect(captured?.modelCalls[0]?.providerExchanges[0]).toMatchObject({
@@ -218,6 +227,8 @@ describe("PiDebugContextRecorder", () => {
 		expect(JSON.stringify(captured)).not.toContain("private-cookie");
 		expect(JSON.stringify(captured)).not.toContain("hidden chain");
 		expect(JSON.stringify(captured)).not.toContain('"text":"private"');
+		expect(JSON.stringify(captured)).not.toContain("private rationale");
+		expect(JSON.stringify(captured)).not.toContain("encrypted-rationale");
 		expect(recorder.list()).toEqual([
 			expect.objectContaining({
 				turnId: "turn-1",
@@ -232,6 +243,65 @@ describe("PiDebugContextRecorder", () => {
 		expect(recorder.get("turn-2")).toBeUndefined();
 		recorder.clear();
 		expect(recorder.get()).toBeUndefined();
+	});
+
+	it("persists the provider request boundary when the provider fails before an assistant message", async () => {
+		const directory = mkdtempSync(join(tmpdir(), "pi-debug-context-provider-failure-"));
+		try {
+			const activeTurn = { turnId: "turn-provider-failure", clientMessageId: "client-provider-failure" };
+			const recorder = new PiDebugContextRecorder("session-provider-failure", () => activeTurn, {
+				directory,
+				maxBytes: 64 * 1024,
+			});
+			const handlers = new Map<string, DebugHandler>();
+			recorder.extension()({
+				on: (name: string, handler: DebugHandler) => handlers.set(name, handler),
+				getActiveTools: () => [],
+				getAllTools: () => [],
+			} as never);
+			handlers.get("before_agent_start")?.(
+				{ prompt: "test failure", systemPrompt: "system", systemPromptOptions: {} },
+				{ model: { provider: "openai", id: "gpt-test", api: "responses" } },
+			);
+			handlers.get("context")?.({ messages: [{ role: "user", content: "test failure" }] });
+			handlers.get("provider_context_inspection")?.({
+				context: {
+					systemPrompt: "system",
+					messages: [{ role: "user", content: "test failure" }],
+					tools: [],
+				},
+			});
+			handlers.get("before_provider_request")?.({
+				payload: { model: "gpt-test", input: "final provider input", stream: true },
+			});
+			handlers.get("after_provider_response")?.({
+				status: 400,
+				headers: { "x-request-id": "request-failed" },
+			});
+			await recorder.flush();
+
+			const restored = new PiDebugContextRecorder("session-provider-failure", () => undefined, {
+				directory,
+				maxBytes: 64 * 1024,
+			});
+			await restored.flush();
+			const captured = restored.get("turn-provider-failure");
+
+			expect(captured?.providerRequests).toHaveLength(1);
+			expect(captured?.providerRequests[0]?.payload).toMatchObject({
+				model: "gpt-test",
+				input: "final provider input",
+			});
+			expect(captured?.modelCalls[0]?.providerContext).toMatchObject({
+				systemPrompt: "system",
+			});
+			expect(captured?.modelCalls[0]?.providerExchanges[0]).toMatchObject({
+				status: 400,
+				headers: { "x-request-id": "request-failed" },
+			});
+		} finally {
+			rmSync(directory, { recursive: true, force: true });
+		}
 	});
 
 	it("persists recent snapshots and restores them without exceeding the configured cap", async () => {

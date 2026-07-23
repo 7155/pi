@@ -316,9 +316,10 @@ function publicSessionModel(model: Model<Api>): Record<string, unknown> {
 	};
 }
 
-function recallMessageText(message: Record<string, unknown>): string {
+function recallMessageText(message: Record<string, unknown>, maximum = 1200): string {
+	const limit = Math.max(1, Math.min(maximum, 4_000));
 	const content = message.content;
-	if (typeof content === "string") return content.trim().slice(0, 1200);
+	if (typeof content === "string") return content.trim().slice(0, limit);
 	if (!Array.isArray(content)) return "";
 	return content
 		.filter(
@@ -331,7 +332,7 @@ function recallMessageText(message: Record<string, unknown>): string {
 		.map((block) => String(block.text ?? "").trim())
 		.filter(Boolean)
 		.join("\n")
-		.slice(0, 1200);
+		.slice(0, limit);
 }
 
 function uiConfirmationValue(value: string): boolean {
@@ -541,6 +542,23 @@ export class PiProductSession implements PooledSession {
 					getRecentMessages: () => productSession?.recentMessagesForContext() ?? [],
 					getRoomSkillRecovery: () => productSession?.roomSkillLoadReceipt(),
 					getRoomToolRecovery: () => productSession?.roomToolRecoveryReceipt(),
+					getAgentSkillRecovery: () => {
+						const items = debugContextRecorder.loadedSkillRecoveryReceipts();
+						return items.length > 0 ? { schemaVersion: "rag-ime.agent-skill-recovery.v1", items } : undefined;
+					},
+					getAgentToolRecovery: () => {
+						const items = registry.disclosed().map((tool) => ({
+							name: tool.name,
+							schemaRevision: backendToolSchemaRevision([tool]),
+						}));
+						return items.length > 0
+							? {
+									schemaVersion: "rag-ime.agent-tool-recovery.v1",
+									catalogRevision: registry.revision(),
+									items,
+								}
+							: undefined;
+					},
 					providerContextJournal,
 				}),
 				createWorkflowControlExtension({
@@ -605,9 +623,9 @@ export class PiProductSession implements PooledSession {
 					`Model not found: ${options.provider}/${options.modelId}`,
 				);
 			}
-			if (options.roomResourceLimits) {
-				model = { ...model, maxTokens: Math.min(model.maxTokens, options.roomResourceLimits.maxOutputTokens) };
-			}
+			// Room output accounting is a Kernel budget, not Provider model
+			// metadata. Keep the catalog model intact and enforce the Room limit
+			// from actual response receipts instead of mutating model.maxTokens.
 		}
 		const created = await createAgentSession({
 			cwd: options.cwd,
@@ -1005,12 +1023,22 @@ export class PiProductSession implements PooledSession {
 
 	private recentMessagesForContext(): Array<{ role: "user" | "assistant"; text: string }> {
 		const result: Array<{ role: "user" | "assistant"; text: string }> = [];
+		let preservedOriginalRequirement = false;
 		for (const message of this.session.messages) {
 			if (message.role !== "user" && message.role !== "assistant") continue;
-			const text = recallMessageText(message as unknown as Record<string, unknown>);
+			const preserveAsOriginal = message.role === "user" && !preservedOriginalRequirement;
+			const text = recallMessageText(
+				message as unknown as Record<string, unknown>,
+				preserveAsOriginal ? 4_000 : 1_200,
+			);
 			if (text) result.push({ role: message.role, text });
+			if (preserveAsOriginal && text) preservedOriginalRequirement = true;
 		}
-		return result.slice(-8);
+		if (result.length <= 8) return result;
+		const firstUser = result.find((message) => message.role === "user");
+		const tail = result.slice(-7);
+		if (!firstUser || tail.includes(firstUser)) return result.slice(-8);
+		return [firstUser, ...tail];
 	}
 
 	private notice(payload: Record<string, unknown>): void {

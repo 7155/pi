@@ -116,6 +116,41 @@ describe("generateSummary reasoning options", () => {
 		expect(completeSimpleMock.mock.calls[0][2]).not.toHaveProperty("reasoning");
 	});
 
+	it("retries a transient upstream summary failure before returning", async () => {
+		vi.useFakeTimers();
+		completeSimpleMock
+			.mockResolvedValueOnce({
+				...mockSummaryResponse,
+				content: [],
+				stopReason: "error",
+				errorMessage: 'OpenAI API error (400): {"message":"Upstream request failed","type":"upstream_error"}',
+			})
+			.mockResolvedValueOnce(mockSummaryResponse);
+
+		try {
+			const summaryPromise = generateSummary(messages, createModel(false), 2000, "test-key");
+			await vi.runAllTimersAsync();
+			await expect(summaryPromise).resolves.toContain("Test summary");
+			expect(completeSimpleMock).toHaveBeenCalledTimes(2);
+		} finally {
+			vi.useRealTimers();
+		}
+	});
+
+	it("does not retry a non-transient summary validation error", async () => {
+		completeSimpleMock.mockResolvedValueOnce({
+			...mockSummaryResponse,
+			content: [],
+			stopReason: "error",
+			errorMessage: 'OpenAI API error (400): {"type":"invalid_request_error"}',
+		});
+
+		await expect(generateSummary(messages, createModel(false), 2000, "test-key")).rejects.toThrow(
+			"invalid_request_error",
+		);
+		expect(completeSimpleMock).toHaveBeenCalledTimes(1);
+	});
+
 	it("clamps compaction summary maxTokens to the model output cap", async () => {
 		const preparation: CompactionPreparation = {
 			firstKeptEntryId: "entry-keep",

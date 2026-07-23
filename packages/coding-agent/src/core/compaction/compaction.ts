@@ -6,8 +6,7 @@
  */
 
 import type { AgentMessage, StreamFn, ThinkingLevel } from "@earendil-works/pi-agent-core";
-import type { AssistantMessage, Context, Model, SimpleStreamOptions, Usage } from "@earendil-works/pi-ai/compat";
-import { completeSimple } from "@earendil-works/pi-ai/compat";
+import type { AssistantMessage, Model, SimpleStreamOptions, Usage } from "@earendil-works/pi-ai/compat";
 import { convertToLlm } from "../messages.ts";
 import {
 	buildSessionContext,
@@ -15,6 +14,7 @@ import {
 	type SessionEntry,
 	sessionEntryToContextMessages,
 } from "../session-manager.ts";
+import { completeSummarizationWithRetry } from "./summarization-completion.ts";
 import {
 	computeFileLists,
 	createFileOps,
@@ -526,19 +526,6 @@ function createSummarizationOptions(
 	return options;
 }
 
-async function completeSummarization(
-	model: Model<any>,
-	context: Context,
-	options: SimpleStreamOptions,
-	streamFn?: StreamFn,
-): Promise<AssistantMessage> {
-	if (!streamFn) {
-		return completeSimple(model, context, options);
-	}
-	const stream = await streamFn(model, context, options);
-	return stream.result();
-}
-
 /**
  * Generate a summary of the conversation using the LLM.
  * If previousSummary is provided, uses the update prompt to merge.
@@ -589,7 +576,7 @@ export async function generateSummary(
 
 	const completionOptions = createSummarizationOptions(model, maxTokens, apiKey, headers, env, signal, thinkingLevel);
 
-	const response = await completeSummarization(
+	const response = await completeSummarizationWithRetry(
 		model,
 		{ systemPrompt: SUMMARIZATION_SYSTEM_PROMPT, messages: summarizationMessages },
 		completionOptions,
@@ -854,7 +841,7 @@ async function generateTurnPrefixSummary(
 		},
 	];
 
-	const response = await completeSummarization(
+	const response = await completeSummarizationWithRetry(
 		model,
 		{ systemPrompt: SUMMARIZATION_SYSTEM_PROMPT, messages: summarizationMessages },
 		createSummarizationOptions(model, maxTokens, apiKey, headers, env, signal, thinkingLevel),

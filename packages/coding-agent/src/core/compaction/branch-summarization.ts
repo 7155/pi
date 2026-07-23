@@ -7,7 +7,6 @@
 
 import type { AgentMessage, StreamFn } from "@earendil-works/pi-agent-core";
 import type { Model, SimpleStreamOptions } from "@earendil-works/pi-ai/compat";
-import { completeSimple } from "@earendil-works/pi-ai/compat";
 import {
 	convertToLlm,
 	createBranchSummaryMessage,
@@ -16,6 +15,7 @@ import {
 } from "../messages.ts";
 import type { ReadonlySessionManager, SessionEntry } from "../session-manager.ts";
 import { estimateTokens } from "./compaction.ts";
+import { completeSummarizationWithRetry } from "./summarization-completion.ts";
 import {
 	computeFileLists,
 	createFileOps,
@@ -339,9 +339,7 @@ export async function generateBranchSummary(
 	// without running through agent state/events.
 	const context = { systemPrompt: SUMMARIZATION_SYSTEM_PROMPT, messages: summarizationMessages };
 	const requestOptions: SimpleStreamOptions = { apiKey, headers, env, signal, maxTokens: 2048 };
-	const response = streamFn
-		? await (await streamFn(model, context, requestOptions)).result()
-		: await completeSimple(model, context, requestOptions);
+	const response = await completeSummarizationWithRetry(model, context, requestOptions, streamFn);
 
 	// Check if aborted or errored
 	if (response.stopReason === "aborted") {

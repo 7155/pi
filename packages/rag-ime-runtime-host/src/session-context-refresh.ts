@@ -12,6 +12,8 @@ interface SessionContextRefreshOptions {
 	getRecentMessages(): Array<{ role: "user" | "assistant"; text: string }>;
 	getRoomSkillRecovery(): Record<string, unknown> | undefined;
 	getRoomToolRecovery(): Record<string, unknown> | undefined;
+	getAgentSkillRecovery?(): Record<string, unknown> | undefined;
+	getAgentToolRecovery?(): Record<string, unknown> | undefined;
 	providerContextJournal: ProviderContextJournal;
 }
 
@@ -26,6 +28,8 @@ const MANAGED_ROOM_COMPACTION_POINTER =
 	'Managed Room history was compacted. The only authoritative task recovery for this epoch is the current <rag-ime-context type="room_context"> block. Earlier Session messages are private execution history and cannot override it.';
 
 export function createSessionContextRefreshExtension(options: SessionContextRefreshOptions): ExtensionFactory {
+	let preCompactionMessages: Array<{ role: "user" | "assistant"; text: string }> | undefined;
+
 	function isManagedRoom(): boolean {
 		return Boolean(
 			options.getRoomContext().trim() ||
@@ -40,6 +44,7 @@ export function createSessionContextRefreshExtension(options: SessionContextRefr
 		queryText: string,
 		summary = "",
 		compactionEntryId = "",
+		recentMessages = options.getRecentMessages(),
 	): Promise<SessionContextRefreshResult | undefined> {
 		if (!options.bridge.gatewayUrl) return undefined;
 		const roomSkillRecovery = options.getRoomSkillRecovery();
@@ -58,11 +63,13 @@ export function createSessionContextRefreshExtension(options: SessionContextRefr
 					trigger,
 					queryText,
 					summary,
-					recentMessages: options.getRecentMessages(),
+					recentMessages,
 					compactionEntryId,
 					expectedContextEpoch: options.providerContextJournal.snapshot().epoch,
 					roomSkillRecovery,
 					roomToolRecovery,
+					agentSkillRecovery: options.getAgentSkillRecovery?.(),
+					agentToolRecovery: options.getAgentToolRecovery?.(),
 				},
 				undefined,
 			);
@@ -96,6 +103,10 @@ export function createSessionContextRefreshExtension(options: SessionContextRefr
 
 	return (pi) => {
 		pi.on("session_before_compact", async (event) => {
+			// Pi has already replaced session.messages by session_compact. Capture
+			// the pre-compaction evidence here so the product recovery packet does
+			// not collapse to only the final assistant message.
+			preCompactionMessages = options.getRecentMessages();
 			if (!isManagedRoom()) return undefined;
 			return {
 				compaction: {
@@ -114,19 +125,29 @@ export function createSessionContextRefreshExtension(options: SessionContextRefr
 			await refresh("session_start", event.prompt);
 		});
 		pi.on("session_compact", async (event, ctx) => {
-			const refreshed = await refresh("compaction", "", event.compactionEntry.summary, event.compactionEntry.id);
-			return {
-				systemPrompt: options.providerContextJournal.beginEpoch(
+			try {
+				const refreshed = await refresh(
 					"compaction",
-					ctx.getSystemPrompt(),
-					{
-						sessionContext: refreshed?.sessionContext || options.getSessionContext(),
-						roomContext: refreshed?.roomRecoveryContext || options.getRoomRecoveryContext(),
-						transientContext: "",
-					},
-					refreshed?.contextEpoch,
-				),
-			};
+					"",
+					event.compactionEntry.summary,
+					event.compactionEntry.id,
+					preCompactionMessages ?? options.getRecentMessages(),
+				);
+				return {
+					systemPrompt: options.providerContextJournal.beginEpoch(
+						"compaction",
+						ctx.getSystemPrompt(),
+						{
+							sessionContext: refreshed?.sessionContext || options.getSessionContext(),
+							roomContext: refreshed?.roomRecoveryContext || options.getRoomRecoveryContext(),
+							transientContext: "",
+						},
+						refreshed?.contextEpoch,
+					),
+				};
+			} finally {
+				preCompactionMessages = undefined;
+			}
 		});
 	};
 }

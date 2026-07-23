@@ -60,6 +60,27 @@ describe("Room settle lifecycle", () => {
 		expect(fetchMock).not.toHaveBeenCalled();
 	});
 
+	it.each(["error", "aborted"] as const)(
+		"does not turn a %s Provider result into a missing-room-commit repair",
+		async (stopReason) => {
+			const fetchMock = vi.fn();
+			vi.stubGlobal("fetch", fetchMock);
+			const handler = captureHandler(() => activeRoom);
+
+			await expect(
+				handler({
+					...event,
+					message: {
+						...event.message,
+						stopReason,
+						errorMessage: stopReason === "error" ? "upstream failed" : undefined,
+					},
+				}),
+			).resolves.toBeUndefined();
+			expect(fetchMock).not.toHaveBeenCalled();
+		},
+	);
+
 	it("turns one product repair receipt into a native structured continuation", async () => {
 		const fetchMock = vi.fn(async () =>
 			gatewayResponse({

@@ -221,6 +221,66 @@ describe("session context refresh", () => {
 		).resolves.toBeUndefined();
 	});
 
+	it("uses the pre-compaction ordinary Agent messages and exact load revisions once", async () => {
+		let recentMessages = [
+			{ role: "user" as const, text: "ORIGINAL-REQUIREMENT: finish the project" },
+			{ role: "assistant" as const, text: "Current implementation is complete" },
+		];
+		const handlers = new Map<string, (event: any, context?: any) => Promise<unknown>>();
+		const fetchMock = vi.fn().mockResolvedValue({
+			ok: true,
+			status: 200,
+			json: async () => ({ ok: true, result: { sessionContext: "## 压缩恢复包" } }),
+		});
+		vi.stubGlobal("fetch", fetchMock);
+		const extension = createSessionContextRefreshExtension({
+			bridge: {
+				sessionId: "agent:ordinary-recovery",
+				registry: {} as never,
+				gatewayUrl: "http://127.0.0.1:8766/api/agent/tool/execute",
+				gatewayToken: "test-token",
+			},
+			getSessionContext: () => "ordinary memory",
+			setSessionContext: () => undefined,
+			getRoomContext: () => "",
+			getRoomRecoveryContext: () => "",
+			setRoomRecoveryContext: () => undefined,
+			getRecentMessages: () => recentMessages,
+			getRoomSkillRecovery: () => undefined,
+			getRoomToolRecovery: () => undefined,
+			getAgentSkillRecovery: () => ({
+				schemaVersion: "rag-ime.agent-skill-recovery.v1",
+				items: [{ name: "notfor", contentRevision: "a".repeat(64) }],
+			}),
+			getAgentToolRecovery: () => ({
+				schemaVersion: "rag-ime.agent-tool-recovery.v1",
+				catalogRevision: "b".repeat(64),
+				items: [{ name: "workspace_read", schemaRevision: "c".repeat(64) }],
+			}),
+			providerContextJournal: new ProviderContextJournal(),
+		});
+		extension({
+			on: (event: string, handler: (value: any, context?: any) => Promise<unknown>) => handlers.set(event, handler),
+		} as never);
+
+		await handlers.get("session_before_compact")?.({
+			preparation: { firstKeptEntryId: "entry:kept", tokensBefore: 1_000 },
+		});
+		recentMessages = [{ role: "assistant", text: "post-compaction-only" }];
+		await handlers.get("session_compact")?.(
+			{ compactionEntry: { id: "compaction:ordinary", summary: "summary" } },
+			{ getSystemPrompt: () => "base prompt" },
+		);
+
+		const request = JSON.parse(String(fetchMock.mock.calls[0]?.[1]?.body));
+		expect(request.recentMessages).toEqual([
+			{ role: "user", text: "ORIGINAL-REQUIREMENT: finish the project" },
+			{ role: "assistant", text: "Current implementation is complete" },
+		]);
+		expect(request.agentSkillRecovery.items[0].contentRevision).toBe("a".repeat(64));
+		expect(request.agentToolRecovery.items[0].schemaRevision).toBe("c".repeat(64));
+	});
+
 	it("fails closed when governed Room skill recovery cannot reach the product", async () => {
 		const handlers = new Map<string, (event: any, context?: any) => Promise<unknown>>();
 		vi.stubGlobal("fetch", vi.fn().mockRejectedValue(new Error("gateway offline")));

@@ -1,6 +1,11 @@
 import type { Context, Tool } from "@earendil-works/pi-ai";
 import { describe, expect, it } from "vitest";
-import { contextEpochCanaryResponse, projectTaskCanaryResponse } from "../src/deterministic-test-adapter.ts";
+import {
+	agentSessionCanaryResponse,
+	contextEpochCanaryResponse,
+	projectCollaborationCanaryResponse,
+	projectTaskCanaryResponse,
+} from "../src/deterministic-test-adapter.ts";
 
 const tool = (name: string): Tool => ({
 	name,
@@ -51,6 +56,34 @@ function projectContext(tools: string[], history = ""): Context {
 	return {
 		systemPrompt: projectTaskPrompt,
 		messages: history ? ([{ role: "user", content: history, timestamp: 1 }] as Context["messages"]) : [],
+		tools: tools.map(tool),
+	};
+}
+
+function agentContext(tools: string[], history = "", systemPrompt = ""): Context {
+	return {
+		systemPrompt,
+		messages: [
+			{
+				role: "user",
+				content: `AGENT-SESSION-RESILIENCE ${history}`,
+				timestamp: 1,
+			},
+		] as Context["messages"],
+		tools: tools.map(tool),
+	};
+}
+
+function collaborationContext(task: string, tools: string[], history: Record<string, unknown> = {}): Context {
+	return {
+		systemPrompt: `<room-fact kind="dispatch_state">${task}</room-fact>`,
+		messages: [
+			{
+				role: "user",
+				content: JSON.stringify(history),
+				timestamp: 1,
+			},
+		] as Context["messages"],
 		tools: tools.map(tool),
 	};
 }
@@ -172,5 +205,130 @@ describe("deterministic context epoch Provider", () => {
 			id: "project-commit",
 			arguments: { requirementCoverage: ["project:1", "project:2"] },
 		});
+	});
+
+	it("drives an ordinary Agent Session through progressive discovery and planning", () => {
+		expect(calls(agentSessionCanaryResponse(agentContext(["skill_load"])))).toEqual([
+			expect.objectContaining({ name: "skill_load", arguments: { name: "room-test-driven-implementation" } }),
+		]);
+
+		const loadedSkill = '<loaded_skill name="room-test-driven-implementation">';
+		expect(calls(agentSessionCanaryResponse(agentContext(["tool_load"], loadedSkill)))).toEqual([
+			expect.objectContaining({ name: "tool_load", arguments: { name: "workspace_read" } }),
+		]);
+
+		const readTool = ["tool_load", "workspace_read"];
+		expect(calls(agentSessionCanaryResponse(agentContext(readTool, loadedSkill)))).toEqual([
+			expect.objectContaining({ name: "workspace_read", id: "agent-missing-read" }),
+		]);
+
+		const afterMissing = `${loadedSkill} "id":"agent-missing-read"`;
+		expect(calls(agentSessionCanaryResponse(agentContext(readTool, afterMissing)))).toEqual([
+			expect.objectContaining({ name: "tool_load", arguments: { name: "workspace_list" } }),
+			expect.objectContaining({ name: "tool_load", arguments: { name: "workspace_search" } }),
+		]);
+
+		const planHistory = [
+			afterMissing,
+			'"id":"agent-list"',
+			'"id":"agent-search"',
+			'"id":"agent-read-app"',
+			'"id":"agent-plan-baseline"',
+			'"id":"agent-plan-patch"',
+			'"id":"agent-plan-regression"',
+		].join(" ");
+		const planTools = ["tool_load", "workspace_read", "workspace_list", "workspace_search", "agent_plan"];
+		expect(calls(agentSessionCanaryResponse(agentContext(planTools, `${loadedSkill} ${planHistory}`)))).toEqual([
+			expect.objectContaining({
+				name: "agent_plan",
+				id: "agent-plan-review",
+				arguments: { op: "submit_review", note: expect.any(String) },
+			}),
+		]);
+	});
+
+	it("routes the deterministic three-member task through collaboration and formal handoff", () => {
+		const aTask = [
+			"原始需求（不可改写）：",
+			"COLLAB-B-REVIEWED",
+			"COLLAB-C-ACCEPTED",
+			"当前任务：",
+			"目标：THREE-MEMBER-ROOM-CANARY",
+			"验收条件 acceptance.criteria",
+			'criterionId: "criterion:a"',
+		].join("\n");
+		const roomState = {
+			history: '"id":"collab-a-state"',
+			participants: [
+				{ id: "participant:reviewer", collaborationRole: "reviewer" },
+				{ id: "participant:coordinator", collaborationRole: "coordinator" },
+			],
+		};
+		const collaborate = calls(
+			projectCollaborationCanaryResponse(
+				collaborationContext(aTask, ["tool_load", "room_state", "room_collaborate"], roomState),
+			),
+		)[0];
+		expect(collaborate).toMatchObject({
+			name: "room_collaborate",
+			id: "collab-a-collaborate",
+			arguments: {
+				targetParticipantId: "participant:reviewer",
+				intentKind: "review",
+				acceptanceCriterionIds: [],
+			},
+		});
+
+		const cTask = [
+			"原始需求（不可改写）：THREE-MEMBER-ROOM-CANARY",
+			"当前任务：",
+			"目标：COLLAB-C-ACCEPTED",
+			"验收条件 acceptance.criteria",
+			'criterionId: "criterion:1"',
+			'criterionId: "criterion:2"',
+		].join("\n");
+		const commit = calls(
+			projectCollaborationCanaryResponse(
+				collaborationContext(
+					cTask,
+					["tool_load", "room_state", "workspace_read", "workspace_shell", "room_post", "room_commit"],
+					{
+						history: [
+							'"id":"collab-c-state"',
+							'"id":"collab-c-read-app"',
+							'"id":"collab-c-acceptance-shell"',
+							'"id":"collab-c-post"',
+						].join(" "),
+						executionReceiptId: "execution:c",
+					},
+				),
+			),
+		)[0];
+		expect(commit).toMatchObject({
+			name: "room_commit",
+			id: "collab-c-commit",
+			arguments: {
+				decision: "deliver",
+				result: "COLLAB-C-COMMIT-RESULT",
+				requirementCoverage: ["criterion:1", "criterion:2"],
+			},
+		});
+	});
+
+	it("summarizes and recovers an ordinary Agent Session without tools", () => {
+		const summary = agentSessionCanaryResponse(
+			agentContext(
+				[],
+				"The messages above are a conversation to summarize. Create a structured context checkpoint summary.",
+			),
+		);
+		expect(summary.content).toEqual([
+			expect.objectContaining({ type: "text", text: expect.stringContaining("AGENT-SESSION-RESILIENCE completed") }),
+		]);
+
+		const recovered = agentSessionCanaryResponse(agentContext([], "压缩恢复检查 AGENT-SESSION-RECOVERY-OK"));
+		expect(recovered.content).toEqual([
+			expect.objectContaining({ type: "text", text: expect.stringContaining("AGENT-SESSION-RECOVERY-OK") }),
+		]);
 	});
 });

@@ -468,6 +468,21 @@ export class PiDebugContextRecorder {
 		}));
 	}
 
+	loadedSkillRecoveryReceipts(): Array<Record<string, unknown>> {
+		const receipts = new Map<string, Record<string, unknown>>();
+		for (const record of this.records.values()) {
+			for (const receipt of record.loadedSkillReceipts) {
+				const name = typeof receipt.name === "string" ? receipt.name.trim() : "";
+				const revision = typeof receipt.contentRevision === "string" ? receipt.contentRevision.trim() : "";
+				if (!name || !revision) continue;
+				receipts.set(`${name}\u001f${revision}`, structuredClone(receipt));
+			}
+		}
+		return [...receipts.values()].sort((left, right) =>
+			String(left.name ?? "").localeCompare(String(right.name ?? "")),
+		);
+	}
+
 	storage(): PiDebugContextStorageStatus {
 		return {
 			persistent: Boolean(this.storageDirectory) && !this.storageError,
@@ -954,6 +969,26 @@ function redactInspectionString(value: string): string {
 		.replace(/\b(?:sk|rk|pk)-[A-Za-z0-9_-]{12,}\b/gu, "[credential omitted]");
 }
 
+function safeReasoningInspectionValue(value: unknown): unknown {
+	if (typeof value === "boolean") return value;
+	if (typeof value === "number" && Number.isFinite(value) && value >= 0) return value;
+	if (!value || typeof value !== "object" || Array.isArray(value)) return undefined;
+
+	const source = value as Record<string, unknown>;
+	const result: Record<string, unknown> = {};
+	for (const key of ["effort", "summary"] as const) {
+		const item = source[key];
+		if (item === null && key === "summary") {
+			result[key] = null;
+			continue;
+		}
+		if (typeof item === "string" && /^[A-Za-z][A-Za-z0-9_-]{0,31}$/u.test(item)) {
+			result[key] = item;
+		}
+	}
+	return Object.keys(result).length ? result : undefined;
+}
+
 function cloneForInspection(value: unknown): unknown {
 	let serialized: string;
 	try {
@@ -965,7 +1000,10 @@ function cloneForInspection(value: unknown): unknown {
 			) {
 				return "[credential omitted]";
 			}
-			if (/^(?:thinking|reasoning|analysis|encrypted[_-]?content)$/iu.test(key)) {
+			if (/^reasoning$/iu.test(key)) {
+				return safeReasoningInspectionValue(item);
+			}
+			if (/^(?:thinking|analysis|encrypted[_-]?content)$/iu.test(key)) {
 				return undefined;
 			}
 			if (

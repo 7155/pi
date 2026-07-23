@@ -29,6 +29,13 @@ export function createRoomSettleLifecycleExtension(options: RoomSettleLifecycleO
 		pi.on("before_agent_settle", async (event: BeforeAgentSettleEvent) => {
 			const active = options.getActiveRoom();
 			if (!active) return;
+			// A failed or aborted Provider turn cannot possibly have produced a
+			// valid room_commit. Let the native failure lifecycle remain
+			// authoritative instead of enqueueing misleading "missing commit"
+			// repair prompts that call the broken Provider again.
+			if (event.message.stopReason === "error" || event.message.stopReason === "aborted") {
+				return;
+			}
 			const response = await requestProductGateway(
 				options.bridge,
 				"room-settle",

@@ -41,6 +41,11 @@ const RETRYABLE_PROVIDER_ERROR_PATTERN = buildProviderErrorPattern([
 	// Wrapper/provider text for transient upstream failures, including OpenRouter
 	// "Provider returned error" responses (#2264).
 	"provider.?returned.?error",
+	// OpenAI-compatible gateways sometimes wrap a transient upstream 5xx as an
+	// HTTP 400 body with type=upstream_error. Match the explicit wrapper signal,
+	// not generic 400/invalid-request errors.
+	"upstream.?request.?failed",
+	"upstream_error",
 
 	// Network, proxy, and fetch transport failures. This includes OpenAI Codex
 	// raw-fetch failures such as "upstream connect", "connection refused", and
@@ -68,6 +73,7 @@ const RETRYABLE_PROVIDER_ERROR_PATTERN = buildProviderErrorPattern([
 	// (#4433); Bedrock/Smithy can throw an HTTP/2 no-response error (#3594).
 	"ended without",
 	"stream ended before message_stop",
+	"stream.?read.?error",
 	"http2 request did not get a response",
 
 	// Provider-requested retry delay cap failures should flow through the outer
