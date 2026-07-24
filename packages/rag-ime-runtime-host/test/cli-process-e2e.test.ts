@@ -157,6 +157,20 @@ describe("runtime host real JSONL process", () => {
 		expect(opened.result.snapshot.toolManifest).toEqual(
 			expect.arrayContaining([expect.objectContaining({ name: "product_probe" })]),
 		);
+		const controlState = await host.request("control-state", "session.control_state", {
+			sessionId: "session:e2e",
+		});
+		expect(controlState.result).toMatchObject({
+			schemaVersion: "rag-ime.pi-session-control-state.v1",
+			sessionId: "session:e2e",
+			isIdle: true,
+			roomCapability: {
+				manifestId: "manifest:test",
+				promptCompileReceiptId: "receipt:test",
+			},
+		});
+		expect(controlState.result).not.toHaveProperty("messages");
+		expect(controlState.result).not.toHaveProperty("entries");
 
 		const receipt = await host.request("dispatch", "room.dispatch", {
 			sessionId: "session:e2e",

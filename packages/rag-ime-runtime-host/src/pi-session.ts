@@ -1095,6 +1095,19 @@ export class PiProductSession implements PooledSession {
 		});
 	}
 
+	controlState(): Record<string, unknown> {
+		return {
+			schemaVersion: "rag-ime.pi-session-control-state.v1",
+			sessionId: this.externalSessionId,
+			isIdle: this.session.isIdle,
+			isCompacting: this.session.isCompacting,
+			activeTurn: this.activeTurn,
+			roomCapability: this.roomCapability ? structuredClone(this.roomCapability) : undefined,
+			activeRoom: this.activeRoom ? structuredClone(this.activeRoom) : undefined,
+			sequence: this.sequence,
+		};
+	}
+
 	snapshot(): Record<string, unknown> {
 		return {
 			sessionId: this.externalSessionId,

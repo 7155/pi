@@ -107,6 +107,14 @@ describe("runtime protocol", () => {
 				params: { sessionId: "target" },
 			}),
 		).toMatchObject({ id: "request-13", method: "room.cancel" });
+		expect(
+			parseRuntimeRequest({
+				protocolVersion: PROTOCOL_VERSION,
+				id: "request-14",
+				method: "session.control_state",
+				params: { sessionId: "source" },
+			}),
+		).toMatchObject({ id: "request-14", method: "session.control_state" });
 	});
 
 	it("rejects unknown or unversioned requests", () => {

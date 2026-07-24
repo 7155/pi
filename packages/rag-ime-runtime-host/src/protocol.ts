@@ -10,6 +10,7 @@ export type RuntimeMethod =
 	| "tools.list"
 	| "tools.sync"
 	| "session.open"
+	| "session.control_state"
 	| "session.snapshot"
 	| "session.debug.context"
 	| "session.commands"
@@ -146,6 +147,7 @@ const RUNTIME_METHODS = new Set<RuntimeMethod>([
 	"tools.list",
 	"tools.sync",
 	"session.open",
+	"session.control_state",
 	"session.snapshot",
 	"session.debug.context",
 	"session.commands",

@@ -358,6 +358,7 @@ export class RagImeRuntimeHost {
 						concurrentControlPlane: true,
 						settledEvents: true,
 						dynamicTools: true,
+						sessionControlState: true,
 						sessionSnapshot: true,
 						conversationFork: true,
 						managedPlugins: true,
@@ -567,6 +568,8 @@ export class RagImeRuntimeHost {
 					roomSkillLoad: opened.session.roomSkillLoadReceipt(),
 				};
 			}
+			case "session.control_state":
+				return this.session(params).controlState();
 			case "session.snapshot":
 				return this.session(params).snapshot();
 			case "session.debug.context":
