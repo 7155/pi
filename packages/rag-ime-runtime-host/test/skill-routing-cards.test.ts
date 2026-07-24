@@ -76,4 +76,46 @@ describe("Skill routing card catalog", () => {
 			routing: { when: ["需要操作应用内浏览器"], does: "控制应用内浏览器。" },
 		});
 	});
+
+	it("attaches runtime-only family, focus, and loaded-body projection without changing routing cards", () => {
+		const result = applySkillRoutingCardCatalog(
+			{
+				diagnostics: [],
+				skills: [
+					{
+						name: "room-structured-handoff",
+						description: "Hand off Room work.",
+						filePath: "/handoff/SKILL.md",
+						baseDir: "/handoff",
+						sourceInfo: createSyntheticSourceInfo("/handoff/SKILL.md", { source: "test" }),
+						disableModelInvocation: false,
+					},
+					{
+						name: "quality-gate",
+						description: "Check evidence.",
+						filePath: "/quality/SKILL.md",
+						baseDir: "/quality",
+						sourceInfo: createSyntheticSourceInfo("/quality/SKILL.md", { source: "test" }),
+						disableModelInvocation: false,
+					},
+				],
+			},
+			{},
+			{
+				focusNames: ["quality-gate"],
+				loadedNames: ["room-structured-handoff"],
+			},
+		);
+
+		expect(result.skills).toMatchObject([
+			{
+				name: "room-structured-handoff",
+				promptCatalog: { family: "room-workflow", focus: false, bodyLoaded: true },
+			},
+			{
+				name: "quality-gate",
+				promptCatalog: { family: "quality-review", focus: true, bodyLoaded: false },
+			},
+		]);
+	});
 });

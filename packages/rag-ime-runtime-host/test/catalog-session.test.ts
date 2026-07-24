@@ -100,6 +100,12 @@ describe("PiProductSession catalog updates", () => {
 			expect(internal.session.systemPrompt).toContain(body);
 			expect(internal.session.systemPrompt).not.toContain("description: Hand off bounded work.");
 			expect(internal.session.systemPrompt.match(/<loaded_skill /gu)).toHaveLength(1);
+			const deferredCatalog = internal.session.systemPrompt.match(
+				/<available_skills[^>]*>([\s\S]*?)<\/available_skills>/u,
+			)?.[1];
+			expect(deferredCatalog).toBeDefined();
+			expect(deferredCatalog).not.toContain("room-structured-handoff");
+			expect(internal.session.systemPrompt).toContain("never load that Skill again");
 			expect(productSession.snapshot()).toMatchObject({ roomSkillLoad: productSession.roomSkillLoad });
 		} finally {
 			productSession.dispose();

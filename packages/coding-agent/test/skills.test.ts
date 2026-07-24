@@ -16,6 +16,7 @@ function createTestSkill(options: {
 	disableModelInvocation?: boolean;
 	source?: string;
 	routing?: Skill["routing"];
+	promptCatalog?: Skill["promptCatalog"];
 }): Skill {
 	return {
 		name: options.name,
@@ -25,6 +26,7 @@ function createTestSkill(options: {
 		baseDir: options.baseDir,
 		sourceInfo: createSyntheticSourceInfo(options.filePath, { source: options.source ?? "test" }),
 		disableModelInvocation: options.disableModelInvocation ?? false,
+		promptCatalog: options.promptCatalog,
 	};
 }
 
@@ -355,6 +357,72 @@ describe("skills", () => {
 			);
 			expect(result).not.toContain("Compatibility description");
 			expect(result).not.toContain("<location>");
+		});
+
+		it("projects only current-stage cards while keeping loaded bodies out of the deferred catalog", () => {
+			const skills: Skill[] = [
+				createTestSkill({
+					name: "grill-me",
+					description: "Clarify requirements.",
+					filePath: "/path/to/grill-me/SKILL.md",
+					baseDir: "/path/to/grill-me",
+					routing: {
+						when: ["需求与验收尚未对齐"],
+						does: "通过追问固定需求边界。",
+					},
+					promptCatalog: {
+						family: "requirements",
+						focus: true,
+						bodyLoaded: false,
+					},
+				}),
+				createTestSkill({
+					name: "quality-gate",
+					description: "Review delivery evidence.",
+					filePath: "/path/to/quality-gate/SKILL.md",
+					baseDir: "/path/to/quality-gate",
+					routing: {
+						when: ["需要准备质量回执"],
+						does: "逐项核对验收证据。",
+					},
+					promptCatalog: {
+						family: "quality-review",
+						focus: false,
+						bodyLoaded: false,
+					},
+				}),
+				createTestSkill({
+					name: "managed-task-execution",
+					description: "Execute a managed task.",
+					filePath: "/path/to/managed-task-execution/SKILL.md",
+					baseDir: "/path/to/managed-task-execution",
+					routing: {
+						when: ["已收到结构化执行任务"],
+						does: "执行任务并提交质量回执。",
+					},
+					promptCatalog: {
+						family: "room-workflow",
+						focus: true,
+						bodyLoaded: true,
+					},
+				}),
+			];
+
+			const result = formatSkillsForPrompt(skills, {
+				loadToolName: "skill_load",
+				searchToolName: "skill_search",
+				includeLocations: false,
+				includeRevision: true,
+			});
+
+			expect(result).toContain('<skill_capability_families format="family-jsonl">');
+			expect(result).toContain('{"family":"quality-review","count":1,"examples":["quality-gate"]}');
+			expect(result).toContain('{"family":"requirements","count":1,"examples":["grill-me"]}');
+			expect(result).toContain('"name":"grill-me"');
+			expect(result).not.toContain('"name":"quality-gate"');
+			expect(result).not.toContain("managed-task-execution");
+			expect(result).toContain("never load that Skill again");
+			expect(result).toContain('<available_skills revision="sha256:');
 		});
 
 		it("should escape XML special characters", () => {

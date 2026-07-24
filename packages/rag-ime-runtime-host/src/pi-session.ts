@@ -28,6 +28,7 @@ import { createLifecycleHookController } from "./lifecycle-hooks.ts";
 import { createMemoryCaptureExtension, prepareGovernedMemoryCapture } from "./memory-capture-tool.ts";
 import { PROTOCOL_VERSION, type RuntimeEventEnvelope, RuntimeProtocolError } from "./protocol.ts";
 import { createProviderContextJournalExtension, ProviderContextJournal } from "./provider-context-journal.ts";
+import { roomSkillPromptFocus, roomToolPromptFocus } from "./room-prompt-catalog.ts";
 import { createRoomResourceLimitExtension, type RoomResourceLimits } from "./room-resource-limits.ts";
 import { type ActiveRoomDispatch, createRoomSettleLifecycleExtension } from "./room-settle-lifecycle.ts";
 import { bootstrapRoomTools } from "./room-tool-bootstrap.ts";
@@ -523,6 +524,9 @@ export class PiProductSession implements PooledSession {
 		const initialContextEpochReason = String(options.roomCapability?.contextEpochReason ?? "session_open");
 		const providerContextJournal = new ProviderContextJournal(initialContextEpoch, initialContextEpochReason);
 		let requiredSkillPrompt = "";
+		const loadedSkillNames = new Set<string>();
+		const skillPromptFocus = roomSkillPromptFocus(options.roomSkillPolicy);
+		const toolPromptFocus = roomToolPromptFocus(options.roomSkillPolicy);
 		resourceLoader = new DefaultResourceLoader({
 			cwd: options.cwd,
 			agentDir: options.agentDir,
@@ -532,12 +536,24 @@ export class PiProductSession implements PooledSession {
 			// Product and explicitly selected source roots are the complete Skill
 			// boundary. Never fall back to workspace or package auto-discovery.
 			noSkills: true,
-			skillsOverride: (base) => applySkillRoutingCardCatalog(base, options.skillRoutingCards ?? {}),
+			skillsOverride: (base) =>
+				applySkillRoutingCardCatalog(
+					base,
+					options.skillRoutingCards ?? {},
+					options.roomSkillPolicy
+						? {
+								focusNames: skillPromptFocus ?? [],
+								loadedNames: [...loadedSkillNames],
+							}
+						: undefined,
+				),
 			extensionFactories: [
 				createDiscoveryToolsExtension({
 					getResourceLoader,
 					registry,
 					gateway: backendBridge,
+					focusToolNames: toolPromptFocus,
+					getLoadedSkillNames: () => [...loadedSkillNames],
 				}),
 				createMemoryCaptureExtension(backendBridge),
 				createBackendToolExtension(backendBridge),
@@ -618,6 +634,7 @@ export class PiProductSession implements PooledSession {
 				);
 			}
 			requiredSkillPrompt = loaded.text;
+			loadedSkillNames.add(requiredSkill.skillId);
 			roomSkillLoad = {
 				schemaVersion: "rag-ime.skill-load.v1",
 				name: requiredSkill.skillId,

@@ -97,6 +97,15 @@ export interface SkillCatalogEntry {
 	does: string;
 }
 
+export interface SkillPromptCatalogProjection {
+	/** Compact family label used only by the system-prompt index. */
+	family: string;
+	/** Include the exact routing card for the current lifecycle stage. */
+	focus: boolean;
+	/** The full body is already present in Provider context. */
+	bodyLoaded: boolean;
+}
+
 export interface Skill {
 	name: string;
 	description: string;
@@ -105,6 +114,8 @@ export interface Skill {
 	baseDir: string;
 	sourceInfo: SourceInfo;
 	disableModelInvocation: boolean;
+	/** Runtime-only prompt projection; never changes the searchable catalog. */
+	promptCatalog?: SkillPromptCatalogProjection;
 }
 
 export interface LoadSkillsResult {
@@ -489,18 +500,31 @@ export function formatSkillsForPrompt(skills: Skill[], options: FormatSkillsForP
 	const loadToolName = options.loadToolName ?? "read";
 	const includeLocations = options.includeLocations ?? loadToolName === "read";
 	const compactRoutingCards = !includeLocations;
+	const hasPromptProjection = visibleSkills.some((skill) => skill.promptCatalog !== undefined);
+	const deferredSkills = hasPromptProjection
+		? visibleSkills.filter((skill) => skill.promptCatalog?.bodyLoaded !== true)
+		: visibleSkills;
+	const promptSkills = hasPromptProjection
+		? deferredSkills.filter((skill) => skill.promptCatalog?.focus === true)
+		: deferredSkills;
 	const catalogAttributes = [
 		...(options.includeRevision ? [`revision="sha256:${skillCatalogRevision(visibleSkills)}"`] : []),
 		...(compactRoutingCards ? ['format="routing-card-jsonl"'] : []),
 	];
 	const catalogTag = `<available_skills${catalogAttributes.length ? ` ${catalogAttributes.join(" ")}` : ""}>`;
 	const lines = [
-		compactRoutingCards
-			? "\n\nThe following compact cards list optional Skills."
-			: "\n\nThe following skills provide specialized instructions for specific tasks.",
+		hasPromptProjection
+			? "\n\nThe following capability-family index and stage cards describe deferred Skills."
+			: compactRoutingCards
+				? "\n\nThe following compact cards list optional Skills."
+				: "\n\nThe following skills provide specialized instructions for specific tasks.",
 	];
 	if (options.searchToolName) {
-		lines.push(`Use ${options.searchToolName} for full routing details when a card is ambiguous.`);
+		lines.push(
+			hasPromptProjection
+				? `Use ${options.searchToolName} to search the complete deferred Skill catalog when the family index or stage cards are insufficient.`
+				: `Use ${options.searchToolName} for full routing details when a card is ambiguous.`,
+		);
 	}
 	if (loadToolName === "read") {
 		lines.push("Use the read tool to load a skill's file when the task matches its catalog entry.");
@@ -508,19 +532,47 @@ export function formatSkillsForPrompt(skills: Skill[], options: FormatSkillsForP
 			"When a skill file references a relative path, resolve it against the skill directory (parent of SKILL.md / dirname of the path) and use that absolute path in tool commands.",
 		);
 	} else {
-		lines.push(`Use ${loadToolName} with the exact name before following a Skill; never reconstruct its body.`);
+		lines.push(
+			`Use ${loadToolName} with the exact name before following a deferred Skill; never reconstruct its body.`,
+		);
+		lines.push(
+			"If a full <loaded_skill> body is already present, follow it directly and never load that Skill again.",
+		);
 	}
 	if (compactRoutingCards) {
 		lines.push("Cards contain name, when, notFor, input, output, and does; load only on a positive match.");
 	}
+	if (hasPromptProjection) {
+		const families = new Map<string, string[]>();
+		for (const skill of deferredSkills) {
+			const family = skill.promptCatalog?.family || "other";
+			const names = families.get(family) ?? [];
+			names.push(skill.name);
+			families.set(family, names);
+		}
+		lines.push(
+			"",
+			'<skill_capability_families format="family-jsonl">',
+			...[...families]
+				.sort(([left], [right]) => left.localeCompare(right))
+				.map(([family, names]) =>
+					JSON.stringify({
+						family,
+						count: names.length,
+						examples: names.slice(0, 2),
+					}),
+				),
+			"</skill_capability_families>",
+		);
+	}
 	lines.push("", catalogTag);
 
 	if (compactRoutingCards) {
-		for (const skill of visibleSkills) {
+		for (const skill of promptSkills) {
 			lines.push(JSON.stringify(promptSkillCatalogEntry(skill)));
 		}
 	} else {
-		for (const skill of visibleSkills) {
+		for (const skill of promptSkills) {
 			lines.push("  <skill>");
 			lines.push(`    <name>${escapeXml(skill.name)}</name>`);
 			if (skill.routing) {

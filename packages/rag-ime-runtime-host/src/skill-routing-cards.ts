@@ -3,6 +3,11 @@ import type { ResourceDiagnostic, Skill, SkillRoutingCard } from "@earendil-work
 
 export type SkillRoutingCardCatalog = Readonly<Record<string, SkillRoutingCard>>;
 
+export interface SkillPromptProjection {
+	focusNames: readonly string[];
+	loadedNames: readonly string[];
+}
+
 const MAX_ROUTING_CARD_CHARS = 200;
 
 function objectRecord(value: unknown): Record<string, unknown> | undefined {
@@ -99,18 +104,42 @@ function catalogMatch(
 	return undefined;
 }
 
+function skillCapabilityFamily(name: string): string {
+	if (name.startsWith("room-")) return "room-workflow";
+	if (name.includes("memory")) return "memory";
+	if (name.includes("quality") || name.includes("review")) return "quality-review";
+	if (name.includes("architecture") || name.includes("code")) return "engineering";
+	if (name.includes("grill") || name.includes("clarification")) return "requirements";
+	if (name.includes(":")) return `plugin:${name.split(":", 1)[0]}`;
+	const prefix = name.split("-", 1)[0]?.trim();
+	return prefix || "other";
+}
+
 export function applySkillRoutingCardCatalog(
 	base: { skills: Skill[]; diagnostics: ResourceDiagnostic[] },
 	catalog: SkillRoutingCardCatalog,
+	projection?: SkillPromptProjection,
 ): { skills: Skill[]; diagnostics: ResourceDiagnostic[] } {
+	const focusNames = new Set(projection?.focusNames ?? []);
+	const loadedNames = new Set(projection?.loadedNames ?? []);
 	return {
 		diagnostics: base.diagnostics,
 		skills: base.skills.map((skill) => {
 			const match = catalogMatch(skill, catalog);
+			const name = match?.name ?? skill.name;
 			return {
 				...skill,
-				...(match ? { name: match.name } : {}),
+				name,
 				routing: skill.routing ?? match?.routing ?? fallbackRoutingCard(skill),
+				...(projection
+					? {
+							promptCatalog: {
+								family: skillCapabilityFamily(name),
+								focus: focusNames.has(name),
+								bodyLoaded: loadedNames.has(name),
+							},
+						}
+					: {}),
 			};
 		}),
 	};

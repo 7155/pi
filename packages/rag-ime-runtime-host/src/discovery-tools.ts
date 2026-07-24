@@ -114,6 +114,8 @@ export interface DiscoveryToolsOptions {
 	registry: BackendToolRegistry;
 	includeToolSearch?: boolean;
 	gateway?: BackendToolBridgeOptions;
+	focusToolNames?: readonly string[];
+	getLoadedSkillNames?: () => readonly string[];
 }
 
 export interface BackendToolRouteEntry {
@@ -130,6 +132,16 @@ function visibleSkills(skills: Skill[]): Skill[] {
 		.filter((skill) => !skill.disableModelInvocation)
 		.slice()
 		.sort((left, right) => left.name.localeCompare(right.name));
+}
+
+type PromptProjectedSkill = Skill & {
+	promptCatalog?: {
+		bodyLoaded?: boolean;
+	};
+};
+
+function deferredSkills(skills: Skill[]): Skill[] {
+	return visibleSkills(skills).filter((skill) => (skill as PromptProjectedSkill).promptCatalog?.bodyLoaded !== true);
 }
 
 function normalizedLimit(value: unknown): number {
@@ -250,14 +262,84 @@ function promptBackendToolRouteEntry(tool: BackendToolManifest): BackendToolRout
 	};
 }
 
-export function formatBackendToolRouteCatalog(tools: BackendToolManifest[], revision: string): string {
+interface ToolPromptCatalogOptions {
+	activeNames?: readonly string[];
+	focusNames?: readonly string[];
+}
+
+const TOOL_FAMILY_PURPOSES: Readonly<Record<string, string>> = {
+	room: "Room 状态、协作、公开发布与责任提交",
+	workspace: "授权工作区内的查找、读取、修改与命令执行",
+	memory: "用户记忆的查询、记录、整理与治理",
+	planning: "用户计划和 Agent 执行清单",
+	agent: "Agent 会话、角色、模型与运行状态",
+	knowledge: "知识库检索、导入和证据读取",
+	browser: "浏览器页面读取与受控交互",
+	desktop: "桌面应用观察与受控操作",
+	input: "输入法状态、候选与上下文",
+	system: "配置、诊断和运行维护",
+	other: "其他产品能力",
+};
+
+function backendToolFamily(name: string): string {
+	if (name.startsWith("room_")) return "room";
+	if (name.startsWith("workspace_")) return "workspace";
+	if (name.includes("memory")) return "memory";
+	if (name.includes("planning") || name.includes("plan")) return "planning";
+	if (name.startsWith("knowledge_")) return "knowledge";
+	if (name.startsWith("browser_")) return "browser";
+	if (name.startsWith("desktop_")) return "desktop";
+	if (name.startsWith("ime_")) return "input";
+	if (name.startsWith("agent_")) return "agent";
+	if (name.includes("config") || name.includes("runtime") || name.includes("diagnostic")) return "system";
+	return "other";
+}
+
+export function formatBackendToolRouteCatalog(
+	tools: BackendToolManifest[],
+	revision: string,
+	options: ToolPromptCatalogOptions = {},
+): string {
 	if (tools.length === 0) return "";
-	const entries = tools.map(promptBackendToolRouteEntry).sort((left, right) => left.name.localeCompare(right.name));
+	const activeNames = new Set(options.activeNames ?? []);
+	const deferred = tools.filter((tool) => !activeNames.has(tool.name));
+	const projected = options.focusNames !== undefined;
+	const focusNames = new Set(options.focusNames ?? []);
+	const entries = deferred
+		.filter((tool) => !projected || focusNames.has(tool.name))
+		.map(promptBackendToolRouteEntry)
+		.sort((left, right) => left.name.localeCompare(right.name));
+	const families = new Map<string, string[]>();
+	for (const tool of deferred) {
+		const family = backendToolFamily(tool.name);
+		const names = families.get(family) ?? [];
+		names.push(tool.name);
+		families.set(family, names);
+	}
 	return [
 		"",
 		"",
+		...(projected
+			? [
+					'<product_tool_capability_families format="family-jsonl">',
+					...[...families]
+						.sort(([left], [right]) => left.localeCompare(right))
+						.map(([family, names]) =>
+							JSON.stringify({
+								family,
+								count: names.length,
+								does: TOOL_FAMILY_PURPOSES[family],
+								examples: names.slice(0, 2),
+							}),
+						),
+					"</product_tool_capability_families>",
+					"",
+				]
+			: []),
 		`${TOOL_CATALOG_MARKER} revision="sha256:${revision}">`,
-		"Cards contain name, when, notFor, input, output, and does. Use tool_search for detail and tool_load for one to four exact schemas needed by the same next step.",
+		projected
+			? "Only current-stage deferred tools have exact cards here. Use tool_search for the complete deferred catalog. Active Provider schemas and deferred entries are mutually exclusive: call an active tool directly and never pass it to tool_load."
+			: "Cards contain name, when, notFor, input, output, and does. Use tool_search for detail and tool_load for one to four exact schemas needed by the same next step.",
 		...entries.map((entry) => JSON.stringify(entry)),
 		"</available_product_tools>",
 	].join("\n");
@@ -290,10 +372,16 @@ export function diffSkillCatalog(before: Skill[], after: Skill[]): SkillCatalogD
 	};
 }
 
-export function searchSkills(skills: Skill[], args: { query?: unknown; limit?: unknown }): Record<string, unknown> {
+export function searchSkills(
+	skills: Skill[],
+	args: { query?: unknown; limit?: unknown },
+	loadedNames: readonly string[] = [],
+): Record<string, unknown> {
 	const query = typeof args.query === "string" ? args.query.trim() : "";
 	const limit = normalizedLimit(args.limit);
-	const items = visibleSkills(skills)
+	const loaded = new Set(loadedNames);
+	const items = deferredSkills(skills)
+		.filter((skill) => !loaded.has(skill.name))
 		.map((skill) => {
 			const entry = skillCatalogEntry(skill);
 			return {
@@ -322,12 +410,16 @@ export function searchSkills(skills: Skill[], args: { query?: unknown; limit?: u
 export async function loadSkill(
 	skills: Skill[],
 	args: { name?: unknown },
+	loadedNames: readonly string[] = [],
 ): Promise<{ text: string; details: Record<string, unknown> }> {
 	if (typeof args.name !== "string" || !args.name.trim()) {
 		throw new Error("skill_load requires an exact skill name");
 	}
 	const name = args.name.trim();
-	const skill = visibleSkills(skills).find((candidate) => candidate.name === name);
+	if (loadedNames.includes(name)) {
+		throw new Error(`Skill body is already active; follow it directly and do not call skill_load again: ${name}`);
+	}
+	const skill = deferredSkills(skills).find((candidate) => candidate.name === name);
 	if (!skill) throw new Error(`Unknown or unavailable skill: ${name}`);
 
 	const content = await readFile(skill.filePath, "utf8");
@@ -358,10 +450,13 @@ export function searchBackendTools(
 	tools: BackendToolManifest[],
 	args: { query?: unknown; limit?: unknown },
 	registryRevision: string,
+	activeNames?: readonly string[],
 ): Record<string, unknown> {
 	const query = typeof args.query === "string" ? args.query.trim() : "";
 	const limit = normalizedLimit(args.limit);
+	const active = new Set(activeNames ?? []);
 	const items = tools
+		.filter((tool) => !active.has(tool.name))
 		.map((tool) => {
 			const entry = backendToolRouteEntry(tool);
 			return {
@@ -381,13 +476,33 @@ export function searchBackendTools(
 		.map(({ tool }) => ({
 			...backendToolRouteEntry(tool),
 		}));
-	return {
+	const result: Record<string, unknown> = {
 		schemaVersion: "rag-ime.tool-search.v1",
 		catalogRevision: registryRevision,
 		query,
 		items,
 		nextTool: TOOL_LOAD_TOOL_NAME,
 	};
+	if (activeNames !== undefined) {
+		result.activeDirectCalls = tools
+			.filter((tool) => active.has(tool.name))
+			.filter((tool) => {
+				if (!query) return true;
+				const entry = backendToolRouteEntry(tool);
+				return (
+					routingSearchScore(
+						query,
+						tool.name,
+						entry.when,
+						entry.notFor,
+						[tool.description, entry.input, entry.output, entry.does].join(" "),
+					) > 0
+				);
+			})
+			.map((tool) => tool.name)
+			.slice(0, limit);
+	}
+	return result;
 }
 
 export function loadBackendTool(
@@ -398,6 +513,9 @@ export function loadBackendTool(
 		throw new Error("tool_load requires an exact product tool name");
 	}
 	const name = args.name.trim();
+	if (registry.isDisclosed(name)) {
+		throw new Error(`Tool schema is already active; call it directly and do not pass it to tool_load: ${name}`);
+	}
 	const tool = registry.get(name);
 	if (!tool) throw new Error(`Unknown or unavailable product tool: ${name}`);
 	return {
@@ -446,17 +564,30 @@ export function loadBackendTools(
 	const names = exactToolNames(args);
 	const unavailable = names.find((name) => !registry.get(name));
 	if (unavailable) throw new Error(`Unknown or unavailable product tool: ${unavailable}`);
+	const active = names.find((name) => registry.isDisclosed(name));
+	if (active) {
+		throw new Error(`Tool schema is already active; call it directly and do not pass it to tool_load: ${active}`);
+	}
 	return names.map((name) => loadBackendTool(registry, { name }));
 }
 
 export function createDiscoveryToolsExtension(options: DiscoveryToolsOptions): InlineExtension {
-	const initialToolCatalog = formatBackendToolRouteCatalog(options.registry.list(), options.registry.revision());
 	return {
 		name: "rag-ime-discovery-tools",
 		factory(pi) {
+			const loadedSkillNames = new Set(options.getLoadedSkillNames?.() ?? []);
+			const currentLoadedSkillNames = (): string[] => {
+				for (const name of options.getLoadedSkillNames?.() ?? []) loadedSkillNames.add(name);
+				return [...loadedSkillNames];
+			};
 			pi.on("before_agent_start", async (event) => {
-				if (!initialToolCatalog || event.systemPrompt.includes(TOOL_CATALOG_MARKER)) return undefined;
-				return { systemPrompt: `${event.systemPrompt}${initialToolCatalog}` };
+				if (event.systemPrompt.includes(TOOL_CATALOG_MARKER)) return undefined;
+				const toolCatalog = formatBackendToolRouteCatalog(options.registry.list(), options.registry.revision(), {
+					activeNames: options.registry.disclosed().map((tool) => tool.name),
+					...(options.focusToolNames !== undefined ? { focusNames: options.focusToolNames } : {}),
+				});
+				if (!toolCatalog) return undefined;
+				return { systemPrompt: `${event.systemPrompt}${toolCatalog}` };
 			});
 			pi.registerTool({
 				name: SKILL_SEARCH_TOOL_NAME,
@@ -468,6 +599,7 @@ export function createDiscoveryToolsExtension(options: DiscoveryToolsOptions): I
 					const result = searchSkills(
 						options.getResourceLoader().getSkills().skills,
 						args as { query?: unknown; limit?: unknown },
+						currentLoadedSkillNames(),
 					);
 					return {
 						content: [{ type: "text", text: JSON.stringify(result) }],
@@ -482,10 +614,13 @@ export function createDiscoveryToolsExtension(options: DiscoveryToolsOptions): I
 				promptSnippet: "Load one managed Skill by exact catalog name",
 				parameters: SKILL_LOAD_PARAMETERS,
 				execute: async (_toolCallId, args) => {
+					const loadedNames = currentLoadedSkillNames();
 					const result = await loadSkill(
 						options.getResourceLoader().getSkills().skills,
 						args as { name?: unknown },
+						loadedNames,
 					);
+					loadedSkillNames.add(String(result.details.name ?? ""));
 					return {
 						content: [{ type: "text", text: result.text }],
 						details: result.details,
@@ -505,6 +640,7 @@ export function createDiscoveryToolsExtension(options: DiscoveryToolsOptions): I
 							options.registry.list(),
 							args as { query?: unknown; limit?: unknown },
 							options.registry.revision(),
+							options.registry.disclosed().map((tool) => tool.name),
 						);
 						if (options.gateway?.roomCapability) {
 							const governed = await requestProductGateway(
@@ -521,7 +657,23 @@ export function createDiscoveryToolsExtension(options: DiscoveryToolsOptions): I
 								},
 								signal,
 							);
-							result = governed.result ?? result;
+							if (governed.result) {
+								const activeNames = new Set(options.registry.disclosed().map((tool) => tool.name));
+								const governedItems = Array.isArray(governed.result.items)
+									? governed.result.items.filter((item) => {
+											if (typeof item !== "object" || item === null || Array.isArray(item)) return false;
+											const name = (item as Record<string, unknown>).name;
+											return typeof name === "string" && !activeNames.has(name);
+										})
+									: result.items;
+								result = {
+									...result,
+									...governed.result,
+									items: governedItems,
+									activeDirectCalls: result.activeDirectCalls,
+									nextTool: TOOL_LOAD_TOOL_NAME,
+								};
+							}
 						}
 						return {
 							content: [{ type: "text", text: JSON.stringify(result) }],
@@ -551,7 +703,7 @@ export function createDiscoveryToolsExtension(options: DiscoveryToolsOptions): I
 								: undefined;
 							prepared.push({
 								...item,
-								alreadyDisclosed: options.registry.isDisclosed(item.tool.name),
+								alreadyDisclosed: false,
 								governedReceipt,
 							});
 						}

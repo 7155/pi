@@ -13,6 +13,7 @@ import {
 	backendToolRouteEntry,
 	createDiscoveryToolsExtension,
 	diffSkillCatalog,
+	formatBackendToolRouteCatalog,
 	loadBackendTool,
 	loadBackendTools,
 	loadSkill,
@@ -165,6 +166,23 @@ describe("runtime discovery tools", () => {
 		}
 	});
 
+	it("keeps active Skill bodies mutually exclusive with deferred search and load", async () => {
+		const active = skill({
+			name: "managed-task-execution",
+			description: "Execute a managed task.",
+			filePath: "/already-loaded/SKILL.md",
+		});
+		const deferred = skill({ name: "quality-gate", description: "Review delivery evidence." });
+
+		const result = searchSkills([active, deferred], { query: "" }, [active.name]);
+
+		expect((result.items as Array<{ name: string }>).map((item) => item.name)).toEqual(["quality-gate"]);
+		expect(result.catalogRevision).toEqual(searchSkills([active, deferred], { query: "" }).catalogRevision);
+		await expect(loadSkill([active, deferred], { name: active.name }, [active.name])).rejects.toThrow(
+			"Skill body is already active",
+		);
+	});
+
 	it("reports deterministic Skill catalog deltas", () => {
 		const before = [
 			skill({ name: "daily-plan", description: "Plan a day." }),
@@ -211,6 +229,44 @@ describe("runtime discovery tools", () => {
 		expect(Object.keys(entry)).toEqual(["name", "when", "notFor", "input", "output", "does"]);
 		expect(Array.from(JSON.stringify(entry)).length).toBeLessThanOrEqual(512);
 		expect(JSON.stringify(entry)).not.toContain("secretArgument");
+	});
+
+	it("renders capability families plus current-stage cards while excluding active Tool schemas", () => {
+		const tools: BackendToolManifest[] = [
+			{
+				name: "room_state",
+				description: "Read Room state.",
+				parameters: { type: "object", properties: {} },
+			},
+			{
+				name: "workspace_read",
+				description: "Read a workspace file.",
+				parameters: { type: "object", properties: {} },
+			},
+			{
+				name: "workspace_shell",
+				description: "Run a workspace command.",
+				parameters: { type: "object", properties: {} },
+			},
+		];
+
+		const prompt = formatBackendToolRouteCatalog(tools, "revision", {
+			activeNames: ["room_state"],
+			focusNames: ["workspace_read"],
+		});
+		const search = searchBackendTools(tools, { query: "" }, "revision", ["room_state"]);
+
+		expect(prompt).toContain('<product_tool_capability_families format="family-jsonl">');
+		expect(prompt).toContain(
+			'{"family":"workspace","count":2,"does":"授权工作区内的查找、读取、修改与命令执行","examples":["workspace_read","workspace_shell"]}',
+		);
+		expect(prompt).toContain('"name":"workspace_read"');
+		expect(prompt).not.toContain('"name":"workspace_shell"');
+		expect(prompt).not.toContain("room_state");
+		expect(search).toMatchObject({
+			items: [{ name: "workspace_read" }, { name: "workspace_shell" }],
+			activeDirectCalls: ["room_state"],
+		});
 	});
 
 	it("registers fixed discovery schemas and searches the live backend catalog", async () => {
@@ -322,6 +378,12 @@ describe("runtime discovery tools", () => {
 		expect(providerLoad.tool.input).toBe("检索问题与范围");
 		expect(providerLoad.tool).not.toHaveProperty("profile");
 		expect(providerLoad.tool).not.toHaveProperty("risk");
+		const nextPrompt = await beforeAgentStart({ systemPrompt: "base prompt" });
+		const deferredCatalog = nextPrompt?.systemPrompt.match(
+			/<available_product_tools[^>]*>([\s\S]*?)<\/available_product_tools>/u,
+		)?.[1];
+		expect(deferredCatalog).toBeDefined();
+		expect(deferredCatalog).not.toContain("memory.query");
 	});
 
 	it("validates and discloses up to four exact Tool schemas as one Provider update", async () => {
@@ -500,6 +562,70 @@ describe("runtime discovery tools", () => {
 			expect(registry.disclosed()).toEqual([]);
 			expect(registry.governedLoadReceipts()).toEqual([]);
 			expect(activeTools).toEqual(["tool_load"]);
+		} finally {
+			vi.unstubAllGlobals();
+		}
+	});
+
+	it("rejects active Tool schemas atomically before any governed load request", async () => {
+		const registry = new BackendToolRegistry();
+		registry.sync([
+			{
+				name: "room_state",
+				description: "Read Room state.",
+				parameters: { type: "object", properties: {} },
+			},
+			{
+				name: "workspace_read",
+				description: "Read a workspace file.",
+				parameters: { type: "object", properties: {} },
+			},
+		]);
+		registry.disclose("room_state");
+		const registered = new Map<string, ToolDefinition>();
+		const extension = createDiscoveryToolsExtension({
+			getResourceLoader: () =>
+				({
+					getSkills: () => ({ skills: [], diagnostics: [] }),
+				}) as unknown as ResourceLoader,
+			registry,
+			gateway: {
+				sessionId: "session-room",
+				registry,
+				gatewayUrl: "http://127.0.0.1:8766/api/agent/tool/execute",
+				roomCapability: { manifestId: "manifest:room" },
+			},
+		});
+		if (typeof extension === "function") throw new Error("Expected a named inline extension");
+		await extension.factory({
+			on() {},
+			registerTool(toolDefinition: ToolDefinition) {
+				registered.set(toolDefinition.name, toolDefinition);
+			},
+			getActiveTools() {
+				return ["tool_load", "room_state"];
+			},
+			setActiveTools() {},
+		} as never);
+		const fetchMock = vi.fn<typeof fetch>();
+		vi.stubGlobal("fetch", fetchMock);
+		try {
+			const loadTool = registered.get(TOOL_LOAD_TOOL_NAME);
+			if (!loadTool) throw new Error("tool_load was not registered");
+			await expect(
+				loadTool.execute("load-active", { name: "room_state" } as never, undefined, undefined, {} as never),
+			).rejects.toThrow("Tool schema is already active");
+			await expect(
+				loadTool.execute(
+					"load-mixed",
+					{ names: ["workspace_read", "room_state"] } as never,
+					undefined,
+					undefined,
+					{} as never,
+				),
+			).rejects.toThrow("Tool schema is already active");
+			expect(fetchMock).not.toHaveBeenCalled();
+			expect(registry.isDisclosed("workspace_read")).toBe(false);
 		} finally {
 			vi.unstubAllGlobals();
 		}
