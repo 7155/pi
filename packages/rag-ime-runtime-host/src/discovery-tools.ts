@@ -20,7 +20,7 @@ import {
 	type BackendToolManifest,
 	type BackendToolRegistry,
 	backendToolSchemaRevision,
-	requestGovernedToolLoad,
+	requestGovernedToolLoads,
 	requestProductGateway,
 } from "./tool-bridge.ts";
 
@@ -620,7 +620,23 @@ export function createDiscoveryToolsExtension(options: DiscoveryToolsOptions): I
 						args as { name?: unknown },
 						loadedNames,
 					);
-					loadedSkillNames.add(String(result.details.name ?? ""));
+					const loadedName = String(result.details.name ?? "");
+					loadedSkillNames.add(loadedName);
+					const projectedSkill = options
+						.getResourceLoader()
+						.getSkills()
+						.skills.find((skill) => skill.name === loadedName && skill.promptCatalog !== undefined);
+					if (projectedSkill?.promptCatalog) {
+						projectedSkill.promptCatalog = {
+							...projectedSkill.promptCatalog,
+							focus: false,
+							bodyLoaded: true,
+						};
+						// AgentSession owns the actual Provider system prompt. Reusing
+						// the current active set asks it to rebuild from this projection
+						// without reloading extensions or changing Tool order.
+						pi.setActiveTools([...pi.getActiveTools()]);
+					}
 					return {
 						content: [{ type: "text", text: result.text }],
 						details: result.details,
@@ -689,24 +705,19 @@ export function createDiscoveryToolsExtension(options: DiscoveryToolsOptions): I
 					parameters: TOOL_LOAD_PARAMETERS,
 					execute: async (toolCallId, args, signal) => {
 						const loaded = loadBackendTools(options.registry, args as { name?: unknown; names?: unknown });
-						const prepared = [];
-						for (const [index, item] of loaded.entries()) {
-							const governedReceipt = options.gateway?.roomCapability
-								? await requestGovernedToolLoad(
-										options.gateway,
-										item.tool.name,
-										loaded.length === 1
-											? `load:${toolCallId}`
-											: `load:${toolCallId}:${index}:${item.tool.name}`,
-										signal,
-									)
-								: undefined;
-							prepared.push({
-								...item,
-								alreadyDisclosed: false,
-								governedReceipt,
-							});
-						}
+						const loadRequests = loaded.map((item, index) => ({
+							name: item.tool.name,
+							receiptId:
+								loaded.length === 1 ? `load:${toolCallId}` : `load:${toolCallId}:${index}:${item.tool.name}`,
+						}));
+						const governedReceipts = options.gateway?.roomCapability
+							? await requestGovernedToolLoads(options.gateway, loadRequests, signal)
+							: loadRequests.map(() => undefined);
+						const prepared = loaded.map((item, index) => ({
+							...item,
+							alreadyDisclosed: false,
+							governedReceipt: governedReceipts[index],
+						}));
 						for (const item of prepared) {
 							const receiptId =
 								typeof item.governedReceipt?.receiptId === "string" ? item.governedReceipt.receiptId : "";

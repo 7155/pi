@@ -327,6 +327,57 @@ export async function requestGovernedToolLoad(
 	return result;
 }
 
+export async function requestGovernedToolLoads(
+	options: BackendToolBridgeOptions,
+	loads: ReadonlyArray<{ name: string; receiptId: string }>,
+	signal?: AbortSignal,
+): Promise<Array<Record<string, unknown> | undefined>> {
+	if (loads.length < 1 || loads.length > 4) {
+		throw new RuntimeProtocolError("INVALID_PARAMS", "Room tool load batch must contain one to four items");
+	}
+	if (!options.roomCapability) return loads.map(() => undefined);
+	if (loads.length === 1) {
+		return [await requestGovernedToolLoad(options, loads[0].name, loads[0].receiptId, signal)];
+	}
+	for (const load of loads) {
+		if (!options.registry.get(load.name)) {
+			throw new RuntimeProtocolError("TOOL_NOT_FOUND", `Unknown product tool: ${load.name}`);
+		}
+	}
+	const governed = await requestProductGateway(
+		options,
+		"load",
+		{
+			sessionId: options.sessionId,
+			loads: loads.map((load) => ({
+				receiptId: load.receiptId,
+				toolName: load.name,
+			})),
+			createdAtMs: Date.now(),
+		},
+		signal,
+	);
+	const items = governed.result?.items;
+	if (!Array.isArray(items) || items.length !== loads.length) {
+		throw new RuntimeProtocolError("INVALID_TOOL_RECEIPT", "Room tool load batch returned an invalid receipt set");
+	}
+	return items.map((item, index) => {
+		if (
+			typeof item !== "object" ||
+			item === null ||
+			Array.isArray(item) ||
+			(item as Record<string, unknown>).receiptId !== loads[index].receiptId ||
+			(item as Record<string, unknown>).toolName !== loads[index].name
+		) {
+			throw new RuntimeProtocolError(
+				"INVALID_TOOL_RECEIPT",
+				`Room tool load batch receipt does not match request: ${loads[index].name}`,
+			);
+		}
+		return item as Record<string, unknown>;
+	});
+}
+
 /** Rebind disclosed schemas to the active Dispatch without reinjecting them. */
 export async function rebindGovernedToolReceipts(
 	options: BackendToolBridgeOptions,

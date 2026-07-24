@@ -183,6 +183,85 @@ describe("runtime discovery tools", () => {
 		);
 	});
 
+	it("rebuilds the Room system prompt after a Skill body becomes active", async () => {
+		const root = await mkdtemp(join(tmpdir(), "pi-runtime-skill-projection-"));
+		try {
+			const filePath = join(root, "SKILL.md");
+			await writeFile(
+				filePath,
+				[
+					"---",
+					"name: quality-gate",
+					"description: Check delivery evidence.",
+					"---",
+					"",
+					"Check every acceptance criterion.",
+				].join("\n"),
+			);
+			const projected = {
+				...skill({
+					name: "quality-gate",
+					description: "Check delivery evidence.",
+					filePath,
+				}),
+				promptCatalog: {
+					family: "quality-review",
+					focus: true,
+					bodyLoaded: false,
+				},
+			};
+			const registered = new Map<string, ToolDefinition>();
+			let activeTools = ["skill_search", "skill_load"];
+			let rebuilds = 0;
+			const extension = createDiscoveryToolsExtension({
+				getResourceLoader: () =>
+					({
+						getSkills: () => ({ skills: [projected], diagnostics: [] }),
+					}) as unknown as ResourceLoader,
+				registry: new BackendToolRegistry(),
+				getLoadedSkillNames: () => [],
+			});
+			if (typeof extension === "function") throw new Error("Expected a named inline extension");
+			await extension.factory({
+				on() {},
+				registerTool(toolDefinition: ToolDefinition) {
+					registered.set(toolDefinition.name, toolDefinition);
+				},
+				getActiveTools() {
+					return activeTools;
+				},
+				setActiveTools(toolNames: string[]) {
+					activeTools = [...toolNames];
+					rebuilds += 1;
+				},
+			} as never);
+			const loadTool = registered.get(SKILL_LOAD_TOOL_NAME);
+			if (!loadTool) throw new Error("skill_load was not registered");
+
+			await loadTool.execute("load-quality", { name: "quality-gate" } as never, undefined, undefined, {} as never);
+
+			expect(projected.promptCatalog).toEqual({
+				family: "quality-review",
+				focus: false,
+				bodyLoaded: true,
+			});
+			expect(rebuilds).toBe(1);
+			expect(activeTools).toEqual(["skill_search", "skill_load"]);
+			const searchTool = registered.get(SKILL_SEARCH_TOOL_NAME);
+			if (!searchTool) throw new Error("skill_search was not registered");
+			const search = await searchTool.execute(
+				"search-after-load",
+				{ query: "" } as never,
+				undefined,
+				undefined,
+				{} as never,
+			);
+			expect(search.details).toMatchObject({ items: [] });
+		} finally {
+			await rm(root, { recursive: true, force: true });
+		}
+	});
+
 	it("reports deterministic Skill catalog deltas", () => {
 		const before = [
 			skill({ name: "daily-plan", description: "Plan a day." }),
@@ -437,20 +516,29 @@ describe("runtime discovery tools", () => {
 			},
 		} as never);
 		activeTools = [...registered.keys()];
-		const fetchMock = vi
-			.fn<typeof fetch>()
-			.mockResolvedValueOnce(
-				new Response(JSON.stringify({ ok: true, result: { receiptId: "receipt:search" } }), {
+		const fetchMock = vi.fn<typeof fetch>().mockResolvedValueOnce(
+			new Response(
+				JSON.stringify({
+					ok: true,
+					result: {
+						items: [
+							{
+								receiptId: "load:load-batch:0:workspace_search",
+								toolName: "workspace_search",
+							},
+							{
+								receiptId: "load:load-batch:1:workspace_read",
+								toolName: "workspace_read",
+							},
+						],
+					},
+				}),
+				{
 					status: 200,
 					headers: { "Content-Type": "application/json" },
-				}),
-			)
-			.mockResolvedValueOnce(
-				new Response(JSON.stringify({ ok: true, result: { receiptId: "receipt:read" } }), {
-					status: 200,
-					headers: { "Content-Type": "application/json" },
-				}),
-			);
+				},
+			),
+		);
 		vi.stubGlobal("fetch", fetchMock);
 		try {
 			const loadTool = registered.get(TOOL_LOAD_TOOL_NAME);
@@ -463,6 +551,21 @@ describe("runtime discovery tools", () => {
 				{} as never,
 			);
 
+			expect(fetchMock).toHaveBeenCalledTimes(1);
+			const request = fetchMock.mock.calls[0]?.[1] as RequestInit;
+			expect(JSON.parse(String(request.body))).toMatchObject({
+				sessionId: "session-room",
+				loads: [
+					{
+						receiptId: "load:load-batch:0:workspace_search",
+						toolName: "workspace_search",
+					},
+					{
+						receiptId: "load:load-batch:1:workspace_read",
+						toolName: "workspace_read",
+					},
+				],
+			});
 			expect(registry.disclosed().map((tool) => tool.name)).toEqual(["workspace_search", "workspace_read"]);
 			expect(activeTools.slice(-2)).toEqual(["workspace_search", "workspace_read"]);
 			expect(result.details).toMatchObject({
@@ -470,11 +573,15 @@ describe("runtime discovery tools", () => {
 				tools: [
 					{
 						tool: { name: "workspace_search" },
-						governedReceipt: { receiptId: "receipt:search" },
+						governedReceipt: {
+							receiptId: "load:load-batch:0:workspace_search",
+						},
 					},
 					{
 						tool: { name: "workspace_read" },
-						governedReceipt: { receiptId: "receipt:read" },
+						governedReceipt: {
+							receiptId: "load:load-batch:1:workspace_read",
+						},
 					},
 				],
 			});
@@ -532,20 +639,12 @@ describe("runtime discovery tools", () => {
 				activeTools = [...toolNames];
 			},
 		} as never);
-		const fetchMock = vi
-			.fn<typeof fetch>()
-			.mockResolvedValueOnce(
-				new Response(JSON.stringify({ ok: true, result: { receiptId: "receipt:search" } }), {
-					status: 200,
-					headers: { "Content-Type": "application/json" },
-				}),
-			)
-			.mockResolvedValueOnce(
-				new Response(JSON.stringify({ ok: false, error: "second load rejected" }), {
-					status: 409,
-					headers: { "Content-Type": "application/json" },
-				}),
-			);
+		const fetchMock = vi.fn<typeof fetch>().mockResolvedValueOnce(
+			new Response(JSON.stringify({ ok: false, error: "batch load rejected" }), {
+				status: 409,
+				headers: { "Content-Type": "application/json" },
+			}),
+		);
 		vi.stubGlobal("fetch", fetchMock);
 		try {
 			const loadTool = registered.get(TOOL_LOAD_TOOL_NAME);
@@ -558,7 +657,7 @@ describe("runtime discovery tools", () => {
 					undefined,
 					{} as never,
 				),
-			).rejects.toThrow("second load rejected");
+			).rejects.toThrow("batch load rejected");
 			expect(registry.disclosed()).toEqual([]);
 			expect(registry.governedLoadReceipts()).toEqual([]);
 			expect(activeTools).toEqual(["tool_load"]);
