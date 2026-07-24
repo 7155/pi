@@ -55,7 +55,9 @@ export class BackendToolRegistry {
 	}
 
 	disclosed(): BackendToolManifest[] {
-		return this.manifest.filter((tool) => this.disclosedNames.has(tool.name)).map((tool) => structuredClone(tool));
+		return [...this.disclosedNames]
+			.map((name) => this.get(name))
+			.filter((tool): tool is BackendToolManifest => tool !== undefined);
 	}
 
 	get(name: string): BackendToolManifest | undefined {
@@ -87,8 +89,11 @@ export class BackendToolRegistry {
 	governedLoadReceipts(): Array<{ name: string; receiptId: string }> {
 		return this.disclosed()
 			.map((tool) => ({ name: tool.name, receiptId: this.loadReceiptIds.get(tool.name) ?? "" }))
-			.filter((item) => item.receiptId.length > 0)
-			.sort((left, right) => left.name.localeCompare(right.name));
+			.filter((item) => item.receiptId.length > 0);
+	}
+
+	rebindableLoadReceipts(): Array<{ name: string; receiptId: string }> {
+		return [...this.loadReceiptIds].map(([name, receiptId]) => ({ name, receiptId }));
 	}
 
 	revision(): string {
@@ -293,6 +298,35 @@ export async function requestProductGateway(
 	return payload;
 }
 
+export async function requestGovernedToolLoad(
+	options: BackendToolBridgeOptions,
+	toolName: string,
+	receiptId: string,
+	signal?: AbortSignal,
+): Promise<Record<string, unknown> | undefined> {
+	if (!options.roomCapability) return undefined;
+	if (!options.registry.get(toolName)) {
+		throw new RuntimeProtocolError("TOOL_NOT_FOUND", `Unknown product tool: ${toolName}`);
+	}
+	const governed = await requestProductGateway(
+		options,
+		"load",
+		{
+			sessionId: options.sessionId,
+			receiptId,
+			toolName,
+			createdAtMs: Date.now(),
+		},
+		signal,
+	);
+	const result = governed.result;
+	const governedReceiptId = typeof result?.receiptId === "string" ? result.receiptId : "";
+	if (!governedReceiptId) {
+		throw new RuntimeProtocolError("INVALID_TOOL_RECEIPT", `Room tool receipt load failed: ${toolName}`);
+	}
+	return result;
+}
+
 /** Rebind disclosed schemas to the active Dispatch without reinjecting them. */
 export async function rebindGovernedToolReceipts(
 	options: BackendToolBridgeOptions,
@@ -300,22 +334,9 @@ export async function rebindGovernedToolReceipts(
 ): Promise<Array<{ name: string; receiptId: string }>> {
 	if (!options.roomCapability || !options.gatewayUrl) return [];
 	const rebound: Array<{ name: string; receiptId: string }> = [];
-	for (const item of options.registry.governedLoadReceipts()) {
-		const governed = await requestProductGateway(
-			options,
-			"load",
-			{
-				sessionId: options.sessionId,
-				receiptId: `load:rebind:${dispatchId}:${item.name}`,
-				toolName: item.name,
-				createdAtMs: Date.now(),
-			},
-			undefined,
-		);
-		const receiptId = typeof governed.result?.receiptId === "string" ? governed.result.receiptId : "";
-		if (!receiptId) {
-			throw new RuntimeProtocolError("INVALID_TOOL_RECEIPT", `Room tool receipt rebind failed: ${item.name}`);
-		}
+	for (const item of options.registry.rebindableLoadReceipts()) {
+		const result = await requestGovernedToolLoad(options, item.name, `load:rebind:${dispatchId}:${item.name}`);
+		const receiptId = String(result?.receiptId ?? "");
 		options.registry.recordLoadReceipt(item.name, receiptId);
 		rebound.push({ name: item.name, receiptId });
 	}
@@ -442,6 +463,36 @@ export function createBackendToolDefinition(
 		executionMode: "parallel",
 		execute: async (toolCallId, args, signal) =>
 			executeGatewayTool(options, tool, toolCallId, args, signal, artifacts),
+	};
+}
+
+export function createProjectedBackendToolDefinition(
+	options: BackendToolBridgeOptions,
+	projection: {
+		name: string;
+		label: string;
+		description: string;
+		parameters: ToolDefinition["parameters"];
+		targetToolName: string;
+		mapArguments(args: unknown): Record<string, unknown>;
+	},
+	artifacts = new ToolArtifactBuffer(),
+): ToolDefinition {
+	const target = options.registry.get(projection.targetToolName);
+	if (!target) {
+		throw new RuntimeProtocolError(
+			"TOOL_NOT_FOUND",
+			`Projected runtime tool target is unavailable: ${projection.targetToolName}`,
+		);
+	}
+	return {
+		name: projection.name,
+		label: projection.label,
+		description: projection.description,
+		parameters: projection.parameters,
+		executionMode: "parallel",
+		execute: async (toolCallId, args, signal) =>
+			executeGatewayTool(options, target, toolCallId, projection.mapArguments(args), signal, artifacts),
 	};
 }
 

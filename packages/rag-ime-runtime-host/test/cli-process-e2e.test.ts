@@ -13,7 +13,7 @@ const protocolVersion = "2";
 const children: ChildProcessWithoutNullStreams[] = [];
 const servers: Server[] = [];
 
-async function startHost(slow = false) {
+async function startHost(slow = false, settleStates: string[] = ["committed"]) {
 	const stateRoot = await mkdtemp(join(tmpdir(), "rag-ime-real-host-e2e-"));
 	const settleRequests: Record<string, unknown>[] = [];
 	const gateway = createServer((request, response) => {
@@ -24,15 +24,30 @@ async function startHost(slow = false) {
 		});
 		request.on("end", () => {
 			const payload = JSON.parse(body) as Record<string, unknown>;
-			if (request.url?.endsWith("/room-settle")) settleRequests.push(payload);
+			const isSettle = request.url?.endsWith("/room-settle") === true;
+			if (isSettle) settleRequests.push(payload);
+			const settleState =
+				settleStates[Math.min(Math.max(0, settleRequests.length - 1), settleStates.length - 1)] ?? "committed";
+			const result = request.url?.endsWith("/tool/load")
+				? { receiptId: `receipt:${String(payload.toolName ?? "")}` }
+				: {
+						state: isSettle ? settleState : "committed",
+						dispatchId: payload.dispatchId,
+						...(isSettle && settleState !== "committed" && settleState !== "blocked"
+							? {
+									message:
+										'<managed-task-follow-up origin="room-kernel" kind="continue">' +
+										"继续完成尚未满足的验收项。" +
+										"</managed-task-follow-up>",
+									followUpKey: `follow-up:${settleRequests.length}`,
+								}
+							: {}),
+					};
 			response.writeHead(200, { "Content-Type": "application/json" });
 			response.end(
 				JSON.stringify({
 					ok: true,
-					result: {
-						state: "committed",
-						dispatchId: payload.dispatchId,
-					},
+					result,
 				}),
 			);
 		});
@@ -103,14 +118,19 @@ async function openSession(host: Awaited<ReturnType<typeof startHost>>) {
 		provider: "rag-ime-deterministic",
 		modelId: "room-v2-test",
 		noContextFiles: true,
-		toolManifest: [{ name: "product_probe", description: "test manifest", parameters: { type: "object" } }],
+		toolManifest: [
+			{ name: "product_probe", description: "test manifest", parameters: { type: "object" } },
+			{ name: "room_state", description: "read Room state", parameters: { type: "object" } },
+			{ name: "room_post", description: "publish Room post", parameters: { type: "object" } },
+			{ name: "room_commit", description: "settle Room work", parameters: { type: "object" } },
+		],
 		roomCapability: {
 			manifestId: "manifest:test",
 			manifestHash: hash,
 			capabilityEpoch: 1,
 			promptCompileReceiptId: "receipt:test",
 			promptPlanHash: hash,
-			toolNames: ["room_post"],
+			toolNames: ["room_state", "room_post", "room_commit"],
 		},
 	});
 }
@@ -132,7 +152,7 @@ describe("runtime host real JSONL process", () => {
 		expect(opened.result.snapshot.roomCapability).toMatchObject({
 			manifestId: "manifest:test",
 			promptCompileReceiptId: "receipt:test",
-			toolNames: ["room_post"],
+			toolNames: ["room_state", "room_post", "room_commit"],
 		});
 		expect(opened.result.snapshot.toolManifest).toEqual(
 			expect.arrayContaining([expect.objectContaining({ name: "product_probe" })]),
@@ -164,6 +184,31 @@ describe("runtime host real JSONL process", () => {
 				settleAttempt: 1,
 			}),
 		]);
+		await host.close();
+	});
+
+	it("feeds a governed continuation back into the same Pi run before settling", async () => {
+		const host = await startHost(false, ["continue", "committed"]);
+		await openSession(host);
+
+		await host.request("dispatch", "room.dispatch", {
+			sessionId: "session:e2e",
+			rootId: "root:e2e",
+			dispatchId: "dispatch:e2e",
+			generation: 1,
+			capabilityEpoch: 1,
+			idempotencyKey: "root:e2e/goal-loop",
+			message: "Keep working until the governed acceptance is complete.",
+		});
+		await host.waitFor((message) => message.event === "agent.event" && message.payload?.type === "agent_settled");
+
+		expect(host.settleRequests.map((request) => request.settleAttempt)).toEqual([1, 2]);
+		expect(
+			host.messages.filter(
+				(message) => message.event === "agent.event" && message.payload?.type === "agent_settled",
+			),
+		).toHaveLength(1);
+		expect(JSON.stringify(host.messages)).toContain("继续完成尚未满足的验收项");
 		await host.close();
 	});
 

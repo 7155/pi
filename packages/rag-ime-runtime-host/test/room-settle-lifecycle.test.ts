@@ -81,15 +81,18 @@ describe("Room settle lifecycle", () => {
 		},
 	);
 
-	it("turns one product repair receipt into a native structured continuation", async () => {
+	it.each([
+		["continue", "继续推进并核验证据", "room_goal_guard"],
+		["repair_commit", "请修正 room_commit", "room_commit_guard"],
+	] as const)("turns one product %s receipt into a native structured continuation", async (state, message, origin) => {
 		const fetchMock = vi.fn(async () =>
 			gatewayResponse({
 				ok: true,
 				result: {
-					state: "repair",
+					state,
 					dispatchId: "dispatch:1",
-					message: "请补齐 room_commit",
-					repairKey: "repair:1",
+					message,
+					followUpKey: "follow-up:1",
 				},
 			}),
 		);
@@ -98,12 +101,12 @@ describe("Room settle lifecycle", () => {
 
 		await expect(handler(event)).resolves.toEqual({
 			followUp: {
-				text: "请补齐 room_commit",
+				text: message,
 				continuation: {
-					id: "room-settle-repair:repair:1",
+					id: "room-settle-follow-up:follow-up:1",
 					correlationId: "root:1",
-					origin: "room_settle_guard",
-					idempotencyKey: "repair:1",
+					origin,
+					idempotencyKey: "follow-up:1",
 					maxAttempts: 1,
 				},
 			},

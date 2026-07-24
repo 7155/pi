@@ -6,6 +6,7 @@ import type { SessionManager } from "@earendil-works/pi-coding-agent";
 import { ModelRuntime } from "@earendil-works/pi-coding-agent";
 import { describe, expect, it, vi } from "vitest";
 import { PiProductSession, restoreBackendToolDisclosures } from "../src/pi-session.ts";
+import { ROOM_BOOTSTRAP_TOOL_NAMES } from "../src/room-tool-bootstrap.ts";
 import { BackendToolRegistry } from "../src/tool-bridge.ts";
 
 function manifest(risk: string, requireQuery = false) {
@@ -102,6 +103,100 @@ describe("PiProductSession catalog updates", () => {
 			expect(productSession.snapshot()).toMatchObject({ roomSkillLoad: productSession.roomSkillLoad });
 		} finally {
 			productSession.dispose();
+			await rm(root, { recursive: true, force: true });
+		}
+	});
+
+	it("starts a managed Room with stable Room tools and a projected memory capture tool", async () => {
+		const root = await mkdtemp(join(tmpdir(), "pi-runtime-room-bootstrap-"));
+		const agentDir = join(root, "agent");
+		const sessionDir = join(root, "sessions");
+		const activePluginDir = join(root, "plugins", "active");
+		await Promise.all([
+			mkdir(agentDir, { recursive: true }),
+			mkdir(sessionDir, { recursive: true }),
+			mkdir(activePluginDir, { recursive: true }),
+		]);
+		const modelRuntime = await ModelRuntime.create({
+			authPath: join(root, "auth.json"),
+			modelsPath: null,
+			allowModelNetwork: false,
+		});
+		const fetchMock = vi.fn<typeof fetch>().mockImplementation(async (_url, init) => {
+			const request = JSON.parse(String(init?.body)) as { toolName?: string };
+			return new Response(
+				JSON.stringify({
+					ok: true,
+					result: { receiptId: `receipt:${request.toolName}` },
+				}),
+				{ status: 200, headers: { "Content-Type": "application/json" } },
+			);
+		});
+		vi.stubGlobal("fetch", fetchMock);
+		let productSession: PiProductSession | undefined;
+		try {
+			productSession = await PiProductSession.create({
+				externalSessionId: "room-bootstrap-session",
+				cwd: root,
+				sessionDir,
+				agentDir,
+				activePluginDir,
+				skillPaths: [],
+				piSkillPaths: [],
+				codexSkillPaths: [],
+				modelRuntime,
+				toolManifest: [
+					...ROOM_BOOTSTRAP_TOOL_NAMES.map((name) => ({
+						name,
+						description: `Run ${name}.`,
+						parameters: { type: "object", properties: {} },
+					})),
+					{
+						name: "ime_memory",
+						description: "Use governed memory.",
+						parameters: {
+							type: "object",
+							oneOf: [
+								{
+									type: "object",
+									properties: {
+										op: { const: "capture" },
+										kind: { type: "string" },
+										claim: { type: "string" },
+										captureScope: { type: "string" },
+										reason: { type: "string" },
+									},
+								},
+							],
+						},
+					},
+				],
+				roomCapability: {
+					manifestId: "manifest:room-bootstrap",
+					manifestHash: "c".repeat(64),
+				},
+				toolGatewayUrl: "http://127.0.0.1:8766/api/agent/tool/execute",
+				noContextFiles: true,
+				emitEvent() {},
+			});
+
+			expect(productSession.snapshot()).toMatchObject({
+				disclosedBackendTools: [...ROOM_BOOTSTRAP_TOOL_NAMES],
+				activeBackendTools: [...ROOM_BOOTSTRAP_TOOL_NAMES],
+			});
+			const tools = new Map(productSession.listTools().map((tool) => [String(tool.name), tool]));
+			expect(tools.get("room_state")).toMatchObject({ active: true });
+			expect(tools.get("room_post")).toMatchObject({ active: true });
+			expect(tools.get("room_commit")).toMatchObject({ active: true });
+			expect(tools.get("memory_capture")).toMatchObject({ active: true });
+			expect(tools.get("ime_memory")).toMatchObject({ active: false });
+			const requests = fetchMock.mock.calls.map(([, init]) => JSON.parse(String(init?.body))) as Array<{
+				toolName: string;
+			}>;
+			expect(requests.map((request) => request.toolName)).toEqual([...ROOM_BOOTSTRAP_TOOL_NAMES, "ime_memory"]);
+		} finally {
+			productSession?.dispose();
+			vi.unstubAllGlobals();
 			await rm(root, { recursive: true, force: true });
 		}
 	});
@@ -215,6 +310,11 @@ describe("PiProductSession catalog updates", () => {
 				description: "Apply settings.",
 				parameters: { type: "object", properties: {} },
 			},
+			{
+				name: "workspace.read",
+				description: "Read workspace files.",
+				parameters: { type: "object", properties: {} },
+			},
 		]);
 		const sessionManager = {
 			getBranch: () => [
@@ -235,11 +335,30 @@ describe("PiProductSession catalog updates", () => {
 					type: "message",
 					message: { role: "toolResult", toolName: "unknown.tool", isError: false },
 				},
+				{
+					type: "message",
+					message: {
+						role: "toolResult",
+						toolName: "tool_load",
+						isError: false,
+						details: {
+							schemaVersion: "rag-ime.tool-load-batch.v1",
+							tools: [
+								{
+									tool: { name: "workspace.read" },
+									governedReceipt: { receiptId: "receipt:workspace-read" },
+								},
+								{ tool: { name: "missing.tool" } },
+							],
+						},
+					},
+				},
 			],
 		} as unknown as SessionManager;
 
-		expect(restoreBackendToolDisclosures(registry, sessionManager)).toEqual(["settings.apply"]);
-		expect(registry.disclosed().map((tool) => tool.name)).toEqual(["settings.apply"]);
+		expect(restoreBackendToolDisclosures(registry, sessionManager)).toEqual(["settings.apply", "workspace.read"]);
+		expect(registry.disclosed().map((tool) => tool.name)).toEqual(["settings.apply", "workspace.read"]);
+		expect(registry.loadReceipt("workspace.read")).toBe("receipt:workspace-read");
 	});
 
 	it("keeps permission-only changes in the incremental suffix and reloads only real schema changes", async () => {

@@ -900,6 +900,7 @@ export async function createDeterministicTestModelRuntime(): Promise<ModelRuntim
 				stopReason: "toolUse",
 			}),
 			fauxAssistantMessage("Room dispatch inspected the workspace and settled."),
+			fauxAssistantMessage("Governed continuation completed the remaining acceptance check."),
 		]);
 	}
 	const model = faux.getModel();

@@ -25,10 +25,12 @@ import {
 	runtimeSkillCatalogRevision,
 } from "./discovery-tools.ts";
 import { createLifecycleHookController } from "./lifecycle-hooks.ts";
+import { createMemoryCaptureExtension, prepareGovernedMemoryCapture } from "./memory-capture-tool.ts";
 import { PROTOCOL_VERSION, type RuntimeEventEnvelope, RuntimeProtocolError } from "./protocol.ts";
 import { createProviderContextJournalExtension, ProviderContextJournal } from "./provider-context-journal.ts";
 import { createRoomResourceLimitExtension, type RoomResourceLimits } from "./room-resource-limits.ts";
 import { type ActiveRoomDispatch, createRoomSettleLifecycleExtension } from "./room-settle-lifecycle.ts";
+import { bootstrapRoomTools } from "./room-tool-bootstrap.ts";
 import { TOOL_LOAD_TOOL_NAME } from "./runtime-tool-names.ts";
 import { createSessionContextRefreshExtension } from "./session-context-refresh.ts";
 import type { PooledSession } from "./session-pool.ts";
@@ -182,7 +184,19 @@ function requiredRoomSkill(value: unknown): { skillId: string; skillHash: string
 
 /** Restore only schemas explicitly disclosed by tool_load on the active branch. */
 export function restoreBackendToolDisclosures(registry: BackendToolRegistry, sessionManager: SessionManager): string[] {
-	const restored = new Set<string>();
+	const restored: string[] = [];
+	const restoredNames = new Set<string>();
+	const restore = (value: unknown, governedValue?: unknown) => {
+		const loadedTool = objectRecord(value);
+		const loadedName = typeof loadedTool?.name === "string" ? loadedTool.name : "";
+		if (!registry.get(loadedName)) return;
+		if (!restoredNames.has(loadedName)) {
+			restoredNames.add(loadedName);
+			restored.push(loadedName);
+		}
+		const governed = objectRecord(governedValue);
+		if (typeof governed?.receiptId === "string") registry.recordLoadReceipt(loadedName, governed.receiptId);
+	};
 	for (const entry of sessionManager.getBranch()) {
 		if (entry.type !== "message") continue;
 		const message = objectRecord(entry.message);
@@ -190,16 +204,16 @@ export function restoreBackendToolDisclosures(registry: BackendToolRegistry, ses
 		if (message.toolName !== TOOL_LOAD_TOOL_NAME) continue;
 
 		const details = objectRecord(message.details);
-		const loadedTool = objectRecord(details?.tool);
-		const loadedName = typeof loadedTool?.name === "string" ? loadedTool.name : "";
-		if (registry.get(loadedName)) {
-			restored.add(loadedName);
-			const governed = objectRecord(details?.governedReceipt);
-			if (typeof governed?.receiptId === "string") registry.recordLoadReceipt(loadedName, governed.receiptId);
+		restore(details?.tool, details?.governedReceipt);
+		if (Array.isArray(details?.tools)) {
+			for (const item of details.tools) {
+				const loaded = objectRecord(item);
+				restore(loaded?.tool, loaded?.governedReceipt);
+			}
 		}
 	}
 	for (const name of restored) registry.disclose(name);
-	return [...restored].sort();
+	return restored;
 }
 
 function applyBackendToolDisclosure(session: AgentSession, registry: BackendToolRegistry): string[] {
@@ -525,6 +539,7 @@ export class PiProductSession implements PooledSession {
 					registry,
 					gateway: backendBridge,
 				}),
+				createMemoryCaptureExtension(backendBridge),
 				createBackendToolExtension(backendBridge),
 				createSessionContextRefreshExtension({
 					bridge: backendBridge,
@@ -588,6 +603,8 @@ export class PiProductSession implements PooledSession {
 			systemPromptOverride: (base) => [base?.trim(), requiredSkillPrompt].filter(Boolean).join("\n\n") || undefined,
 		});
 		await resourceLoader.reload();
+		await bootstrapRoomTools(backendBridge);
+		await prepareGovernedMemoryCapture(backendBridge);
 		let roomSkillLoad: RoomSkillLoadReceipt | undefined;
 		const requiredSkill = requiredRoomSkill(options.roomSkillPolicy);
 		if (requiredSkill) {

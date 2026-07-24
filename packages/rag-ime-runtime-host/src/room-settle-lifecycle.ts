@@ -61,22 +61,23 @@ export function createRoomSettleLifecycleExtension(options: RoomSettleLifecycleO
 			}
 			const state = text(result.state);
 			if (state === "committed" || state === "blocked") return;
-			if (state !== "repair") {
+			if (state !== "continue" && state !== "repair_commit") {
 				throw new Error(`Unknown Room settle state: ${state || "missing"}`);
 			}
 			const message = text(result.message);
-			const repairKey = text(result.repairKey);
-			if (!message || !repairKey) {
-				throw new Error("Room settle repair response is incomplete");
+			const followUpKey = text(result.followUpKey);
+			if (!message || !followUpKey) {
+				throw new Error("Room settle follow-up response is incomplete");
 			}
+			const origin = state === "continue" ? "room_goal_guard" : "room_commit_guard";
 			return {
 				followUp: {
 					text: message,
 					continuation: {
-						id: `room-settle-repair:${repairKey}`,
+						id: `room-settle-follow-up:${followUpKey}`,
 						correlationId: active.rootId,
-						origin: "room_settle_guard",
-						idempotencyKey: repairKey,
+						origin,
+						idempotencyKey: followUpKey,
 						maxAttempts: 1,
 					},
 				},

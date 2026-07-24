@@ -7,13 +7,14 @@ import {
 	type Skill,
 	type ToolDefinition,
 } from "@earendil-works/pi-coding-agent";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import {
 	type BackendToolRouteEntry,
 	backendToolRouteEntry,
 	createDiscoveryToolsExtension,
 	diffSkillCatalog,
 	loadBackendTool,
+	loadBackendTools,
 	loadSkill,
 	searchBackendTools,
 	searchSkills,
@@ -321,5 +322,186 @@ describe("runtime discovery tools", () => {
 		expect(providerLoad.tool.input).toBe("检索问题与范围");
 		expect(providerLoad.tool).not.toHaveProperty("profile");
 		expect(providerLoad.tool).not.toHaveProperty("risk");
+	});
+
+	it("validates and discloses up to four exact Tool schemas as one Provider update", async () => {
+		const registry = new BackendToolRegistry();
+		registry.sync([
+			{
+				name: "workspace_read",
+				description: "Read a workspace file.",
+				parameters: { type: "object", properties: { path: { type: "string" } } },
+			},
+			{
+				name: "workspace_search",
+				description: "Search the workspace.",
+				parameters: { type: "object", properties: { query: { type: "string" } } },
+			},
+		]);
+		expect(
+			loadBackendTools(registry, { names: ["workspace_search", "workspace_read"] }).map((item) => item.tool.name),
+		).toEqual(["workspace_search", "workspace_read"]);
+		expect(() => loadBackendTools(registry, { name: "workspace_read", names: ["workspace_search"] })).toThrow(
+			"exactly one",
+		);
+		expect(() => loadBackendTools(registry, { names: ["workspace_read", "workspace_read"] })).toThrow("unique");
+
+		const registered = new Map<string, ToolDefinition>();
+		let activeTools: string[] = [];
+		const extension = createDiscoveryToolsExtension({
+			getResourceLoader: () =>
+				({
+					getSkills: () => ({ skills: [], diagnostics: [] }),
+				}) as unknown as ResourceLoader,
+			registry,
+			gateway: {
+				sessionId: "session-room",
+				registry,
+				gatewayUrl: "http://127.0.0.1:8766/api/agent/tool/execute",
+				roomCapability: { manifestId: "manifest:room" },
+			},
+		});
+		if (typeof extension === "function") throw new Error("Expected a named inline extension");
+		await extension.factory({
+			on() {},
+			registerTool(toolDefinition: ToolDefinition) {
+				registered.set(toolDefinition.name, toolDefinition);
+			},
+			getActiveTools() {
+				return activeTools;
+			},
+			setActiveTools(toolNames: string[]) {
+				activeTools = [...toolNames];
+			},
+		} as never);
+		activeTools = [...registered.keys()];
+		const fetchMock = vi
+			.fn<typeof fetch>()
+			.mockResolvedValueOnce(
+				new Response(JSON.stringify({ ok: true, result: { receiptId: "receipt:search" } }), {
+					status: 200,
+					headers: { "Content-Type": "application/json" },
+				}),
+			)
+			.mockResolvedValueOnce(
+				new Response(JSON.stringify({ ok: true, result: { receiptId: "receipt:read" } }), {
+					status: 200,
+					headers: { "Content-Type": "application/json" },
+				}),
+			);
+		vi.stubGlobal("fetch", fetchMock);
+		try {
+			const loadTool = registered.get(TOOL_LOAD_TOOL_NAME);
+			if (!loadTool) throw new Error("tool_load was not registered");
+			const result = await loadTool.execute(
+				"load-batch",
+				{ names: ["workspace_search", "workspace_read"] } as never,
+				undefined,
+				undefined,
+				{} as never,
+			);
+
+			expect(registry.disclosed().map((tool) => tool.name)).toEqual(["workspace_search", "workspace_read"]);
+			expect(activeTools.slice(-2)).toEqual(["workspace_search", "workspace_read"]);
+			expect(result.details).toMatchObject({
+				schemaVersion: "rag-ime.tool-load-batch.v1",
+				tools: [
+					{
+						tool: { name: "workspace_search" },
+						governedReceipt: { receiptId: "receipt:search" },
+					},
+					{
+						tool: { name: "workspace_read" },
+						governedReceipt: { receiptId: "receipt:read" },
+					},
+				],
+			});
+			const providerResult = JSON.parse((result.content[0] as { text: string }).text) as {
+				schemaVersion: string;
+				tools: Array<Record<string, unknown>>;
+			};
+			expect(providerResult.schemaVersion).toBe("rag-ime.tool-load-batch.v1");
+			expect(providerResult.tools.map((tool) => tool.name)).toEqual(["workspace_search", "workspace_read"]);
+			expect(JSON.stringify(providerResult)).not.toContain('"parameters"');
+		} finally {
+			vi.unstubAllGlobals();
+		}
+	});
+
+	it("does not expose any batch Tool schema when a governed load fails", async () => {
+		const registry = new BackendToolRegistry();
+		registry.sync([
+			{
+				name: "workspace_read",
+				description: "Read a workspace file.",
+				parameters: { type: "object", properties: {} },
+			},
+			{
+				name: "workspace_search",
+				description: "Search the workspace.",
+				parameters: { type: "object", properties: {} },
+			},
+		]);
+		const registered = new Map<string, ToolDefinition>();
+		let activeTools = ["tool_load"];
+		const extension = createDiscoveryToolsExtension({
+			getResourceLoader: () =>
+				({
+					getSkills: () => ({ skills: [], diagnostics: [] }),
+				}) as unknown as ResourceLoader,
+			registry,
+			gateway: {
+				sessionId: "session-room",
+				registry,
+				gatewayUrl: "http://127.0.0.1:8766/api/agent/tool/execute",
+				roomCapability: { manifestId: "manifest:room" },
+			},
+		});
+		if (typeof extension === "function") throw new Error("Expected a named inline extension");
+		await extension.factory({
+			on() {},
+			registerTool(toolDefinition: ToolDefinition) {
+				registered.set(toolDefinition.name, toolDefinition);
+			},
+			getActiveTools() {
+				return activeTools;
+			},
+			setActiveTools(toolNames: string[]) {
+				activeTools = [...toolNames];
+			},
+		} as never);
+		const fetchMock = vi
+			.fn<typeof fetch>()
+			.mockResolvedValueOnce(
+				new Response(JSON.stringify({ ok: true, result: { receiptId: "receipt:search" } }), {
+					status: 200,
+					headers: { "Content-Type": "application/json" },
+				}),
+			)
+			.mockResolvedValueOnce(
+				new Response(JSON.stringify({ ok: false, error: "second load rejected" }), {
+					status: 409,
+					headers: { "Content-Type": "application/json" },
+				}),
+			);
+		vi.stubGlobal("fetch", fetchMock);
+		try {
+			const loadTool = registered.get(TOOL_LOAD_TOOL_NAME);
+			if (!loadTool) throw new Error("tool_load was not registered");
+			await expect(
+				loadTool.execute(
+					"load-batch-fail",
+					{ names: ["workspace_search", "workspace_read"] } as never,
+					undefined,
+					undefined,
+					{} as never,
+				),
+			).rejects.toThrow("second load rejected");
+			expect(registry.disclosed()).toEqual([]);
+			expect(registry.governedLoadReceipts()).toEqual([]);
+			expect(activeTools).toEqual(["tool_load"]);
+		} finally {
+			vi.unstubAllGlobals();
+		}
 	});
 });

@@ -20,6 +20,7 @@ import {
 	type BackendToolManifest,
 	type BackendToolRegistry,
 	backendToolSchemaRevision,
+	requestGovernedToolLoad,
 	requestProductGateway,
 } from "./tool-bridge.ts";
 
@@ -84,8 +85,19 @@ const TOOL_LOAD_PARAMETERS = {
 			minLength: 1,
 			description: "Exact product tool name returned by tool_search.",
 		},
+		names: {
+			type: "array",
+			minItems: 1,
+			maxItems: 4,
+			uniqueItems: true,
+			items: {
+				type: "string",
+				minLength: 1,
+			},
+			description: "One to four exact product tool names needed for the same concrete next step.",
+		},
 	},
-	required: ["name"],
+	oneOf: [{ required: ["name"] }, { required: ["names"] }],
 	additionalProperties: false,
 } as ToolDefinition["parameters"];
 
@@ -245,7 +257,7 @@ export function formatBackendToolRouteCatalog(tools: BackendToolManifest[], revi
 		"",
 		"",
 		`${TOOL_CATALOG_MARKER} revision="sha256:${revision}">`,
-		"Cards contain name, when, notFor, input, output, and does. Use tool_search for detail and tool_load for one schema.",
+		"Cards contain name, when, notFor, input, output, and does. Use tool_search for detail and tool_load for one to four exact schemas needed by the same next step.",
 		...entries.map((entry) => JSON.stringify(entry)),
 		"</available_product_tools>",
 	].join("\n");
@@ -405,6 +417,38 @@ export function loadBackendTool(
 	};
 }
 
+function exactToolNames(args: { name?: unknown; names?: unknown }): string[] {
+	const hasName = args.name !== undefined;
+	const hasNames = args.names !== undefined;
+	if (hasName === hasNames) {
+		throw new Error("tool_load requires exactly one of name or names");
+	}
+	const values = hasName ? [args.name] : args.names;
+	if (!Array.isArray(values) || values.length < 1 || values.length > 4) {
+		throw new Error("tool_load names must contain between one and four exact product tool names");
+	}
+	const names = values.map((value) => {
+		if (typeof value !== "string" || !value.trim()) {
+			throw new Error("tool_load requires exact non-empty product tool names");
+		}
+		return value.trim();
+	});
+	if (new Set(names).size !== names.length) {
+		throw new Error("tool_load names must be unique");
+	}
+	return names;
+}
+
+export function loadBackendTools(
+	registry: BackendToolRegistry,
+	args: { name?: unknown; names?: unknown },
+): Array<{ tool: BackendToolManifest; result: Record<string, unknown> }> {
+	const names = exactToolNames(args);
+	const unavailable = names.find((name) => !registry.get(name));
+	if (unavailable) throw new Error(`Unknown or unavailable product tool: ${unavailable}`);
+	return names.map((name) => loadBackendTool(registry, { name }));
+}
+
 export function createDiscoveryToolsExtension(options: DiscoveryToolsOptions): InlineExtension {
 	const initialToolCatalog = formatBackendToolRouteCatalog(options.registry.list(), options.registry.revision());
 	return {
@@ -488,54 +532,85 @@ export function createDiscoveryToolsExtension(options: DiscoveryToolsOptions): I
 				pi.registerTool({
 					name: TOOL_LOAD_TOOL_NAME,
 					label: "Load tool",
-					description:
-						"Disclose one exact product tool schema to the Provider only when its parameters are needed.",
-					promptSnippet: "Disclose one exact tool schema returned by tool_search before calling it",
+					description: "Disclose one to four exact product tool schemas needed for the same concrete next step.",
+					promptSnippet: "Disclose one to four exact tool schemas returned by tool_search before calling them",
 					parameters: TOOL_LOAD_PARAMETERS,
 					execute: async (toolCallId, args, signal) => {
-						const loaded = loadBackendTool(options.registry, args as { name?: unknown });
-						let governedReceipt: Record<string, unknown> | undefined;
-						if (options.gateway?.roomCapability) {
-							const governed = await requestProductGateway(
-								options.gateway,
-								"load",
-								{
-									sessionId: options.gateway.sessionId,
-									receiptId: `load:${toolCallId}`,
-									toolName: loaded.tool.name,
-									createdAtMs: Date.now(),
-								},
-								signal,
-							);
-							governedReceipt = governed.result;
-							const receiptId = typeof governedReceipt?.receiptId === "string" ? governedReceipt.receiptId : "";
-							options.registry.recordLoadReceipt(loaded.tool.name, receiptId);
+						const loaded = loadBackendTools(options.registry, args as { name?: unknown; names?: unknown });
+						const prepared = [];
+						for (const [index, item] of loaded.entries()) {
+							const governedReceipt = options.gateway?.roomCapability
+								? await requestGovernedToolLoad(
+										options.gateway,
+										item.tool.name,
+										loaded.length === 1
+											? `load:${toolCallId}`
+											: `load:${toolCallId}:${index}:${item.tool.name}`,
+										signal,
+									)
+								: undefined;
+							prepared.push({
+								...item,
+								alreadyDisclosed: options.registry.isDisclosed(item.tool.name),
+								governedReceipt,
+							});
 						}
-						const alreadyDisclosed = options.registry.isDisclosed(loaded.tool.name);
-						options.registry.disclose(loaded.tool.name);
+						for (const item of prepared) {
+							const receiptId =
+								typeof item.governedReceipt?.receiptId === "string" ? item.governedReceipt.receiptId : "";
+							if (receiptId) options.registry.recordLoadReceipt(item.tool.name, receiptId);
+							options.registry.disclose(item.tool.name);
+						}
 						const activeTools = new Set(pi.getActiveTools());
-						activeTools.add(loaded.tool.name);
+						for (const item of prepared) activeTools.add(item.tool.name);
 						pi.setActiveTools([...activeTools]);
-						const nextCall = {
-							tool: loaded.tool.name,
-							instruction: `Call ${loaded.tool.name} directly with arguments from its newly disclosed Provider schema.`,
-						};
-						const providerResult = {
-							schemaVersion: "rag-ime.tool-load.v1",
-							catalogRevision: options.registry.revision(),
-							schemaRevision: backendToolSchemaRevision([loaded.tool]),
-							tool: backendToolRouteEntry(loaded.tool),
-							disclosed: true,
-							alreadyDisclosed,
-							nextCall,
-						};
-						const details = {
-							...loaded.result,
-							disclosed: true,
-							alreadyDisclosed,
-							nextCall,
-							...(governedReceipt ? { governedReceipt } : {}),
-						};
+						const nextCalls = prepared.map((item) => ({
+							tool: item.tool.name,
+							instruction: `Call ${item.tool.name} directly with arguments from its newly disclosed Provider schema.`,
+						}));
+						const providerResult =
+							prepared.length === 1
+								? {
+										schemaVersion: "rag-ime.tool-load.v1",
+										catalogRevision: options.registry.revision(),
+										schemaRevision: backendToolSchemaRevision([prepared[0].tool]),
+										tool: backendToolRouteEntry(prepared[0].tool),
+										disclosed: true,
+										alreadyDisclosed: prepared[0].alreadyDisclosed,
+										nextCall: nextCalls[0],
+									}
+								: {
+										schemaVersion: "rag-ime.tool-load-batch.v1",
+										catalogRevision: options.registry.revision(),
+										schemaRevision: backendToolSchemaRevision(prepared.map((item) => item.tool)),
+										tools: prepared.map((item) => ({
+											...backendToolRouteEntry(item.tool),
+											disclosed: true,
+											alreadyDisclosed: item.alreadyDisclosed,
+										})),
+										nextCalls,
+									};
+						const details =
+							prepared.length === 1
+								? {
+										...prepared[0].result,
+										disclosed: true,
+										alreadyDisclosed: prepared[0].alreadyDisclosed,
+										nextCall: nextCalls[0],
+										...(prepared[0].governedReceipt ? { governedReceipt: prepared[0].governedReceipt } : {}),
+									}
+								: {
+										schemaVersion: "rag-ime.tool-load-batch.v1",
+										catalogRevision: options.registry.revision(),
+										schemaRevision: backendToolSchemaRevision(prepared.map((item) => item.tool)),
+										tools: prepared.map((item, index) => ({
+											...item.result,
+											disclosed: true,
+											alreadyDisclosed: item.alreadyDisclosed,
+											nextCall: nextCalls[index],
+											...(item.governedReceipt ? { governedReceipt: item.governedReceipt } : {}),
+										})),
+									};
 						return {
 							content: [{ type: "text", text: JSON.stringify(providerResult) }],
 							details,

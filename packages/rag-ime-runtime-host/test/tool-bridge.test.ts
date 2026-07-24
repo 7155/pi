@@ -134,9 +134,20 @@ describe("BackendToolRegistry", () => {
 		registry.sync(after);
 		expect(registry.disclosed()).toEqual([]);
 
-		for (const name of ["skill_load", "tool_load"]) {
+		for (const name of ["skill_load", "tool_load", "memory_capture"]) {
 			expect(() => registry.sync([tool({ name })])).toThrow("Tool name is reserved by the runtime host");
 		}
+	});
+
+	it("keeps newly disclosed Tool schemas in append order without reordering the stable prefix", () => {
+		const registry = new BackendToolRegistry();
+		registry.sync([tool({ name: "alpha.query" }), tool({ name: "zeta.run" })]);
+
+		registry.disclose("zeta.run");
+		registry.disclose("alpha.query");
+		registry.disclose("zeta.run");
+
+		expect(registry.disclosed().map((item) => item.name)).toEqual(["zeta.run", "alpha.query"]);
 	});
 
 	it("registers the authorized catalog without disclosing every schema", async () => {
@@ -454,6 +465,42 @@ describe("BackendToolRegistry", () => {
 				sessionId: "session-room",
 				receiptId: "load:rebind:dispatch:2:room_post",
 				toolName: "room_post",
+			});
+		} finally {
+			vi.unstubAllGlobals();
+		}
+	});
+
+	it("rebinds a governed projected Tool target without disclosing its schema", async () => {
+		const registry = new BackendToolRegistry();
+		registry.sync([tool({ name: "ime_memory" })]);
+		registry.recordLoadReceipt("ime_memory", "load:old-memory");
+		const fetchMock = vi.fn<typeof fetch>().mockResolvedValue(
+			new Response(JSON.stringify({ ok: true, result: { receiptId: "load:new-memory" } }), {
+				status: 200,
+				headers: { "Content-Type": "application/json" },
+			}),
+		);
+		vi.stubGlobal("fetch", fetchMock);
+		try {
+			const rebound = await rebindGovernedToolReceipts(
+				{
+					sessionId: "session-room",
+					registry,
+					gatewayUrl: "http://127.0.0.1:8766/api/agent/tool/execute",
+					roomCapability: { manifestId: "manifest:2", manifestHash: "b".repeat(64) },
+				},
+				"dispatch:2",
+			);
+
+			expect(rebound).toEqual([{ name: "ime_memory", receiptId: "load:new-memory" }]);
+			expect(registry.loadReceipt("ime_memory")).toBe("load:new-memory");
+			expect(registry.disclosed()).toEqual([]);
+			expect(registry.governedLoadReceipts()).toEqual([]);
+			const request = JSON.parse(String(fetchMock.mock.calls[0]?.[1]?.body)) as Record<string, unknown>;
+			expect(request).toMatchObject({
+				receiptId: "load:rebind:dispatch:2:ime_memory",
+				toolName: "ime_memory",
 			});
 		} finally {
 			vi.unstubAllGlobals();
