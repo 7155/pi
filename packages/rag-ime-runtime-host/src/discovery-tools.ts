@@ -338,7 +338,7 @@ export function formatBackendToolRouteCatalog(
 			: []),
 		`${TOOL_CATALOG_MARKER} revision="sha256:${revision}">`,
 		projected
-			? "Only current-stage deferred tools have exact cards here. Use tool_search for the complete deferred catalog. Active Provider schemas and deferred entries are mutually exclusive: call an active tool directly and never pass it to tool_load."
+			? "Only current-stage tool candidates have exact cards here. Use tool_search for the complete catalog. A successful tool_load receipt or an active Provider schema immediately supersedes its earlier card; the card may remain only as immutable cache history and is no longer deferred. Call active tools directly and never pass them to tool_load."
 			: "Cards contain name, when, notFor, input, output, and does. Use tool_search for detail and tool_load for one to four exact schemas needed by the same next step.",
 		...entries.map((entry) => JSON.stringify(entry)),
 		"</available_product_tools>",

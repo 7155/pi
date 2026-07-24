@@ -185,6 +185,29 @@ describe("OpenAI Responses terminal event handling", () => {
 		expect(result.errorMessage).toBe("OpenAI Responses stream ended before a terminal response event");
 	});
 
+	it("reports cancellation instead of misclassifying an aborted stream as early EOF", async () => {
+		const model = createModel();
+		const context: Context = {
+			systemPrompt: "",
+			messages: [{ role: "user", content: [{ type: "text", text: "hi" }], timestamp: 0 }],
+			tools: [],
+		};
+		const controller = new AbortController();
+		controller.abort();
+		const stream = streamOpenAIResponses(model, context, {
+			apiKey: "test",
+			signal: controller.signal,
+		});
+
+		for await (const _event of stream) {
+			// Drain the stream so result() observes the terminal cancellation.
+		}
+
+		const result = await stream.result();
+		expect(result.stopReason).toBe("aborted");
+		expect(result.errorMessage).toBe("Request was aborted");
+	});
+
 	it("finalizes completed terminal events as stop", async () => {
 		const model = createModel();
 		const output = createOutput(model);

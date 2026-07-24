@@ -125,6 +125,25 @@ function executionReceiptIds(serialized: string, limit = 2): string[] {
 		.slice(-limit);
 }
 
+function qualityGateProposal(
+	criterionIds: string[],
+	evidenceRefs: string[],
+	verdict: "ready_to_deliver" | "not_ready",
+): Record<string, unknown> {
+	const passed = verdict === "ready_to_deliver";
+	const itemEvidence = passed ? evidenceRefs.slice(0, 1) : [];
+	return {
+		originalRequestChecked: true,
+		verdict,
+		items: criterionIds.map((criterionId) => ({
+			criterionId,
+			status: passed ? "pass" : "not_verified",
+			evidenceRefs: itemEvidence,
+		})),
+		residualRisks: passed ? [] : ["最终独立验收仍由下一位 Room 成员完成。"],
+	};
+}
+
 /** Drive the real discovery, product Tool and settle loops for the API epoch canary. */
 export function contextEpochCanaryResponse(context: Context): AssistantMessage {
 	const task = currentRoomTask(context);
@@ -185,13 +204,15 @@ export function contextEpochCanaryResponse(context: Context): AssistantMessage {
 			throw new Error("The context epoch canary requires explicit acceptance criterion ids");
 		}
 		const receipts = executionReceiptIds(serialized);
+		const evidenceRefs = receipts.length > 0 ? receipts : [`${prefix}-read-a`, `${prefix}-read-b`];
 		return fauxAssistantMessage(
 			fauxToolCall(
 				"room_commit",
 				{
 					decision: "deliver",
 					result: `CANARY-${epoch}-OK；两份指定源码已完成有界读取。`,
-					evidenceRefs: receipts.length > 0 ? receipts : [`${prefix}-read-a`, `${prefix}-read-b`],
+					qualityGate: qualityGateProposal(requirementCoverage, evidenceRefs, "ready_to_deliver"),
+					evidenceRefs,
 					requirementCoverage,
 				},
 				{ id: `${prefix}-commit` },
@@ -331,13 +352,16 @@ export function projectTaskCanaryResponse(context: Context): AssistantMessage {
 		if (requirementCoverage.length === 0) {
 			throw new Error("The project canary requires explicit acceptance criterion ids");
 		}
+		const receipts = executionReceiptIds(serialized, 8);
+		const evidenceRefs = receipts.length > 0 ? receipts : ["project-test"];
 		return fauxAssistantMessage(
 			fauxToolCall(
 				"room_commit",
 				{
 					decision: "deliver",
 					result: "PROJECT-CANARY-OK；实现已完成，隔离测试全部通过。",
-					evidenceRefs: executionReceiptIds(serialized, 8),
+					qualityGate: qualityGateProposal(requirementCoverage, evidenceRefs, "ready_to_deliver"),
+					evidenceRefs,
 					requirementCoverage,
 				},
 				{ id: "project-commit" },
@@ -560,14 +584,18 @@ export function projectCollaborationCanaryResponse(context: Context): AssistantM
 	}
 	if (!serialized.includes(callId("commit"))) {
 		const evidenceRefs = executionReceiptIds(serialized, 8);
+		const committedEvidenceRefs =
+			evidenceRefs.length > 0 ? evidenceRefs : [member === "A" ? callId("regression-shell") : callId("read-app")];
 		if (member === "A") {
+			const criterionIds = acceptanceCriterionIds(task);
 			return fauxAssistantMessage(
 				fauxToolCall(
 					"room_commit",
 					{
 						decision: "handoff",
 						result: "COLLAB-A-COMMIT-RESULT",
-						evidenceRefs: evidenceRefs.length > 0 ? evidenceRefs : [callId("regression-shell")],
+						qualityGate: qualityGateProposal(criterionIds, committedEvidenceRefs, "not_ready"),
+						evidenceRefs: committedEvidenceRefs,
 						requirementCoverage: [],
 						targetParticipantId: participantIdForRole(context, "coordinator"),
 						nextIntentKind: "close",
@@ -593,7 +621,8 @@ export function projectCollaborationCanaryResponse(context: Context): AssistantM
 				{
 					decision: "deliver",
 					result: member === "B" ? "COLLAB-B-COMMIT-RESULT" : "COLLAB-C-COMMIT-RESULT",
-					evidenceRefs: evidenceRefs.length > 0 ? evidenceRefs : [callId("read-app")],
+					qualityGate: qualityGateProposal(requirementCoverage, committedEvidenceRefs, "ready_to_deliver"),
+					evidenceRefs: committedEvidenceRefs,
 					requirementCoverage,
 				},
 				{ id: callId("commit") },

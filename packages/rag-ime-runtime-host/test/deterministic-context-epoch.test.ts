@@ -150,6 +150,16 @@ describe("deterministic context epoch Provider", () => {
 			arguments: {
 				decision: "deliver",
 				requirementCoverage: ["criterion:1", "criterion:2", "criterion:3"],
+				qualityGate: {
+					originalRequestChecked: true,
+					verdict: "ready_to_deliver",
+					items: expect.arrayContaining([
+						expect.objectContaining({
+							criterionId: "criterion:1",
+							status: "pass",
+						}),
+					]),
+				},
 			},
 		});
 	});
@@ -236,7 +246,17 @@ describe("deterministic context epoch Provider", () => {
 		expect(commit).toMatchObject({
 			name: "room_commit",
 			id: "project-commit",
-			arguments: { requirementCoverage: ["project:1", "project:2"] },
+			arguments: {
+				requirementCoverage: ["project:1", "project:2"],
+				qualityGate: {
+					originalRequestChecked: true,
+					verdict: "ready_to_deliver",
+					items: [
+						expect.objectContaining({ criterionId: "project:1", status: "pass" }),
+						expect.objectContaining({ criterionId: "project:2", status: "pass" }),
+					],
+				},
+			},
 		});
 	});
 
@@ -456,6 +476,62 @@ describe("deterministic context epoch Provider", () => {
 			},
 		});
 
+		const aCommit = calls(
+			projectCollaborationCanaryResponse(
+				collaborationContext(
+					aTask,
+					[
+						"tool_load",
+						"room_state",
+						"room_collaborate",
+						"workspace_read",
+						"workspace_list",
+						"workspace_search",
+						"workspace_shell",
+						"workspace_patch",
+						"room_post",
+						"room_commit",
+					],
+					{
+						history: [
+							'"id":"collab-a-state"',
+							'"id":"collab-a-collaborate"',
+							'"id":"collab-a-missing-read"',
+							'"id":"collab-a-list"',
+							'"id":"collab-a-search"',
+							'"id":"collab-a-read-app"',
+							'"id":"collab-a-baseline-shell"',
+							'"id":"collab-a-patch"',
+							'"id":"collab-a-regression-shell"',
+							'"id":"collab-a-post"',
+						].join(" "),
+						participants: roomState.participants,
+						mutationApplied: true,
+						executionReceiptId: "execution:a",
+					},
+				),
+			),
+		)[0];
+		expect(aCommit).toMatchObject({
+			name: "room_commit",
+			id: "collab-a-commit",
+			arguments: {
+				decision: "handoff",
+				requirementCoverage: [],
+				qualityGate: {
+					originalRequestChecked: true,
+					verdict: "not_ready",
+					items: [
+						expect.objectContaining({
+							criterionId: "criterion:a",
+							status: "not_verified",
+							evidenceRefs: [],
+						}),
+					],
+				},
+			},
+		});
+
 		const cTask = [
 			"原始需求（不可改写）：THREE-MEMBER-ROOM-CANARY",
 			"当前任务：",
@@ -488,6 +564,14 @@ describe("deterministic context epoch Provider", () => {
 				decision: "deliver",
 				result: "COLLAB-C-COMMIT-RESULT",
 				requirementCoverage: ["criterion:1", "criterion:2"],
+				qualityGate: {
+					originalRequestChecked: true,
+					verdict: "ready_to_deliver",
+					items: [
+						expect.objectContaining({ criterionId: "criterion:1", status: "pass" }),
+						expect.objectContaining({ criterionId: "criterion:2", status: "pass" }),
+					],
+				},
 			},
 		});
 	});

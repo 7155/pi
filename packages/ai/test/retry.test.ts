@@ -48,6 +48,14 @@ describe("provider retry classification", () => {
 				}),
 			),
 		).toBe(true);
+		expect(
+			isRetryableAssistantError(
+				fauxAssistantMessage("", {
+					stopReason: "error",
+					errorMessage: "OpenAI Responses stream ended before a terminal response event",
+				}),
+			),
+		).toBe(true);
 	});
 
 	it("retries explicit upstream gateway failures wrapped as HTTP 400", () => {
