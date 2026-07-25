@@ -16,7 +16,7 @@ const AGENT_SESSION_SCENARIO = "agent-session";
 const AGENT_SESSION_TASK_MARKER = "AGENT-SESSION-RESILIENCE";
 const AGENT_SESSION_FINAL_MARKER = "AGENT-SESSION-CANARY-OK";
 const AGENT_SESSION_RECOVERY_MARKER = "AGENT-SESSION-RECOVERY-OK";
-const AGENT_SESSION_SKILL = "room-test-driven-implementation";
+const AGENT_SESSION_SKILL = "test-driven-implementation";
 
 function contextText(context: Context): string {
 	return JSON.stringify({ systemPrompt: context.systemPrompt ?? "", messages: context.messages });
@@ -88,15 +88,15 @@ function latestWorkspaceReadReceipt(context: Context, fileName: string): Record<
 		.at(-1);
 }
 
-function participantIdForRole(context: Context, collaborationRole: string): string {
+function participantRefForRole(context: Context, collaborationRole: string): string {
 	const participant = parsedContextRecords(context).find((record) => {
-		const id = String(record.id ?? record.participantId ?? "");
-		return id.startsWith("participant:") && record.collaborationRole === collaborationRole;
+		const participantRef = String(record.participantRef ?? "").trim();
+		return participantRef.length > 0 && record.capabilitySummary === collaborationRole;
 	});
 	if (!participant) {
 		throw new Error(`Room state did not expose the ${collaborationRole} participant`);
 	}
-	return String(participant.id ?? participant.participantId);
+	return String(participant.participantRef);
 }
 
 function currentRoomTask(context: Context): string | undefined {
@@ -112,36 +112,43 @@ function currentEpochMarker(task: string): string {
 	return match?.[1] ?? "";
 }
 
-function acceptanceCriterionIds(task: string): string[] {
-	return [...task.matchAll(/"?criterionId"?\s*:\s*"([^"]+)"/gu)]
-		.map((match) => match[1])
+function acceptanceAliases(task: string): string[] {
+	return [...task.matchAll(/\b(AC-[1-9][0-9]*)\b/gu)]
+		.map((match) => match[1].toUpperCase())
 		.filter((value, index, values) => value.length > 0 && values.indexOf(value) === index);
 }
 
-function executionReceiptIds(serialized: string, limit = 2): string[] {
-	return [...serialized.matchAll(/"executionReceiptId":"([^"]+)"/gu)]
-		.map((match) => match[1])
+function currentAcceptanceAliases(context: Context, task: string): string[] {
+	const groups = parsedContextRecords(context)
+		.map((record) => record.acceptanceAliases)
+		.filter((value): value is unknown[] => Array.isArray(value));
+	for (const group of groups.reverse()) {
+		const aliases = group
+			.map((item) => {
+				if (typeof item === "string") return item.trim().toUpperCase();
+				if (typeof item !== "object" || item === null) return "";
+				return String((item as Record<string, unknown>).acceptance ?? "")
+					.trim()
+					.toUpperCase();
+			})
+			.filter((value, index, values) => /^AC-[1-9][0-9]*$/u.test(value) && values.indexOf(value) === index);
+		if (aliases.length > 0) return aliases;
+	}
+	return acceptanceAliases(task);
+}
+
+function runtimeEvidenceRefs(context: Context, limit = 2): string[] {
+	return parsedContextRecords(context)
+		.map((record) => String(record.evidenceRef ?? ""))
 		.filter((value, index, values) => value.length > 0 && values.indexOf(value) === index)
 		.slice(-limit);
 }
 
-function qualityGateProposal(
-	criterionIds: string[],
-	evidenceRefs: string[],
-	verdict: "ready_to_deliver" | "not_ready",
-): Record<string, unknown> {
-	const passed = verdict === "ready_to_deliver";
-	const itemEvidence = passed ? evidenceRefs.slice(0, 1) : [];
-	return {
-		originalRequestChecked: true,
-		verdict,
-		items: criterionIds.map((criterionId) => ({
-			criterionId,
-			status: passed ? "pass" : "not_verified",
-			evidenceRefs: itemEvidence,
-		})),
-		residualRisks: passed ? [] : ["最终独立验收仍由下一位 Room 成员完成。"],
-	};
+function evidenceProposal(aliases: string[], evidenceRefs: string[]): Array<Record<string, unknown>> {
+	return aliases.map((acceptance) => ({
+		acceptance,
+		refs: evidenceRefs,
+	}));
 }
 
 /** Drive the real discovery, product Tool and settle loops for the API epoch canary. */
@@ -192,28 +199,27 @@ export function contextEpochCanaryResponse(context: Context): AssistantMessage {
 		return fauxAssistantMessage(
 			fauxToolCall(
 				"room_post",
-				{ content: `CANARY-${epoch}-OK；两份指定源码已完成有界读取。` },
+				{ kind: "evidence", content: `CANARY-${epoch}-OK；两份指定源码已完成有界读取。` },
 				{ id: `${prefix}-post` },
 			),
 			{ stopReason: "toolUse" },
 		);
 	}
 	if (!serialized.includes(`${prefix}-commit`)) {
-		const requirementCoverage = acceptanceCriterionIds(task);
-		if (requirementCoverage.length === 0) {
-			throw new Error("The context epoch canary requires explicit acceptance criterion ids");
+		const aliases = acceptanceAliases(task);
+		if (aliases.length === 0) {
+			throw new Error("The context epoch canary requires explicit AC aliases");
 		}
-		const receipts = executionReceiptIds(serialized);
+		const receipts = runtimeEvidenceRefs(context);
 		const evidenceRefs = receipts.length > 0 ? receipts : [`${prefix}-read-a`, `${prefix}-read-b`];
 		return fauxAssistantMessage(
 			fauxToolCall(
 				"room_commit",
 				{
 					decision: "deliver",
-					result: `CANARY-${epoch}-OK；两份指定源码已完成有界读取。`,
-					qualityGate: qualityGateProposal(requirementCoverage, evidenceRefs, "ready_to_deliver"),
-					evidenceRefs,
-					requirementCoverage,
+					summary: `CANARY-${epoch}-OK；两份指定源码已完成有界读取。`,
+					evidence: evidenceProposal(aliases, evidenceRefs),
+					residualRisks: [],
 				},
 				{ id: `${prefix}-commit` },
 			),
@@ -341,28 +347,27 @@ export function projectTaskCanaryResponse(context: Context): AssistantMessage {
 		return fauxAssistantMessage(
 			fauxToolCall(
 				"room_post",
-				{ content: "PROJECT-CANARY-OK；实现已完成，隔离测试全部通过。" },
+				{ kind: "evidence", content: "PROJECT-CANARY-OK；实现已完成，隔离测试全部通过。" },
 				{ id: "project-post" },
 			),
 			{ stopReason: "toolUse" },
 		);
 	}
 	if (!serialized.includes("project-commit")) {
-		const requirementCoverage = acceptanceCriterionIds(task);
-		if (requirementCoverage.length === 0) {
-			throw new Error("The project canary requires explicit acceptance criterion ids");
+		const aliases = acceptanceAliases(task);
+		if (aliases.length === 0) {
+			throw new Error("The project canary requires explicit AC aliases");
 		}
-		const receipts = executionReceiptIds(serialized, 8);
+		const receipts = runtimeEvidenceRefs(context, 8);
 		const evidenceRefs = receipts.length > 0 ? receipts : ["project-test"];
 		return fauxAssistantMessage(
 			fauxToolCall(
 				"room_commit",
 				{
 					decision: "deliver",
-					result: "PROJECT-CANARY-OK；实现已完成，隔离测试全部通过。",
-					qualityGate: qualityGateProposal(requirementCoverage, evidenceRefs, "ready_to_deliver"),
-					evidenceRefs,
-					requirementCoverage,
+					summary: "PROJECT-CANARY-OK；实现已完成，隔离测试全部通过。",
+					evidence: evidenceProposal(aliases, evidenceRefs),
+					residualRisks: [],
 				},
 				{ id: "project-commit" },
 			),
@@ -383,7 +388,8 @@ export function projectCollaborationCanaryResponse(context: Context): AssistantM
 	}
 	const task = currentRoomTask(context);
 	if (!task) return fauxAssistantMessage("A managed three-member Room dispatch is required.");
-	const currentTask = (task.split("当前任务：").at(-1) ?? task).split("验收条件 acceptance.criteria")[0] ?? task;
+	const currentTask =
+		(task.split("当前任务：").at(-1) ?? task).split(/验收条件(?:\s+acceptance\.criteria|（|:|：)/u)[0] ?? task;
 	const member = currentTask.includes("COLLAB-B-REVIEWED")
 		? "B"
 		: currentTask.includes("COLLAB-C-ACCEPTED")
@@ -417,14 +423,14 @@ export function projectCollaborationCanaryResponse(context: Context): AssistantM
 				fauxToolCall(
 					"room_collaborate",
 					{
-						targetParticipantId: participantIdForRole(context, "reviewer"),
-						intentKind: "review",
+						targetParticipantRef: participantRefForRole(context, "reviewer"),
+						intent: "review",
 						objective:
 							"B 先调用 room_state，再独立读取 calculator.py 与 test_calculator.py；" +
 							"不得调用 workspace_patch 或 workspace_shell；room_post 以 COLLAB-B-REVIEWED 开头，" +
-							"最后 room_commit decision=deliver、result=COLLAB-B-COMMIT-RESULT。",
+							"最后用 room_commit 交付 COLLAB-B-COMMIT-RESULT 和 AC 证据。",
 						expectedOutput: "B 交付只读测试意图复核与两份文件证据。",
-						acceptanceCriterionIds: [],
+						acceptance: currentAcceptanceAliases(context, task).filter((alias) => alias === "AC-4"),
 					},
 					{ id: callId("collaborate") },
 				),
@@ -573,7 +579,11 @@ export function projectCollaborationCanaryResponse(context: Context): AssistantM
 		const marker =
 			member === "A" ? "COLLAB-A-IMPLEMENTED" : member === "B" ? "COLLAB-B-REVIEWED" : "COLLAB-C-ACCEPTED";
 		return fauxAssistantMessage(
-			fauxToolCall("room_post", { content: `${marker}；隔离项目证据已核对。` }, { id: callId("post") }),
+			fauxToolCall(
+				"room_post",
+				{ kind: "evidence", content: `${marker}；隔离项目证据已核对。` },
+				{ id: callId("post") },
+			),
 			{ stopReason: "toolUse" },
 		);
 	}
@@ -583,47 +593,47 @@ export function projectCollaborationCanaryResponse(context: Context): AssistantM
 		});
 	}
 	if (!serialized.includes(callId("commit"))) {
-		const evidenceRefs = executionReceiptIds(serialized, 8);
+		const evidenceRefs = runtimeEvidenceRefs(context, 8);
 		const committedEvidenceRefs =
 			evidenceRefs.length > 0 ? evidenceRefs : [member === "A" ? callId("regression-shell") : callId("read-app")];
 		if (member === "A") {
-			const criterionIds = acceptanceCriterionIds(task);
+			const aliases = currentAcceptanceAliases(context, task);
+			const ownedAliases = aliases.filter((alias) => ["AC-1", "AC-2", "AC-3"].includes(alias));
 			return fauxAssistantMessage(
 				fauxToolCall(
 					"room_commit",
 					{
 						decision: "handoff",
-						result: "COLLAB-A-COMMIT-RESULT",
-						qualityGate: qualityGateProposal(criterionIds, committedEvidenceRefs, "not_ready"),
-						evidenceRefs: committedEvidenceRefs,
-						requirementCoverage: [],
-						targetParticipantId: participantIdForRole(context, "coordinator"),
-						nextIntentKind: "close",
+						summary: "COLLAB-A-COMMIT-RESULT",
+						evidence: evidenceProposal(ownedAliases, committedEvidenceRefs),
+						residualRisks: ["最终独立验收仍由 C 完成。"],
+						targetParticipantRef: participantRefForRole(context, "coordinator"),
+						intent: "close",
 						nextTask:
 							"C 先调用 room_state，独立读取 calculator.py 与 test_calculator.py；" +
 							"运行 /usr/bin/python3 -m unittest -v，不得调用 workspace_patch；" +
-							"room_post 以 COLLAB-C-ACCEPTED 开头；最后 room_commit decision=deliver、" +
-							"result=COLLAB-C-COMMIT-RESULT，并原样覆盖全部 acceptance.criteria[].criterionId。",
-						nextExpectedOutput: "C 交付独立测试验收证据并最终关闭 Root。",
+							"room_post 以 COLLAB-C-ACCEPTED 开头；最后用 room_commit 交付 " +
+							"COLLAB-C-COMMIT-RESULT，并覆盖全部 AC 验收别名。",
+						expectedOutput: "C 交付独立测试验收证据并最终关闭 Root。",
+						acceptanceAliases: aliases,
 					},
 					{ id: callId("commit") },
 				),
 				{ stopReason: "toolUse" },
 			);
 		}
-		const requirementCoverage = member === "C" ? acceptanceCriterionIds(task) : [];
-		if (member === "C" && requirementCoverage.length === 0) {
-			throw new Error("The final collaboration task requires explicit acceptance criterion ids");
+		const aliases = currentAcceptanceAliases(context, task);
+		if (aliases.length === 0) {
+			throw new Error("Every collaboration delivery requires explicit AC aliases");
 		}
 		return fauxAssistantMessage(
 			fauxToolCall(
 				"room_commit",
 				{
 					decision: "deliver",
-					result: member === "B" ? "COLLAB-B-COMMIT-RESULT" : "COLLAB-C-COMMIT-RESULT",
-					qualityGate: qualityGateProposal(requirementCoverage, committedEvidenceRefs, "ready_to_deliver"),
-					evidenceRefs: committedEvidenceRefs,
-					requirementCoverage,
+					summary: member === "B" ? "COLLAB-B-COMMIT-RESULT" : "COLLAB-C-COMMIT-RESULT",
+					evidence: evidenceProposal(aliases, committedEvidenceRefs),
+					residualRisks: [],
 				},
 				{ id: callId("commit") },
 			),

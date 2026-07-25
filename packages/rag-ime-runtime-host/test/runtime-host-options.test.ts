@@ -48,19 +48,13 @@ describe("runtime host managed skills", () => {
 	});
 
 	it("loads only explicitly configured product Skill paths", () => {
-		vi.stubEnv(
-			"RAG_IME_PI_SKILL_PATHS",
-			["/managed/rag-ime-memory-curator", "/managed/rag-ime-plugin-creator"].join(delimiter),
-		);
+		vi.stubEnv("RAG_IME_PI_SKILL_PATHS", ["/managed/memory-curation", "/managed/plugin-creator"].join(delimiter));
 		vi.stubEnv("RAG_IME_PI_USER_SKILL_PATHS", "/user/pi-skills");
 		vi.stubEnv("RAG_IME_CODEX_SKILL_PATHS", ["/user/codex-skills", "/user/agent-skills"].join(delimiter));
 
 		const options = runtimeHostOptionsFromEnvironment(() => undefined);
 
-		expect(options.skillPaths).toEqual([
-			resolve("/managed/rag-ime-memory-curator"),
-			resolve("/managed/rag-ime-plugin-creator"),
-		]);
+		expect(options.skillPaths).toEqual([resolve("/managed/memory-curation"), resolve("/managed/plugin-creator")]);
 		expect(options.piSkillPaths).toEqual([resolve("/user/pi-skills")]);
 		expect(options.codexSkillPaths).toEqual([resolve("/user/codex-skills"), resolve("/user/agent-skills")]);
 	});

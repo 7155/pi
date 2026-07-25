@@ -2,7 +2,7 @@ import { createHash } from "node:crypto";
 import type { InlineExtension, ToolDefinition } from "@earendil-works/pi-coding-agent";
 import { RuntimeProtocolError } from "./protocol.ts";
 import { RESERVED_RUNTIME_TOOL_NAMES } from "./runtime-tool-names.ts";
-import { modelVisibleResult, ToolArtifactBuffer } from "./tool-artifact-buffer.ts";
+import { modelVisibleResult, modelVisibleToolGatewayResult, ToolArtifactBuffer } from "./tool-artifact-buffer.ts";
 
 const TOOL_NAME_PATTERN = /^[a-zA-Z][a-zA-Z0-9_.-]{0,127}$/;
 const MAX_TOOLS = 256;
@@ -18,6 +18,10 @@ export interface BackendToolManifest {
 	does?: string;
 	profile?: string;
 	risk?: string;
+	runtimeProjections?: Array<{
+		name: string;
+		operation: string;
+	}>;
 }
 
 export interface BackendToolCatalogDiff {
@@ -36,6 +40,8 @@ export interface ToolGatewayResponse {
 	ok: boolean;
 	result?: Record<string, unknown>;
 	approval?: Record<string, unknown>;
+	roomInvocationReceipt?: Record<string, unknown>;
+	roomExecutionReceipt?: Record<string, unknown>;
 	error?: string;
 }
 
@@ -147,6 +153,11 @@ export class BackendToolRegistry {
 				if (record.risk !== undefined && typeof record.risk !== "string") {
 					throw new RuntimeProtocolError("INVALID_TOOL_MANIFEST", `Tool ${record.name} risk must be a string`);
 				}
+				const runtimeProjections = validateRuntimeProjections(
+					record.name,
+					record.runtimeProjections,
+					record.parameters as Record<string, unknown>,
+				);
 				for (const key of ["when", "notFor"] as const) {
 					if (
 						record[key] !== undefined &&
@@ -179,6 +190,7 @@ export class BackendToolRegistry {
 					does: record.does as string | undefined,
 					profile: record.profile,
 					risk: record.risk,
+					...(runtimeProjections.length > 0 ? { runtimeProjections } : {}),
 				};
 			})
 			.sort((left, right) => left.name.localeCompare(right.name));
@@ -187,6 +199,139 @@ export class BackendToolRegistry {
 		this.manifest = manifest;
 		return this.list();
 	}
+}
+
+function validateRuntimeProjections(
+	toolName: string,
+	value: unknown,
+	parameters: Record<string, unknown>,
+): NonNullable<BackendToolManifest["runtimeProjections"]> {
+	if (value === undefined) return [];
+	if (!Array.isArray(value) || value.length === 0 || value.length > 16) {
+		throw new RuntimeProtocolError(
+			"INVALID_TOOL_MANIFEST",
+			`Tool ${toolName} runtimeProjections must contain between one and sixteen entries`,
+		);
+	}
+	const operations = operationNames(parameters);
+	const names = new Set<string>();
+	const projectedOperations = new Set<string>();
+	return value.map((item, index) => {
+		if (typeof item !== "object" || item === null || Array.isArray(item)) {
+			throw new RuntimeProtocolError(
+				"INVALID_TOOL_MANIFEST",
+				`Tool ${toolName} runtime projection ${index} must be an object`,
+			);
+		}
+		const projection = item as Record<string, unknown>;
+		if (
+			typeof projection.name !== "string" ||
+			!TOOL_NAME_PATTERN.test(projection.name) ||
+			!RESERVED_RUNTIME_TOOL_NAMES.has(projection.name)
+		) {
+			throw new RuntimeProtocolError(
+				"INVALID_TOOL_MANIFEST",
+				`Tool ${toolName} runtime projection ${index} has an invalid runtime-owned name`,
+			);
+		}
+		if (
+			typeof projection.operation !== "string" ||
+			!projection.operation.trim() ||
+			!operations.has(projection.operation)
+		) {
+			throw new RuntimeProtocolError(
+				"INVALID_TOOL_MANIFEST",
+				`Tool ${toolName} runtime projection ${projection.name} targets an unavailable operation`,
+			);
+		}
+		if (names.has(projection.name) || projectedOperations.has(projection.operation)) {
+			throw new RuntimeProtocolError(
+				"INVALID_TOOL_MANIFEST",
+				`Tool ${toolName} runtime projections must have unique names and operations`,
+			);
+		}
+		names.add(projection.name);
+		projectedOperations.add(projection.operation);
+		return {
+			name: projection.name,
+			operation: projection.operation,
+		};
+	});
+}
+
+function operationNames(parameters: Record<string, unknown>): Set<string> {
+	const names = new Set<string>();
+	const branches = Array.isArray(parameters.oneOf) ? parameters.oneOf : [];
+	for (const branch of branches) {
+		if (typeof branch !== "object" || branch === null || Array.isArray(branch)) continue;
+		const properties = (branch as Record<string, unknown>).properties;
+		if (typeof properties !== "object" || properties === null || Array.isArray(properties)) continue;
+		const operation = (properties as Record<string, unknown>).op;
+		if (typeof operation !== "object" || operation === null || Array.isArray(operation)) continue;
+		const value = (operation as Record<string, unknown>).const;
+		if (typeof value === "string" && value) names.add(value);
+	}
+	return names;
+}
+
+export function modelVisibleBackendToolParameters(tool: BackendToolManifest): Record<string, unknown> {
+	const hidden = new Set((tool.runtimeProjections ?? []).map((item) => item.operation));
+	if (hidden.size === 0) return structuredClone(tool.parameters);
+	const schema = structuredClone(tool.parameters);
+	const branches = Array.isArray(schema.oneOf) ? schema.oneOf : [];
+	const hiddenOnlyKeys = new Set<string>();
+	const visibleKeys = new Set<string>();
+	const visibleBranches: unknown[] = [];
+	for (const branch of branches) {
+		if (typeof branch !== "object" || branch === null || Array.isArray(branch)) {
+			visibleBranches.push(branch);
+			continue;
+		}
+		const record = branch as Record<string, unknown>;
+		const properties =
+			typeof record.properties === "object" && record.properties !== null && !Array.isArray(record.properties)
+				? (record.properties as Record<string, unknown>)
+				: {};
+		const operation = properties.op;
+		const operationName =
+			typeof operation === "object" && operation !== null && !Array.isArray(operation)
+				? (operation as Record<string, unknown>).const
+				: undefined;
+		const keys = new Set([
+			...Object.keys(properties),
+			...(Array.isArray(record.required)
+				? record.required.filter((item): item is string => typeof item === "string")
+				: []),
+		]);
+		if (typeof operationName === "string" && hidden.has(operationName)) {
+			for (const key of keys) hiddenOnlyKeys.add(key);
+			continue;
+		}
+		for (const key of keys) visibleKeys.add(key);
+		visibleBranches.push(branch);
+	}
+	schema.oneOf = visibleBranches;
+	if (typeof schema.properties === "object" && schema.properties !== null && !Array.isArray(schema.properties)) {
+		const properties = schema.properties as Record<string, unknown>;
+		for (const key of hiddenOnlyKeys) {
+			if (key !== "op" && !visibleKeys.has(key)) delete properties[key];
+		}
+		const operation = properties.op;
+		if (typeof operation === "object" && operation !== null && !Array.isArray(operation)) {
+			const record = operation as Record<string, unknown>;
+			if (Array.isArray(record.enum)) {
+				record.enum = record.enum.filter((item) => typeof item !== "string" || !hidden.has(item));
+			}
+		}
+	}
+	if (Array.isArray(schema.required)) {
+		const properties =
+			typeof schema.properties === "object" && schema.properties !== null && !Array.isArray(schema.properties)
+				? (schema.properties as Record<string, unknown>)
+				: {};
+		schema.required = schema.required.filter((item) => typeof item !== "string" || item in properties);
+	}
+	return schema;
 }
 
 function canonicalJson(value: unknown): unknown {
@@ -418,7 +563,11 @@ async function executeGatewayTool(
 		signal,
 	);
 	artifacts.acknowledge(prepared.deliveryKeys);
-	const result = payload.result ?? {};
+	const result: Record<string, unknown> = {
+		...(payload.result ?? {}),
+		...(payload.roomInvocationReceipt ? { roomInvocationReceipt: payload.roomInvocationReceipt } : {}),
+		...(payload.roomExecutionReceipt ? { roomExecutionReceipt: payload.roomExecutionReceipt } : {}),
+	};
 	if (result.reviewRequired === true) {
 		const run = typeof result.run === "object" && result.run !== null ? (result.run as Record<string, unknown>) : {};
 		const runId = String(run.runId ?? result.runId ?? "");
@@ -483,7 +632,13 @@ async function executeGatewayTool(
 			content: [
 				{
 					type: "text",
-					text: JSON.stringify(modelVisibleResult({ summary, approvalState, receipt: receipt ?? null })),
+					text: JSON.stringify(
+						modelVisibleToolGatewayResult({
+							summary,
+							approvalState,
+							receipt: receipt ?? null,
+						}),
+					),
 				},
 			],
 			details: {
@@ -496,7 +651,7 @@ async function executeGatewayTool(
 	}
 	const agentBlocks = artifacts.capture(result);
 	return {
-		content: [{ type: "text", text: JSON.stringify(modelVisibleResult(result)) }],
+		content: [{ type: "text", text: JSON.stringify(modelVisibleToolGatewayResult(result)) }],
 		details: { ...result, toolName: tool.name, ...(agentBlocks.length > 0 ? { agentBlocks } : {}) },
 	};
 }
@@ -510,7 +665,7 @@ export function createBackendToolDefinition(
 		name: tool.name,
 		label: tool.name,
 		description: tool.description,
-		parameters: tool.parameters as ToolDefinition["parameters"],
+		parameters: modelVisibleBackendToolParameters(tool) as ToolDefinition["parameters"],
 		executionMode: "parallel",
 		execute: async (toolCallId, args, signal) =>
 			executeGatewayTool(options, tool, toolCallId, args, signal, artifacts),
@@ -526,6 +681,7 @@ export function createProjectedBackendToolDefinition(
 		parameters: ToolDefinition["parameters"];
 		targetToolName: string;
 		mapArguments(args: unknown): Record<string, unknown>;
+		projectModelResult?(result: Record<string, unknown>): unknown;
 	},
 	artifacts = new ToolArtifactBuffer(),
 ): ToolDefinition {
@@ -542,8 +698,30 @@ export function createProjectedBackendToolDefinition(
 		description: projection.description,
 		parameters: projection.parameters,
 		executionMode: "parallel",
-		execute: async (toolCallId, args, signal) =>
-			executeGatewayTool(options, target, toolCallId, projection.mapArguments(args), signal, artifacts),
+		execute: async (toolCallId, args, signal) => {
+			const executed = await executeGatewayTool(
+				options,
+				target,
+				toolCallId,
+				projection.mapArguments(args),
+				signal,
+				artifacts,
+			);
+			if (!projection.projectModelResult) return executed;
+			const details =
+				typeof executed.details === "object" && executed.details !== null && !Array.isArray(executed.details)
+					? (executed.details as Record<string, unknown>)
+					: {};
+			return {
+				...executed,
+				content: [
+					{
+						type: "text",
+						text: JSON.stringify(modelVisibleResult(projection.projectModelResult(details))),
+					},
+				],
+			};
+		},
 	};
 }
 

@@ -83,7 +83,7 @@ describe("Skill routing card catalog", () => {
 				diagnostics: [],
 				skills: [
 					{
-						name: "room-structured-handoff",
+						name: "structured-handoff",
 						description: "Hand off Room work.",
 						filePath: "/handoff/SKILL.md",
 						baseDir: "/handoff",
@@ -103,14 +103,14 @@ describe("Skill routing card catalog", () => {
 			{},
 			{
 				focusNames: ["quality-gate"],
-				loadedNames: ["room-structured-handoff"],
+				loadedNames: ["structured-handoff"],
 			},
 		);
 
 		expect(result.skills).toMatchObject([
 			{
-				name: "room-structured-handoff",
-				promptCatalog: { family: "room-workflow", focus: false, bodyLoaded: true },
+				name: "structured-handoff",
+				promptCatalog: { family: "collaboration", focus: false, bodyLoaded: true },
 			},
 			{
 				name: "quality-gate",

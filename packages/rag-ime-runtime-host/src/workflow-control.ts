@@ -2,7 +2,8 @@ import { randomUUID } from "node:crypto";
 import type { ExtensionFactory } from "@earendil-works/pi-coding-agent";
 import { type BackendToolBridgeOptions, requestProductGateway } from "./tool-bridge.ts";
 
-const WORKFLOW_BLOCK_PATTERN = /\n*<rag-ime-context type="workflow_control"[^>]*>[\s\S]*?<\/rag-ime-context>\n*/gu;
+const WORKFLOW_BLOCK_PATTERN =
+	/\n*(?:<workflow-state\b[^>]*>[\s\S]*?<\/workflow-state>|<rag-ime-context type="workflow_control"[^>]*>[\s\S]*?<\/rag-ime-context>)\n*/gu;
 
 interface WorkflowControlOptions {
 	bridge: BackendToolBridgeOptions;
@@ -36,15 +37,23 @@ function optionalNumber(value: unknown): number | undefined {
 	return Number.isFinite(parsed) ? Math.max(0, parsed) : undefined;
 }
 
-function publicPlanItems(value: unknown): string[] {
+interface PublicPlanItem {
+	label: string;
+	status: string;
+}
+
+function publicPlanItems(value: unknown): PublicPlanItem[] {
 	if (!Array.isArray(value)) return [];
-	return value.slice(0, 12).flatMap((item, index) => {
+	return value.slice(0, 12).flatMap((item) => {
 		const record = asRecord(item);
 		const label = text(record.text) || text(record.title) || text(record.objective);
 		if (!label) return [];
-		const status = text(record.status) || (record.completed === true ? "completed" : "pending");
-		const marker = status === "completed" ? "x" : status === "in_progress" || status === "executing" ? ">" : " ";
-		return [`${index + 1}. [${marker}] ${label.slice(0, 240)}`];
+		return [
+			{
+				label: label.slice(0, 240),
+				status: text(record.status) || (record.completed === true ? "completed" : "pending"),
+			},
+		];
 	});
 }
 
@@ -54,21 +63,29 @@ function renderWorkflow(snapshot: WorkflowSnapshot): string {
 	const gate = asRecord(snapshot.actGate);
 	const planStatus = text(plan.status);
 	const goalStatus = text(goal.status);
-	const lines = ["## 当前工作流"];
+	const lines: string[] = [];
 	const planItems = publicPlanItems(plan.items);
 	const showPlan = Boolean(planStatus) && (planStatus !== "draft" || planItems.length > 0);
 
-	if (showPlan) {
-		lines.push(`### Plan · ${planStatus}`);
-		const title = text(plan.title);
-		if (title) lines.push(title.slice(0, 320));
-		lines.push(...planItems);
+	const objective = (showPlan ? text(plan.title) : "") || (goal.configured === true ? text(goal.objective) : "");
+	if (objective) {
+		lines.push(`当前任务：${objective.slice(0, 500)}`);
+	}
+
+	if (showPlan && planItems.length > 0) {
+		const completed = planItems.filter((item) => item.status === "completed").length;
+		const active = planItems.find((item) => ["in_progress", "executing"].includes(item.status));
+		const next = active ?? planItems.find((item) => item.status !== "completed");
+		const summary =
+			completed === planItems.length
+				? "全部完成"
+				: `${completed}/${planItems.length} 项完成${next ? `，正在执行：${next.label}` : ""}`;
+		lines.push(`计划：${summary}`);
+	} else if (showPlan && planStatus === "completed") {
+		lines.push("计划：全部完成");
 	}
 
 	if (goal.configured === true && goalStatus) {
-		lines.push(`### Goal · ${goalStatus}`);
-		const objective = text(goal.objective);
-		if (objective) lines.push(objective.slice(0, 500));
 		const remaining = asRecord(goal.remaining);
 		const budget = asRecord(goal.budget);
 		const remainingTokens = optionalNumber(remaining.tokens);
@@ -81,14 +98,24 @@ function renderWorkflow(snapshot: WorkflowSnapshot): string {
 				? `剩余时间 ${Math.ceil((remainingTimeMs ?? 0) / 60_000)} 分钟`
 				: "",
 		].filter(Boolean);
-		if (budgetParts.length) lines.push(budgetParts.join(" · "));
-		if (goalStatus === "paused") lines.push("Goal 已暂停，不要自行继续执行。");
+		if (budgetParts.length) lines.push(`剩余预算：${budgetParts.join(" · ")}`);
 	}
 
-	if (Object.keys(gate).length > 0) {
-		const fallback =
-			gate.allowed === true ? "当前工作已授权；写操作仍须通过产品权限与审批。" : "当前写操作未获批准。";
-		lines.push(`### Act Gate\n${text(gate.message) || text(gate.reason) || fallback}`);
+	if (goalStatus === "paused") {
+		lines.push("行动状态：已暂停，等待用户继续。");
+	} else if (Object.keys(gate).length > 0) {
+		const message = text(gate.message);
+		const reason = text(gate.reason);
+		const roomDispatch = `${message} ${reason}`.includes("Room Dispatch");
+		const state =
+			gate.allowed === true
+				? roomDispatch
+					? "当前 Room 任务已经开始，可以在本轮权限范围内继续工作。"
+					: "可以继续。"
+				: message || reason || "当前改变尚未获准。";
+		lines.push(`行动状态：${state}`);
+	} else if (goalStatus === "active" || showPlan) {
+		lines.push("行动状态：可以继续。");
 	}
 	return lines.join("\n").trim();
 }
@@ -96,7 +123,7 @@ function renderWorkflow(snapshot: WorkflowSnapshot): string {
 function replaceWorkflowBlock(systemPrompt: string, body: string): string {
 	const base = systemPrompt.replace(WORKFLOW_BLOCK_PATTERN, "\n").trimEnd();
 	if (!body) return base;
-	return [base, '<rag-ime-context type="workflow_control">', body, "</rag-ime-context>"].filter(Boolean).join("\n");
+	return [base, "<workflow-state>", body, "</workflow-state>"].filter(Boolean).join("\n");
 }
 
 function lastAssistantUsage(messages: readonly unknown[]): { tokenDelta: number } {

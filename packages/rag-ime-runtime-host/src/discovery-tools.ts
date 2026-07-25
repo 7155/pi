@@ -20,6 +20,7 @@ import {
 	type BackendToolManifest,
 	type BackendToolRegistry,
 	backendToolSchemaRevision,
+	modelVisibleBackendToolParameters,
 	requestGovernedToolLoads,
 	requestProductGateway,
 } from "./tool-bridge.ts";
@@ -29,6 +30,7 @@ const MAX_RESULT_LIMIT = 20;
 const MAX_SKILL_BYTES = 128 * 1024;
 const MAX_TOOL_ROUTE_CHARS = 512;
 const TOOL_CATALOG_MARKER = '<available_product_tools format="route-jsonl"';
+const LOADED_SKILL_STATE_ENTRY = "rag-ime.loaded-skill-state.v1";
 
 const SKILL_SEARCH_PARAMETERS = {
 	type: "object",
@@ -270,13 +272,15 @@ interface ToolPromptCatalogOptions {
 const TOOL_FAMILY_PURPOSES: Readonly<Record<string, string>> = {
 	room: "Room 状态、协作、公开发布与责任提交",
 	workspace: "授权工作区内的查找、读取、修改与命令执行",
-	memory: "用户记忆的查询、记录、整理与治理",
+	memory: "用户记忆的查询、整理、审阅与治理",
 	planning: "用户计划和 Agent 执行清单",
 	agent: "Agent 会话、角色、模型与运行状态",
 	knowledge: "知识库检索、导入和证据读取",
 	browser: "浏览器页面读取与受控交互",
 	desktop: "桌面应用观察与受控操作",
 	input: "输入法状态、候选与上下文",
+	voice: "语音输入状态与受控配置",
+	plugin: "插件目录、状态与受控管理",
 	system: "配置、诊断和运行维护",
 	other: "其他产品能力",
 };
@@ -289,7 +293,13 @@ function backendToolFamily(name: string): string {
 	if (name.startsWith("knowledge_")) return "knowledge";
 	if (name.startsWith("browser_")) return "browser";
 	if (name.startsWith("desktop_")) return "desktop";
-	if (name.startsWith("ime_")) return "input";
+	if (name === "ime_input") return "input";
+	if (name === "ime_voice") return "voice";
+	if (name === "ime_browser") return "browser";
+	if (name === "ime_knowledge") return "knowledge";
+	if (name === "ime_plugins") return "plugin";
+	if (name === "ime_agents" || name === "ime_models") return "agent";
+	if (name === "ime_overview" || name === "ime_configuration" || name === "ime_runtime") return "system";
 	if (name.startsWith("agent_")) return "agent";
 	if (name.includes("config") || name.includes("runtime") || name.includes("diagnostic")) return "system";
 	return "other";
@@ -527,7 +537,7 @@ export function loadBackendTool(
 			tool: {
 				name: tool.name,
 				description: tool.description,
-				parameters: tool.parameters,
+				parameters: modelVisibleBackendToolParameters(tool),
 				profile: tool.profile,
 				risk: tool.risk,
 			},
@@ -576,10 +586,44 @@ export function createDiscoveryToolsExtension(options: DiscoveryToolsOptions): I
 		name: "rag-ime-discovery-tools",
 		factory(pi) {
 			const loadedSkillNames = new Set(options.getLoadedSkillNames?.() ?? []);
+			// Hard cache invariant: skill_load only appends its Tool Result in the
+			// current epoch. Exact bodies may enter systemPrompt only at compaction,
+			// which is the boundary that creates the next stable prefix.
+			const loadedSkillBodies = new Map<string, string>();
+			const restoreLoadedSkillState = (entries: readonly unknown[]): void => {
+				for (const entry of entries) {
+					if (typeof entry !== "object" || entry === null || Array.isArray(entry)) continue;
+					const record = entry as Record<string, unknown>;
+					if (record.type !== "custom" || record.customType !== LOADED_SKILL_STATE_ENTRY) continue;
+					if (typeof record.data !== "object" || record.data === null || Array.isArray(record.data)) continue;
+					const data = record.data as Record<string, unknown>;
+					const name = typeof data.name === "string" ? data.name.trim() : "";
+					const contentRevision =
+						typeof data.contentRevision === "string" ? data.contentRevision.trim().toLowerCase() : "";
+					const resultSha256 = typeof data.resultSha256 === "string" ? data.resultSha256.trim().toLowerCase() : "";
+					const body = typeof data.body === "string" ? data.body : "";
+					if (!name || !/^[a-f0-9]{64}$/u.test(contentRevision) || !/^[a-f0-9]{64}$/u.test(resultSha256)) {
+						continue;
+					}
+					if (Buffer.byteLength(body, "utf8") > MAX_SKILL_BYTES + 2048 || sha256(body) !== resultSha256) continue;
+					if (
+						!body.includes(
+							`<loaded_skill name="${escapeXmlAttribute(name)}" revision="sha256:${contentRevision}">`,
+						)
+					) {
+						continue;
+					}
+					loadedSkillNames.add(name);
+					loadedSkillBodies.set(name, body);
+				}
+			};
 			const currentLoadedSkillNames = (): string[] => {
 				for (const name of options.getLoadedSkillNames?.() ?? []) loadedSkillNames.add(name);
 				return [...loadedSkillNames];
 			};
+			pi.on("session_start", async (_event, ctx) => {
+				restoreLoadedSkillState(ctx.sessionManager.getBranch());
+			});
 			pi.on("before_agent_start", async (event) => {
 				if (event.systemPrompt.includes(TOOL_CATALOG_MARKER)) return undefined;
 				const toolCatalog = formatBackendToolRouteCatalog(options.registry.list(), options.registry.revision(), {
@@ -588,6 +632,17 @@ export function createDiscoveryToolsExtension(options: DiscoveryToolsOptions): I
 				});
 				if (!toolCatalog) return undefined;
 				return { systemPrompt: `${event.systemPrompt}${toolCatalog}` };
+			});
+			pi.on("session_compact", async (_event, ctx) => {
+				restoreLoadedSkillState(ctx.sessionManager.getBranch());
+				const current = ctx.getSystemPrompt();
+				const missingBodies = [...loadedSkillBodies]
+					.filter(([name]) => !current.includes(`<loaded_skill name="${escapeXmlAttribute(name)}"`))
+					.map(([, body]) => body);
+				if (missingBodies.length === 0) return undefined;
+				return {
+					systemPrompt: [current, ...missingBodies].filter(Boolean).join("\n\n"),
+				};
 			});
 			pi.registerTool({
 				name: SKILL_SEARCH_TOOL_NAME,
@@ -621,22 +676,15 @@ export function createDiscoveryToolsExtension(options: DiscoveryToolsOptions): I
 						loadedNames,
 					);
 					const loadedName = String(result.details.name ?? "");
+					const contentRevision = String(result.details.contentRevision ?? "");
 					loadedSkillNames.add(loadedName);
-					const projectedSkill = options
-						.getResourceLoader()
-						.getSkills()
-						.skills.find((skill) => skill.name === loadedName && skill.promptCatalog !== undefined);
-					if (projectedSkill?.promptCatalog) {
-						projectedSkill.promptCatalog = {
-							...projectedSkill.promptCatalog,
-							focus: false,
-							bodyLoaded: true,
-						};
-						// AgentSession owns the actual Provider system prompt. Reusing
-						// the current active set asks it to rebuild from this projection
-						// without reloading extensions or changing Tool order.
-						pi.setActiveTools([...pi.getActiveTools()]);
-					}
+					loadedSkillBodies.set(loadedName, result.text);
+					pi.appendEntry(LOADED_SKILL_STATE_ENTRY, {
+						name: loadedName,
+						contentRevision,
+						resultSha256: sha256(result.text),
+						body: result.text,
+					});
 					return {
 						content: [{ type: "text", text: result.text }],
 						details: result.details,

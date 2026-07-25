@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -183,7 +184,7 @@ describe("runtime discovery tools", () => {
 		);
 	});
 
-	it("rebuilds the Room system prompt after a Skill body becomes active", async () => {
+	it("keeps the current epoch prompt stable and restores loaded Skill bodies only after compaction", async () => {
 		const root = await mkdtemp(join(tmpdir(), "pi-runtime-skill-projection-"));
 		try {
 			const filePath = join(root, "SKILL.md");
@@ -211,7 +212,12 @@ describe("runtime discovery tools", () => {
 				},
 			};
 			const registered = new Map<string, ToolDefinition>();
+			const handlers = new Map<string, (...args: unknown[]) => unknown>();
+			const customEntries: Array<{ type: "custom"; customType: string; data: unknown }> = [];
 			let activeTools = ["skill_search", "skill_load"];
+			let effectiveSystemPrompt = "stable-prefix\n用户原始字节保持不变";
+			const promptBytesBeforeLoad = Buffer.from(effectiveSystemPrompt, "utf8");
+			const promptShaBeforeLoad = createHash("sha256").update(promptBytesBeforeLoad).digest("hex");
 			let rebuilds = 0;
 			const extension = createDiscoveryToolsExtension({
 				getResourceLoader: () =>
@@ -223,30 +229,59 @@ describe("runtime discovery tools", () => {
 			});
 			if (typeof extension === "function") throw new Error("Expected a named inline extension");
 			await extension.factory({
-				on() {},
+				on(event: string, handler: (...args: unknown[]) => unknown) {
+					handlers.set(event, handler);
+				},
 				registerTool(toolDefinition: ToolDefinition) {
 					registered.set(toolDefinition.name, toolDefinition);
+				},
+				appendEntry(customType: string, data: unknown) {
+					customEntries.push({ type: "custom", customType, data });
 				},
 				getActiveTools() {
 					return activeTools;
 				},
 				setActiveTools(toolNames: string[]) {
 					activeTools = [...toolNames];
+					effectiveSystemPrompt = "unexpected-rebuild";
 					rebuilds += 1;
 				},
 			} as never);
 			const loadTool = registered.get(SKILL_LOAD_TOOL_NAME);
 			if (!loadTool) throw new Error("skill_load was not registered");
 
-			await loadTool.execute("load-quality", { name: "quality-gate" } as never, undefined, undefined, {} as never);
+			const loadResult = await loadTool.execute(
+				"load-quality",
+				{ name: "quality-gate" } as never,
+				undefined,
+				undefined,
+				{} as never,
+			);
+			const loadedBody = loadResult.content.find((item) => item.type === "text")?.text;
+			if (!loadedBody) throw new Error("skill_load did not return the exact Skill body");
 
 			expect(projected.promptCatalog).toEqual({
 				family: "quality-review",
-				focus: false,
-				bodyLoaded: true,
+				focus: true,
+				bodyLoaded: false,
 			});
-			expect(rebuilds).toBe(1);
+			expect(rebuilds).toBe(0);
 			expect(activeTools).toEqual(["skill_search", "skill_load"]);
+			expect(Buffer.from(effectiveSystemPrompt, "utf8").equals(promptBytesBeforeLoad)).toBe(true);
+			expect(createHash("sha256").update(effectiveSystemPrompt, "utf8").digest("hex")).toBe(promptShaBeforeLoad);
+			expect(loadedBody).toContain('<loaded_skill name="quality-gate" revision="sha256:');
+			expect(customEntries).toEqual([
+				expect.objectContaining({
+					type: "custom",
+					customType: "rag-ime.loaded-skill-state.v1",
+					data: expect.objectContaining({
+						name: "quality-gate",
+						body: loadedBody,
+						contentRevision: expect.stringMatching(/^[a-f0-9]{64}$/u),
+						resultSha256: expect.stringMatching(/^[a-f0-9]{64}$/u),
+					}),
+				}),
+			]);
 			const searchTool = registered.get(SKILL_SEARCH_TOOL_NAME);
 			if (!searchTool) throw new Error("skill_search was not registered");
 			const search = await searchTool.execute(
@@ -257,6 +292,145 @@ describe("runtime discovery tools", () => {
 				{} as never,
 			);
 			expect(search.details).toMatchObject({ items: [] });
+
+			const compactHandler = handlers.get("session_compact");
+			if (!compactHandler) throw new Error("session_compact handler was not registered");
+			const compactResult = (await compactHandler(
+				{ type: "session_compact" },
+				{
+					getSystemPrompt: () => effectiveSystemPrompt,
+					sessionManager: { getBranch: () => customEntries },
+				},
+			)) as { systemPrompt?: string };
+			expect(compactResult.systemPrompt).toBe(`${effectiveSystemPrompt}\n\n${loadedBody}`);
+			expect(
+				Buffer.from(compactResult.systemPrompt ?? "", "utf8").subarray(0, promptBytesBeforeLoad.length),
+			).toEqual(promptBytesBeforeLoad);
+
+			const duplicate = await compactHandler(
+				{ type: "session_compact" },
+				{
+					getSystemPrompt: () => compactResult.systemPrompt ?? "",
+					sessionManager: { getBranch: () => customEntries },
+				},
+			);
+			expect(duplicate).toBeUndefined();
+		} finally {
+			await rm(root, { recursive: true, force: true });
+		}
+	});
+
+	it("recovers manual Skill load state after resume without rewriting the current epoch prompt", async () => {
+		const root = await mkdtemp(join(tmpdir(), "pi-runtime-skill-resume-"));
+		try {
+			const filePath = join(root, "SKILL.md");
+			await writeFile(
+				filePath,
+				["---", "name: quality-gate", "description: Check evidence.", "---", "", "Check fresh evidence."].join(
+					"\n",
+				),
+			);
+			const projected = skill({ name: "quality-gate", description: "Check evidence.", filePath });
+			const persisted: Array<{ type: "custom"; customType: string; data: unknown }> = [];
+			const firstTools = new Map<string, ToolDefinition>();
+			const first = createDiscoveryToolsExtension({
+				getResourceLoader: () =>
+					({
+						getSkills: () => ({ skills: [projected], diagnostics: [] }),
+					}) as unknown as ResourceLoader,
+				registry: new BackendToolRegistry(),
+			});
+			if (typeof first === "function") throw new Error("Expected a named inline extension");
+			await first.factory({
+				on() {},
+				registerTool(toolDefinition: ToolDefinition) {
+					firstTools.set(toolDefinition.name, toolDefinition);
+				},
+				appendEntry(customType: string, data: unknown) {
+					persisted.push({ type: "custom", customType, data });
+				},
+				getActiveTools: () => ["skill_search", "skill_load"],
+				setActiveTools() {
+					throw new Error("skill_load must not rebuild tools");
+				},
+			} as never);
+			const firstLoad = firstTools.get(SKILL_LOAD_TOOL_NAME);
+			if (!firstLoad) throw new Error("skill_load was not registered");
+			const firstResult = await firstLoad.execute(
+				"load-before-resume",
+				{ name: "quality-gate" } as never,
+				undefined,
+				undefined,
+				{} as never,
+			);
+			const loadedBody = firstResult.content.find((item) => item.type === "text")?.text;
+			if (!loadedBody) throw new Error("skill_load did not return the exact Skill body");
+
+			const resumedTools = new Map<string, ToolDefinition>();
+			const resumedHandlers = new Map<string, (...args: unknown[]) => unknown>();
+			let resumedPrompt = "stable-prefix";
+			let rebuilds = 0;
+			const resumed = createDiscoveryToolsExtension({
+				getResourceLoader: () =>
+					({
+						getSkills: () => ({ skills: [projected], diagnostics: [] }),
+					}) as unknown as ResourceLoader,
+				registry: new BackendToolRegistry(),
+			});
+			if (typeof resumed === "function") throw new Error("Expected a named inline extension");
+			await resumed.factory({
+				on(event: string, handler: (...args: unknown[]) => unknown) {
+					resumedHandlers.set(event, handler);
+				},
+				registerTool(toolDefinition: ToolDefinition) {
+					resumedTools.set(toolDefinition.name, toolDefinition);
+				},
+				appendEntry() {},
+				getActiveTools: () => ["skill_search", "skill_load"],
+				setActiveTools() {
+					resumedPrompt = "unexpected-rebuild";
+					rebuilds += 1;
+				},
+			} as never);
+			const startHandler = resumedHandlers.get("session_start");
+			if (!startHandler) throw new Error("session_start handler was not registered");
+			await startHandler(
+				{ type: "session_start", reason: "resume" },
+				{ sessionManager: { getBranch: () => persisted } },
+			);
+			const resumedSearch = resumedTools.get(SKILL_SEARCH_TOOL_NAME);
+			const resumedLoad = resumedTools.get(SKILL_LOAD_TOOL_NAME);
+			if (!resumedSearch || !resumedLoad) throw new Error("Skill discovery tools were not registered");
+			const searchResult = await resumedSearch.execute(
+				"search-after-resume",
+				{ query: "" } as never,
+				undefined,
+				undefined,
+				{} as never,
+			);
+			expect(searchResult.details).toMatchObject({ items: [] });
+			await expect(
+				resumedLoad.execute(
+					"duplicate-after-resume",
+					{ name: "quality-gate" } as never,
+					undefined,
+					undefined,
+					{} as never,
+				),
+			).rejects.toThrow("Skill body is already active");
+			expect(rebuilds).toBe(0);
+			expect(resumedPrompt).toBe("stable-prefix");
+
+			const compactHandler = resumedHandlers.get("session_compact");
+			if (!compactHandler) throw new Error("session_compact handler was not registered");
+			const compactResult = (await compactHandler(
+				{ type: "session_compact" },
+				{
+					getSystemPrompt: () => resumedPrompt,
+					sessionManager: { getBranch: () => persisted },
+				},
+			)) as { systemPrompt?: string };
+			expect(compactResult.systemPrompt).toBe(`stable-prefix\n\n${loadedBody}`);
 		} finally {
 			await rm(root, { recursive: true, force: true });
 		}
@@ -346,6 +520,44 @@ describe("runtime discovery tools", () => {
 			items: [{ name: "workspace_read" }, { name: "workspace_shell" }],
 			activeDirectCalls: ["room_state"],
 		});
+	});
+
+	it("classifies product-prefixed tools by capability instead of treating every ime tool as input", () => {
+		const tools = [
+			"ime_agents",
+			"ime_browser",
+			"ime_configuration",
+			"ime_input",
+			"ime_knowledge",
+			"ime_models",
+			"ime_overview",
+			"ime_plugins",
+			"ime_runtime",
+			"ime_voice",
+		].map<BackendToolManifest>((name) => ({
+			name,
+			description: `${name} capability.`,
+			parameters: { type: "object", properties: {} },
+		}));
+
+		const prompt = formatBackendToolRouteCatalog(tools, "revision", {
+			focusNames: [],
+		});
+
+		expect(prompt).toContain(
+			'{"family":"agent","count":2,"does":"Agent 会话、角色、模型与运行状态","examples":["ime_agents","ime_models"]}',
+		);
+		expect(prompt).toContain(
+			'{"family":"input","count":1,"does":"输入法状态、候选与上下文","examples":["ime_input"]}',
+		);
+		expect(prompt).toContain(
+			'{"family":"system","count":3,"does":"配置、诊断和运行维护","examples":["ime_configuration","ime_overview"]}',
+		);
+		expect(prompt).toContain('{"family":"voice","count":1,"does":"语音输入状态与受控配置","examples":["ime_voice"]}');
+		expect(prompt).toContain(
+			'{"family":"plugin","count":1,"does":"插件目录、状态与受控管理","examples":["ime_plugins"]}',
+		);
+		expect(prompt).not.toContain('{"family":"input","count":10');
 	});
 
 	it("registers fixed discovery schemas and searches the live backend catalog", async () => {

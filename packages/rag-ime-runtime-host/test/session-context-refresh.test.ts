@@ -353,7 +353,7 @@ describe("session context refresh", () => {
 			getRoomRecoveryContext: () => "stale Room recovery",
 			setRoomRecoveryContext: () => undefined,
 			getRecentMessages: () => [],
-			getRoomSkillRecovery: () => ({ name: "room-independent-vision-review" }),
+			getRoomSkillRecovery: () => ({ name: "independent-review" }),
 			getRoomToolRecovery: () => ({ items: [{ name: "room_state", receiptId: "load:state" }] }),
 			providerContextJournal,
 		});

@@ -11,7 +11,7 @@ const MEMORY_CAPTURE_TARGET = "ime_memory";
 
 const MEMORY_CAPTURE_PARAMETERS = {
 	type: "object",
-	required: ["kind", "claim", "scope", "reason"],
+	required: ["kind", "claim", "scope", "basis", "futureUse"],
 	properties: {
 		kind: {
 			type: "string",
@@ -27,31 +27,38 @@ const MEMORY_CAPTURE_PARAMETERS = {
 			type: "string",
 			enum: ["user", "project"],
 		},
-		reason: {
+		basis: {
+			type: "string",
+			enum: [
+				"explicit_user_request",
+				"explicit_user_statement",
+				"user_correction",
+				"repeated_user_signal",
+				"verified_outcome",
+			],
+			description: "The evidence class supporting this candidate.",
+		},
+		futureUse: {
 			type: "string",
 			minLength: 1,
-			maxLength: 500,
-			description: "Why this fact is likely to remain useful beyond the current turn.",
+			maxLength: 300,
+			description: "How this single claim should help a later Session.",
+		},
+		supersedes: {
+			type: "string",
+			maxLength: 800,
+			description: "Only for correction: the old statement being corrected, never an internal memory ID.",
 		},
 	},
 	additionalProperties: false,
 } as ToolDefinition["parameters"];
 
 export function supportsMemoryCapture(tool: BackendToolManifest | undefined): boolean {
-	if (!tool) return false;
-	const branches = Array.isArray(tool.parameters.oneOf) ? tool.parameters.oneOf : [];
-	return branches.some((value) => {
-		if (!value || typeof value !== "object" || Array.isArray(value)) return false;
-		const properties = (value as Record<string, unknown>).properties;
-		if (!properties || typeof properties !== "object" || Array.isArray(properties)) return false;
-		const operation = (properties as Record<string, unknown>).op;
-		return Boolean(
-			operation &&
-				typeof operation === "object" &&
-				!Array.isArray(operation) &&
-				(operation as Record<string, unknown>).const === "capture",
-		);
-	});
+	return Boolean(
+		tool?.runtimeProjections?.some(
+			(projection) => projection.name === MEMORY_CAPTURE_TOOL_NAME && projection.operation === "capture",
+		),
+	);
 }
 
 export function createMemoryCaptureExtension(options: BackendToolBridgeOptions): InlineExtension {
@@ -62,9 +69,9 @@ export function createMemoryCaptureExtension(options: BackendToolBridgeOptions):
 			pi.registerTool(
 				createProjectedBackendToolDefinition(options, {
 					name: MEMORY_CAPTURE_TOOL_NAME,
-					label: "Capture durable memory evidence",
+					label: "Propose one memory candidate",
 					description:
-						"Mark one user-confirmed preference, fact, decision, correction, or reusable pitfall for the existing governed memory pipeline.",
+						"Propose one evidence-backed preference, fact, decision, correction, or reusable pitfall for governed review. Use for explicit or stable user signals that should change a later Session. Do not use for one-off requests, workflow progress, model guesses, sensitive content, or batch curation. This never writes durable memory directly.",
 					parameters: MEMORY_CAPTURE_PARAMETERS,
 					targetToolName: MEMORY_CAPTURE_TARGET,
 					mapArguments(args) {
@@ -77,7 +84,18 @@ export function createMemoryCaptureExtension(options: BackendToolBridgeOptions):
 							kind: value.kind,
 							claim: value.claim,
 							captureScope: value.scope,
-							reason: value.reason,
+							basis: value.basis,
+							futureUse: value.futureUse,
+							...(value.supersedes ? { supersedes: value.supersedes } : {}),
+						};
+					},
+					projectModelResult(result) {
+						return {
+							summary: result.summary,
+							candidate: result.candidate,
+							createsDurableMemory: false,
+							...(result.reasonCode ? { reasonCode: result.reasonCode } : {}),
+							...(typeof result.retryable === "boolean" ? { retryable: result.retryable } : {}),
 						};
 					},
 				}),

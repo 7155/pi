@@ -359,7 +359,7 @@ describe("skills", () => {
 			expect(result).not.toContain("<location>");
 		});
 
-		it("projects only current-stage cards while keeping loaded bodies out of the deferred catalog", () => {
+		it("keeps the family index stable while limiting detailed cards to current-stage deferred skills", () => {
 			const skills: Skill[] = [
 				createTestSkill({
 					name: "grill-me",
@@ -418,9 +418,11 @@ describe("skills", () => {
 			expect(result).toContain('<skill_capability_families format="family-jsonl">');
 			expect(result).toContain('{"family":"quality-review","count":1,"examples":["quality-gate"]}');
 			expect(result).toContain('{"family":"requirements","count":1,"examples":["grill-me"]}');
+			expect(result).toContain('{"family":"room-workflow","count":1,"examples":["managed-task-execution"]}');
 			expect(result).toContain('"name":"grill-me"');
 			expect(result).not.toContain('"name":"quality-gate"');
-			expect(result).not.toContain("managed-task-execution");
+			const detailedCards = result.match(/<available_skills[^>]*>([\s\S]*?)<\/available_skills>/u)?.[1] ?? "";
+			expect(detailedCards).not.toContain("managed-task-execution");
 			expect(result).toContain("never load that Skill again");
 			expect(result).toContain('<available_skills revision="sha256:');
 		});

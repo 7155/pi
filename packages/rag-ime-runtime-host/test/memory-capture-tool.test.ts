@@ -6,7 +6,7 @@ import {
 	supportsMemoryCapture,
 } from "../src/memory-capture-tool.ts";
 import { MEMORY_CAPTURE_TOOL_NAME } from "../src/runtime-tool-names.ts";
-import { BackendToolRegistry } from "../src/tool-bridge.ts";
+import { BackendToolRegistry, modelVisibleBackendToolParameters } from "../src/tool-bridge.ts";
 
 function memoryRegistry(capture = true): BackendToolRegistry {
 	const registry = new BackendToolRegistry();
@@ -24,11 +24,22 @@ function memoryRegistry(capture = true): BackendToolRegistry {
 							kind: { type: "string" },
 							claim: { type: "string" },
 							captureScope: { type: "string" },
-							reason: { type: "string" },
+							basis: { type: "string" },
+							futureUse: { type: "string" },
 						},
 					},
 				],
 			},
+			...(capture
+				? {
+						runtimeProjections: [
+							{
+								name: MEMORY_CAPTURE_TOOL_NAME,
+								operation: "capture",
+							},
+						],
+					}
+				: {}),
 		},
 	]);
 	return registry;
@@ -55,6 +66,19 @@ describe("memory_capture runtime projection", () => {
 		expect(registered).toEqual([]);
 	});
 
+	it("keeps capture available to the runtime projection but absent from the ime_memory schema", () => {
+		const tool = memoryRegistry().get("ime_memory");
+		if (!tool) throw new Error("ime_memory is unavailable");
+
+		const visible = modelVisibleBackendToolParameters(tool);
+
+		expect(JSON.stringify(tool.parameters)).toContain('"capture"');
+		expect(JSON.stringify(visible)).not.toContain('"capture"');
+		expect(JSON.stringify(visible)).not.toContain('"claim"');
+		expect(JSON.stringify(visible)).not.toContain('"futureUse"');
+		expect(supportsMemoryCapture(tool)).toBe(true);
+	});
+
 	it("projects a small Provider tool onto governed ime_memory.capture", async () => {
 		const registry = memoryRegistry();
 		const definitions = new Map<string, ToolDefinition>();
@@ -76,10 +100,22 @@ describe("memory_capture runtime projection", () => {
 				}),
 			)
 			.mockResolvedValueOnce(
-				new Response(JSON.stringify({ ok: true, result: { stored: true, status: "pending" } }), {
-					status: 200,
-					headers: { "Content-Type": "application/json" },
-				}),
+				new Response(
+					JSON.stringify({
+						ok: true,
+						result: {
+							summary: "候选已接收",
+							candidate: "accepted",
+							createsDurableMemory: false,
+							hintId: "capture:private",
+							sourceId: "source:private",
+						},
+					}),
+					{
+						status: 200,
+						headers: { "Content-Type": "application/json" },
+					},
+				),
 			);
 		vi.stubGlobal("fetch", fetchMock);
 		try {
@@ -99,13 +135,14 @@ describe("memory_capture runtime projection", () => {
 			expect(JSON.stringify(tool.parameters)).not.toContain("sourceId");
 			expect(JSON.stringify(tool.parameters)).not.toContain("maintenance_apply");
 
-			await tool.execute(
+			const result = await tool.execute(
 				"call-memory",
 				{
 					kind: "preference",
 					claim: "用户希望 Room 默认工作区托管。",
 					scope: "project",
-					reason: "这是稳定的项目运行偏好。",
+					basis: "explicit_user_statement",
+					futureUse: "以后创建 Room 时默认选用工作区托管。",
 				} as never,
 				undefined,
 				undefined,
@@ -128,11 +165,24 @@ describe("memory_capture runtime projection", () => {
 					kind: "preference",
 					claim: "用户希望 Room 默认工作区托管。",
 					captureScope: "project",
-					reason: "这是稳定的项目运行偏好。",
+					basis: "explicit_user_statement",
+					futureUse: "以后创建 Room 时默认选用工作区托管。",
 				},
 			});
 			expect(JSON.stringify(executeRequest)).not.toContain("memory_capture");
 			expect(JSON.stringify(executeRequest)).not.toContain("sourceId");
+			expect(result.content).toEqual([
+				{
+					type: "text",
+					text: JSON.stringify({
+						summary: "候选已接收",
+						candidate: "accepted",
+						createsDurableMemory: false,
+					}),
+				},
+			]);
+			expect(JSON.stringify(result.content)).not.toContain("capture:private");
+			expect(JSON.stringify(result.content)).not.toContain("source:private");
 		} finally {
 			vi.unstubAllGlobals();
 		}

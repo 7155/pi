@@ -14,12 +14,12 @@ function request(id: string, method: RuntimeRequest["method"], params: Record<st
 describe("Room runtime RPC", () => {
 	it("opens a governed Session with one exact native Skill and provider-only Room context", async () => {
 		const root = await mkdtemp(join(tmpdir(), "rag-ime-room-runtime-context-"));
-		const skillRoot = join(root, "skills", "room-test-driven-implementation");
+		const skillRoot = join(root, "skills", "test-driven-implementation");
 		const body = "Apply the bounded implementation workflow.";
 		await mkdir(skillRoot, { recursive: true });
 		await writeFile(
 			join(skillRoot, "SKILL.md"),
-			`---\nname: room-test-driven-implementation\ndescription: Implement safely.\n---\n${body}\n`,
+			`---\nname: test-driven-implementation\ndescription: Implement safely.\n---\n${body}\n`,
 		);
 		const modelRuntime = await ModelRuntime.create({
 			authPath: join(root, "auth.json"),
@@ -54,7 +54,7 @@ describe("Room runtime RPC", () => {
 					},
 					roomSkillPolicy: {
 						selection: "required",
-						skillId: "room-test-driven-implementation",
+						skillId: "test-driven-implementation",
 						skillHash: createHash("sha256").update(body).digest("hex"),
 					},
 					roomResourceLimits: {
@@ -72,7 +72,7 @@ describe("Room runtime RPC", () => {
 			)) as Record<string, any>;
 
 			expect(opened.roomSkillLoad).toMatchObject({
-				name: "room-test-driven-implementation",
+				name: "test-driven-implementation",
 				contentRevision: createHash("sha256").update(body).digest("hex"),
 				loadReason: "stage_required",
 			});

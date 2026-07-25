@@ -16,10 +16,10 @@ const tool = (name: string): Tool => ({
 const taskPrompt = `<room-fact kind="dispatch_state">## Room 任务
 当前任务：
 - 预期产物：CANARY-2-OK
-验收条件 acceptance.criteria（提交时原样使用 criterionId）：
-- criterionId: "criterion:1" | 待验收 | 有界读取第一份源码
-- criterionId: "criterion:2" | 待验收 | 有界读取第二份源码
-- criterionId: "criterion:3" | 待验收 | 公开结果并提交
+	验收条件（提交证据时使用 AC 编号）：
+	- AC-1 | 待验收 | 有界读取第一份源码
+	- AC-2 | 待验收 | 有界读取第二份源码
+	- AC-3 | 待验收 | 公开结果并提交
 </room-fact>`;
 
 function context(tools: string[], history = ""): Context {
@@ -47,9 +47,9 @@ const projectTaskPrompt = `<room-fact kind="dispatch_state">## Room 任务
 - 执行 PROJECT-TASK-CANARY。
 当前任务：
 - 目标：PROJECT-TASK-CANARY
-验收条件 acceptance.criteria（提交时原样使用 criterionId）：
-- criterionId: "project:1" | 待验收 | 修改并测试
-- criterionId: "project:2" | 待验收 | 公开结果并提交
+	验收条件（提交证据时使用 AC 编号）：
+	- AC-1 | 待验收 | 修改并测试
+	- AC-2 | 待验收 | 公开结果并提交
 </room-fact>`;
 
 function projectContext(tools: string[], history = ""): Context {
@@ -149,17 +149,13 @@ describe("deterministic context epoch Provider", () => {
 			id: "epoch-2-commit",
 			arguments: {
 				decision: "deliver",
-				requirementCoverage: ["criterion:1", "criterion:2", "criterion:3"],
-				qualityGate: {
-					originalRequestChecked: true,
-					verdict: "ready_to_deliver",
-					items: expect.arrayContaining([
-						expect.objectContaining({
-							criterionId: "criterion:1",
-							status: "pass",
-						}),
-					]),
-				},
+				summary: "CANARY-2-OK；两份指定源码已完成有界读取。",
+				evidence: [
+					{ acceptance: "AC-1", refs: ["epoch-2-read-a", "epoch-2-read-b"] },
+					{ acceptance: "AC-2", refs: ["epoch-2-read-a", "epoch-2-read-b"] },
+					{ acceptance: "AC-3", refs: ["epoch-2-read-a", "epoch-2-read-b"] },
+				],
+				residualRisks: [],
 			},
 		});
 	});
@@ -170,7 +166,7 @@ describe("deterministic context epoch Provider", () => {
 		]);
 	});
 
-	it("keeps compatibility with an older JSON task projection without requiring it", () => {
+	it("rejects an older JSON task projection that exposes database criterion ids", () => {
 		const legacyPrompt = `<room-fact kind="dispatch_state">${JSON.stringify({
 			acceptance: { criteria: [{ criterionId: "legacy:1" }] },
 			task: { expectedOutput: "CANARY-7-OK" },
@@ -180,11 +176,7 @@ describe("deterministic context epoch Provider", () => {
 			messages: [{ role: "user", content: '"id":"epoch-7-read-a" "id":"epoch-7-post"', timestamp: 1 }],
 			tools: ["tool_load", "workspace_read", "room_post", "room_commit"].map(tool),
 		} as Context;
-		const commit = calls(contextEpochCanaryResponse(legacyContext))[0];
-		expect(commit).toMatchObject({
-			name: "room_commit",
-			arguments: { requirementCoverage: ["legacy:1"] },
-		});
+		expect(() => contextEpochCanaryResponse(legacyContext)).toThrow("requires explicit AC aliases");
 	});
 
 	it("drives a real project through discovery, approved patch, test and settle", () => {
@@ -247,25 +239,23 @@ describe("deterministic context epoch Provider", () => {
 			name: "room_commit",
 			id: "project-commit",
 			arguments: {
-				requirementCoverage: ["project:1", "project:2"],
-				qualityGate: {
-					originalRequestChecked: true,
-					verdict: "ready_to_deliver",
-					items: [
-						expect.objectContaining({ criterionId: "project:1", status: "pass" }),
-						expect.objectContaining({ criterionId: "project:2", status: "pass" }),
-					],
-				},
+				decision: "deliver",
+				summary: "PROJECT-CANARY-OK；实现已完成，隔离测试全部通过。",
+				evidence: [
+					{ acceptance: "AC-1", refs: ["project-test"] },
+					{ acceptance: "AC-2", refs: ["project-test"] },
+				],
+				residualRisks: [],
 			},
 		});
 	});
 
 	it("drives an ordinary Agent Session through progressive discovery and planning", () => {
 		expect(calls(agentSessionCanaryResponse(agentContext(["skill_load"])))).toEqual([
-			expect.objectContaining({ name: "skill_load", arguments: { name: "room-test-driven-implementation" } }),
+			expect.objectContaining({ name: "skill_load", arguments: { name: "test-driven-implementation" } }),
 		]);
 
-		const loadedSkill = '<loaded_skill name="room-test-driven-implementation">';
+		const loadedSkill = '<loaded_skill name="test-driven-implementation">';
 		expect(calls(agentSessionCanaryResponse(agentContext(["tool_load"], loadedSkill)))).toEqual([
 			expect.objectContaining({ name: "tool_load", arguments: { name: "workspace_read" } }),
 		]);
@@ -337,7 +327,7 @@ describe("deterministic context epoch Provider", () => {
 	});
 
 	it("completes every ordinary Agent plan item before final delivery", () => {
-		const loadedSkill = '<loaded_skill name="room-test-driven-implementation">';
+		const loadedSkill = '<loaded_skill name="test-driven-implementation">';
 		const baseHistory = [
 			loadedSkill,
 			'"id":"agent-missing-read"',
@@ -451,14 +441,19 @@ describe("deterministic context epoch Provider", () => {
 			"COLLAB-C-ACCEPTED",
 			"当前任务：",
 			"目标：THREE-MEMBER-ROOM-CANARY",
-			"验收条件 acceptance.criteria",
-			'criterionId: "criterion:a"',
+			"验收条件（提交证据时使用 AC 编号）：",
+			"- AC-1 | 待验收 | A 完成实现并交给 C 验收",
+			"- AC-2 | 待验收 | A 完成基线测试",
+			"- AC-3 | 待验收 | A 发布实现证据",
+			"- AC-4 | 待验收 | B 完成只读复核",
+			"- AC-5 | 待验收 | C 完成独立验收",
+			"- AC-6 | 待验收 | C 关闭 Root",
 		].join("\n");
 		const roomState = {
 			history: '"id":"collab-a-state"',
 			participants: [
-				{ id: "participant:reviewer", collaborationRole: "reviewer" },
-				{ id: "participant:coordinator", collaborationRole: "coordinator" },
+				{ participantRef: "P2", capabilitySummary: "reviewer" },
+				{ participantRef: "P3", capabilitySummary: "coordinator" },
 			],
 		};
 		const collaborate = calls(
@@ -470,9 +465,9 @@ describe("deterministic context epoch Provider", () => {
 			name: "room_collaborate",
 			id: "collab-a-collaborate",
 			arguments: {
-				targetParticipantId: "participant:reviewer",
-				intentKind: "review",
-				acceptanceCriterionIds: [],
+				targetParticipantRef: "P2",
+				intent: "review",
+				acceptance: ["AC-4"],
 			},
 		});
 
@@ -507,7 +502,7 @@ describe("deterministic context epoch Provider", () => {
 						].join(" "),
 						participants: roomState.participants,
 						mutationApplied: true,
-						executionReceiptId: "execution:a",
+						evidenceRef: "execution:a",
 					},
 				),
 			),
@@ -517,18 +512,48 @@ describe("deterministic context epoch Provider", () => {
 			id: "collab-a-commit",
 			arguments: {
 				decision: "handoff",
-				requirementCoverage: [],
-				qualityGate: {
-					originalRequestChecked: true,
-					verdict: "not_ready",
-					items: [
-						expect.objectContaining({
-							criterionId: "criterion:a",
-							status: "not_verified",
-							evidenceRefs: [],
-						}),
-					],
-				},
+				summary: "COLLAB-A-COMMIT-RESULT",
+				evidence: [
+					{ acceptance: "AC-1", refs: ["execution:a"] },
+					{ acceptance: "AC-2", refs: ["execution:a"] },
+					{ acceptance: "AC-3", refs: ["execution:a"] },
+				],
+				residualRisks: ["最终独立验收仍由 C 完成。"],
+				targetParticipantRef: "P3",
+				intent: "close",
+				acceptanceAliases: ["AC-1", "AC-2", "AC-3", "AC-4", "AC-5", "AC-6"],
+			},
+		});
+
+		const bTask = [
+			"原始需求（不可改写）：THREE-MEMBER-ROOM-CANARY，包含 AC-1 到 AC-6",
+			"当前任务：",
+			"目标：COLLAB-B-REVIEWED",
+			"验收条件（提交证据时使用 AC 编号）：",
+			"- AC-1 | 待验收 | B 完成只读复核",
+		].join("\n");
+		const bCommit = calls(
+			projectCollaborationCanaryResponse(
+				collaborationContext(bTask, ["tool_load", "room_state", "workspace_read", "room_post", "room_commit"], {
+					history: [
+						'"id":"collab-b-state"',
+						'"id":"collab-b-read-app"',
+						'"id":"collab-b-read-test"',
+						'"id":"collab-b-post"',
+					].join(" "),
+					acceptanceAliases: [{ acceptance: "AC-1" }],
+					evidenceRef: "execution:b",
+				}),
+			),
+		)[0];
+		expect(bCommit).toMatchObject({
+			name: "room_commit",
+			id: "collab-b-commit",
+			arguments: {
+				decision: "deliver",
+				summary: "COLLAB-B-COMMIT-RESULT",
+				evidence: [{ acceptance: "AC-1", refs: ["execution:b"] }],
+				residualRisks: [],
 			},
 		});
 
@@ -537,8 +562,8 @@ describe("deterministic context epoch Provider", () => {
 			"当前任务：",
 			"目标：COLLAB-C-ACCEPTED",
 			"验收条件 acceptance.criteria",
-			'criterionId: "criterion:1"',
-			'criterionId: "criterion:2"',
+			"- AC-1 | 待验收 | 独立读取实现",
+			"- AC-2 | 待验收 | 独立运行测试",
 		].join("\n");
 		const commit = calls(
 			projectCollaborationCanaryResponse(
@@ -552,7 +577,7 @@ describe("deterministic context epoch Provider", () => {
 							'"id":"collab-c-acceptance-shell"',
 							'"id":"collab-c-post"',
 						].join(" "),
-						executionReceiptId: "execution:c",
+						evidenceRef: "execution:c",
 					},
 				),
 			),
@@ -562,16 +587,12 @@ describe("deterministic context epoch Provider", () => {
 			id: "collab-c-commit",
 			arguments: {
 				decision: "deliver",
-				result: "COLLAB-C-COMMIT-RESULT",
-				requirementCoverage: ["criterion:1", "criterion:2"],
-				qualityGate: {
-					originalRequestChecked: true,
-					verdict: "ready_to_deliver",
-					items: [
-						expect.objectContaining({ criterionId: "criterion:1", status: "pass" }),
-						expect.objectContaining({ criterionId: "criterion:2", status: "pass" }),
-					],
-				},
+				summary: "COLLAB-C-COMMIT-RESULT",
+				evidence: [
+					{ acceptance: "AC-1", refs: ["execution:c"] },
+					{ acceptance: "AC-2", refs: ["execution:c"] },
+				],
+				residualRisks: [],
 			},
 		});
 	});

@@ -3,6 +3,7 @@ import { describe, expect, it, vi } from "vitest";
 import {
 	MAX_MODEL_VISIBLE_TOOL_RESULT_BYTES,
 	modelVisibleResult,
+	modelVisibleToolGatewayResult,
 	ToolArtifactBuffer,
 	toolAgentBlocks,
 } from "../src/tool-artifact-buffer.ts";
@@ -86,6 +87,92 @@ describe("BackendToolRegistry", () => {
 		expect(second.map((item) => item.name)).toEqual(["alpha.query", "zeta.run"]);
 		expect(registry.revision()).toBe(firstRevision);
 		expect(backendToolSchemaRevision(second)).toBe(firstSchemaRevision);
+	});
+
+	it("keeps Room governance receipts out of model context and exposes one short evidence ref", () => {
+		const product = modelVisibleToolGatewayResult({
+			ok: true,
+			result: { content: "bounded file content" },
+			roomExecutionReceipt: {
+				executionReceiptId: "execution:invoke:workspace-read",
+				invocationReceiptId: "invoke:workspace-read",
+				sessionId: "session:private",
+				toolName: "workspace_read",
+				status: "applied",
+			},
+		});
+		expect(product).toEqual({
+			evidenceRef: "execution:invoke:workspace-read",
+			ok: true,
+			result: { content: "bounded file content" },
+		});
+
+		const lifecycle = modelVisibleToolGatewayResult({
+			ok: true,
+			result: {
+				participants: [{ participantRef: "P1", displayName: "伙伴" }],
+			},
+			invocationReceipt: {
+				receiptId: "invoke:room-state",
+				canonicalCommand: { rootId: "root:private" },
+			},
+			executionReceipt: {
+				executionReceiptId: "execution:invoke:room-state",
+				sessionId: "session:private",
+				toolName: "room_state",
+				status: "applied",
+			},
+		});
+		expect(lifecycle).toEqual({
+			ok: true,
+			result: {
+				participants: [{ participantRef: "P1", displayName: "伙伴" }],
+			},
+		});
+	});
+
+	it("keeps approval and memory audit payloads in details instead of model context", () => {
+		const product = modelVisibleToolGatewayResult({
+			summary: "命令执行完成，退出码 0",
+			approvalRequired: false,
+			autoApproved: true,
+			approvalId: "approval:private",
+			approval: {
+				approvalId: "approval:private",
+				preview: { command: "private command" },
+				receipt: { auditId: "audit:private" },
+			},
+			receipt: {
+				summary: "命令执行完成，退出码 0",
+				output: "3 tests passed",
+				approvalId: "approval:private",
+				auditId: "audit:private",
+				roomExecutionReceipt: {
+					executionReceiptId: "execution:invoke:nested",
+					toolName: "workspace_shell",
+					status: "applied",
+				},
+			},
+			memoryCheckpoint: {
+				source: { sourceId: "agent-memory:private" },
+			},
+			roomExecutionReceipt: {
+				executionReceiptId: "execution:invoke:workspace-shell",
+				toolName: "workspace_shell",
+				status: "applied",
+			},
+		});
+
+		expect(product).toEqual({
+			evidenceRef: "execution:invoke:workspace-shell",
+			summary: "命令执行完成，退出码 0",
+			approvalRequired: false,
+			autoApproved: true,
+			receipt: {
+				summary: "命令执行完成，退出码 0",
+				output: "3 tests passed",
+			},
+		});
 	});
 
 	it("separates metadata-only permission changes from schema changes", () => {
@@ -189,7 +276,16 @@ describe("BackendToolRegistry", () => {
 						approval: {
 							approvalId: "approval-1",
 							state: "applied",
-							receipt: { summary: "设置已应用" },
+							receipt: {
+								summary: "设置已应用",
+								roomExecutionReceipt: {
+									executionReceiptId: "execution:invoke:settings-apply",
+									invocationReceiptId: "invoke:settings-apply",
+									sessionId: "session-1",
+									toolName: "settings.apply",
+									status: "applied",
+								},
+							},
 						},
 					}),
 					{ status: 200, headers: { "Content-Type": "application/json" } },
@@ -229,6 +325,63 @@ describe("BackendToolRegistry", () => {
 			expect(result.details).toMatchObject({
 				approvalState: "applied",
 				approval: { receipt: { summary: "设置已应用" } },
+			});
+			const visible = JSON.parse(result.content[0]?.text ?? "{}") as Record<string, unknown>;
+			expect(visible).toMatchObject({
+				summary: "设置已应用",
+				approvalState: "applied",
+				evidenceRef: "execution:invoke:settings-apply",
+			});
+			expect(JSON.stringify(visible)).not.toContain("roomExecutionReceipt");
+		} finally {
+			vi.unstubAllGlobals();
+		}
+	});
+
+	it("preserves an outer gateway execution receipt as one model-visible evidence ref", async () => {
+		const fetchMock = vi.fn<typeof fetch>().mockResolvedValue(
+			new Response(
+				JSON.stringify({
+					ok: true,
+					result: { summary: "已读取文件", content: "bounded" },
+					roomExecutionReceipt: {
+						executionReceiptId: "execution:invoke:workspace-read",
+						invocationReceiptId: "invoke:workspace-read",
+						sessionId: "session-room",
+						toolName: "workspace_read",
+						status: "applied",
+					},
+				}),
+				{ status: 200, headers: { "Content-Type": "application/json" } },
+			),
+		);
+		vi.stubGlobal("fetch", fetchMock);
+		try {
+			const definition = createBackendToolDefinition(
+				{
+					sessionId: "session-room",
+					registry: new BackendToolRegistry(),
+					gatewayUrl: "http://127.0.0.1:8768/api/agent/tool/execute",
+				},
+				tool({ name: "workspace_read" }),
+			);
+			const result = await definition.execute(
+				"call-read",
+				{ path: "README.md" } as never,
+				undefined,
+				undefined,
+				{} as never,
+			);
+			const visible = JSON.parse(result.content[0]?.text ?? "{}") as Record<string, unknown>;
+			expect(visible).toEqual({
+				summary: "已读取文件",
+				content: "bounded",
+				evidenceRef: "execution:invoke:workspace-read",
+			});
+			expect(result.details).toMatchObject({
+				roomExecutionReceipt: {
+					executionReceiptId: "execution:invoke:workspace-read",
+				},
 			});
 		} finally {
 			vi.unstubAllGlobals();
@@ -299,7 +452,12 @@ describe("BackendToolRegistry", () => {
 			const commitTool = createBackendToolDefinition(options, tool({ name: "room_commit" }), artifacts);
 			await commitTool.execute(
 				"call-commit",
-				{ decision: "deliver", result: "完成" } as never,
+				{
+					decision: "deliver",
+					summary: "完成",
+					evidence: [],
+					residualRisks: [],
+				} as never,
 				undefined,
 				undefined,
 				{} as never,

@@ -525,8 +525,8 @@ export class PiProductSession implements PooledSession {
 		const providerContextJournal = new ProviderContextJournal(initialContextEpoch, initialContextEpochReason);
 		let requiredSkillPrompt = "";
 		const loadedSkillNames = new Set<string>();
-		const skillPromptFocus = roomSkillPromptFocus(options.roomSkillPolicy);
-		const toolPromptFocus = roomToolPromptFocus(options.roomSkillPolicy);
+		const skillPromptFocus = roomSkillPromptFocus(options.roomSkillPolicy) ?? [];
+		const toolPromptFocus = roomToolPromptFocus(options.roomSkillPolicy) ?? [];
 		resourceLoader = new DefaultResourceLoader({
 			cwd: options.cwd,
 			agentDir: options.agentDir,
@@ -537,16 +537,10 @@ export class PiProductSession implements PooledSession {
 			// boundary. Never fall back to workspace or package auto-discovery.
 			noSkills: true,
 			skillsOverride: (base) =>
-				applySkillRoutingCardCatalog(
-					base,
-					options.skillRoutingCards ?? {},
-					options.roomSkillPolicy
-						? {
-								focusNames: skillPromptFocus ?? [],
-								loadedNames: [...loadedSkillNames],
-							}
-						: undefined,
-				),
+				applySkillRoutingCardCatalog(base, options.skillRoutingCards ?? {}, {
+					focusNames: skillPromptFocus,
+					loadedNames: [...loadedSkillNames],
+				}),
 			extensionFactories: [
 				createDiscoveryToolsExtension({
 					getResourceLoader,

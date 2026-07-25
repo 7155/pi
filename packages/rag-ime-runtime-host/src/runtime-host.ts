@@ -33,7 +33,6 @@ const HOST_VERSION = "1.0.0";
 const SESSION_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,199}$/;
 const COMPLETION_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,199}$/;
 const THINKING_LEVELS = new Set<ModelThinkingLevel>(["off", "minimal", "low", "medium", "high", "xhigh", "max"]);
-const STATELESS_THINKING_LEVELS = new Set<ModelThinkingLevel>(["off", "low"]);
 
 export const RUNTIME_PRIMITIVE_CAPABILITIES = Object.freeze({
 	continuationEnvelope: "1",
@@ -407,11 +406,8 @@ export class RagImeRuntimeHost {
 				const modelId = requiredString(params, "modelId", 200);
 				const thinkingLevel = requiredString(params, "thinkingLevel", 20) as ModelThinkingLevel;
 				const timeoutMs = optionalTimeoutMs(params);
-				if (!STATELESS_THINKING_LEVELS.has(thinkingLevel)) {
-					throw new RuntimeProtocolError(
-						"INVALID_PARAMS",
-						"Stateless completion only supports off or low thinking",
-					);
+				if (!THINKING_LEVELS.has(thinkingLevel)) {
+					throw new RuntimeProtocolError("INVALID_PARAMS", `Unsupported thinkingLevel: ${thinkingLevel}`);
 				}
 				if (this.completions.has(requestId)) {
 					throw new RuntimeProtocolError("REQUEST_ALREADY_ACTIVE", `Completion is already active: ${requestId}`);
@@ -468,8 +464,9 @@ export class RagImeRuntimeHost {
 							},
 						],
 					};
+					const reasoning = thinkingLevel === "off" ? undefined : thinkingLevel;
 					const response = await this.modelRuntime.completeSimple(model, context, {
-						...(thinkingLevel === "low" ? { reasoning: "low" as const } : {}),
+						...(reasoning ? { reasoning } : {}),
 						cacheRetention: "none",
 						maxRetries: 0,
 						maxTokens: Math.min(model.maxTokens, 4096),

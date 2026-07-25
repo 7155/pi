@@ -107,9 +107,17 @@ function catalogMatch(
 function skillCapabilityFamily(name: string): string {
 	if (name.startsWith("room-")) return "room-workflow";
 	if (name.includes("memory")) return "memory";
+	if (name.includes("handoff") || name.includes("collaborat")) return "collaboration";
 	if (name.includes("quality") || name.includes("review")) return "quality-review";
-	if (name.includes("architecture") || name.includes("code")) return "engineering";
-	if (name.includes("grill") || name.includes("clarification")) return "requirements";
+	if (
+		name.includes("implementation") ||
+		name.includes("debugging") ||
+		name.includes("architecture") ||
+		name.includes("code")
+	)
+		return "engineering";
+	if (name.includes("solution") || name.includes("planning")) return "planning";
+	if (name.includes("grill") || name.includes("clarification") || name.includes("alignment")) return "requirements";
 	if (name.includes(":")) return `plugin:${name.split(":", 1)[0]}`;
 	const prefix = name.split("-", 1)[0]?.trim();
 	return prefix || "other";

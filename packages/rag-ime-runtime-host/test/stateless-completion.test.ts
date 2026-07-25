@@ -14,7 +14,7 @@ const model: Model<"openai-responses"> = {
 	provider: "test",
 	baseUrl: "https://example.test/v1",
 	reasoning: true,
-	thinkingLevelMap: { medium: null, high: null, xhigh: null, max: null },
+	thinkingLevelMap: { xhigh: null, max: null },
 	input: ["text", "image"],
 	cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
 	contextWindow: 258_000,
@@ -142,7 +142,7 @@ describe("stateless completion", () => {
 		}
 	});
 
-	it("omits reasoning for off and rejects unsupported high thinking", async () => {
+	it("omits off, forwards supported thinking, and rejects invalid levels", async () => {
 		const { host, modelRuntime, root } = await fixture();
 		const complete = vi.spyOn(modelRuntime, "completeSimple").mockResolvedValue(assistant());
 
@@ -157,17 +157,38 @@ describe("stateless completion", () => {
 				}),
 			);
 			expect(complete.mock.calls[0]?.[2]?.reasoning).toBeUndefined();
+			await host.handle(
+				request("call-high", "completion.once", {
+					requestId: "surface-high",
+					provider: "test",
+					modelId: model.id,
+					thinkingLevel: "high",
+					message: "answer once",
+				}),
+			);
+			expect(complete.mock.calls[1]?.[2]?.reasoning).toBe("high");
 			await expect(
 				host.handle(
-					request("call-high", "completion.once", {
-						requestId: "surface-high",
+					request("call-invalid", "completion.once", {
+						requestId: "surface-invalid",
 						provider: "test",
 						modelId: model.id,
-						thinkingLevel: "high",
+						thinkingLevel: "turbo",
 						message: "answer once",
 					}),
 				),
-			).rejects.toThrow("only supports off or low");
+			).rejects.toThrow("Unsupported thinkingLevel: turbo");
+			await expect(
+				host.handle(
+					request("call-max", "completion.once", {
+						requestId: "surface-max",
+						provider: "test",
+						modelId: model.id,
+						thinkingLevel: "max",
+						message: "answer once",
+					}),
+				),
+			).rejects.toThrow(`does not support max thinking`);
 		} finally {
 			await host.dispose();
 			await rm(root, { recursive: true, force: true });

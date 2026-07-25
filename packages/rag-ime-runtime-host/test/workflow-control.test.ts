@@ -65,11 +65,11 @@ describe("workflow control", () => {
 			prompt: "继续",
 			systemPrompt: "基础提示词",
 		})) as { systemPrompt?: string };
-		expect(result.systemPrompt).toContain('type="workflow_control"');
+		expect(result.systemPrompt).toContain("<workflow-state>");
 		expect(result.systemPrompt).toContain("完成 Agent 工作流");
-		expect(result.systemPrompt).toContain("把六项能力交付到正式 App");
-		expect(result.systemPrompt).toContain("[x] 实现后端契约");
-		expect(result.systemPrompt).toContain("[>] 完成前端验收");
+		expect(result.systemPrompt).toContain("计划：1/2 项完成");
+		expect(result.systemPrompt).toContain("正在执行：完成前端验收");
+		expect(result.systemPrompt).not.toContain("实现后端契约");
 		expect(fetchCall(fetchMock, 0)[0]).toBe("http://127.0.0.1:8766/api/agent/tool/workflow-state");
 		const body = fetchBody(fetchMock, 0);
 		expect(body.sessionId).toBe("agent:workflow");
@@ -193,10 +193,10 @@ describe("workflow control", () => {
 			systemPrompt: "基础提示词",
 		})) as { systemPrompt?: string };
 
-		expect(result.systemPrompt).toContain("当前受管 Room Dispatch 已授权执行");
-		expect(result.systemPrompt).not.toContain("Plan · draft");
+		expect(result.systemPrompt).not.toContain("Plan");
 		expect(result.systemPrompt).not.toContain("不得执行写操作");
 		expect(result.systemPrompt).not.toContain("current_time");
+		expect(result.systemPrompt).toContain("当前 Room 任务已经开始");
 	});
 
 	it("renders a completed plan with the authoritative completion gate exactly once", async () => {
@@ -237,8 +237,8 @@ describe("workflow control", () => {
 			systemPrompt: "基础提示词",
 		})) as { systemPrompt?: string };
 
-		expect(result.systemPrompt).toContain("### Plan · completed");
-		expect(result.systemPrompt).toContain("### Act Gate");
+		expect(result.systemPrompt).toContain("计划：全部完成");
+		expect(result.systemPrompt).not.toContain("Act Gate");
 		expect(result.systemPrompt?.match(new RegExp(completionMessage, "gu"))).toHaveLength(1);
 		expect(result.systemPrompt).not.toContain("计划尚未批准");
 		expect(result.systemPrompt).not.toContain("计划尚未获得用户批准");

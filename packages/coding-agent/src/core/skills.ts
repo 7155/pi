@@ -514,7 +514,7 @@ export function formatSkillsForPrompt(skills: Skill[], options: FormatSkillsForP
 	const catalogTag = `<available_skills${catalogAttributes.length ? ` ${catalogAttributes.join(" ")}` : ""}>`;
 	const lines = [
 		hasPromptProjection
-			? "\n\nThe following capability-family index and stage cards describe deferred Skills."
+			? "\n\nThe following capability-family index is stable for this context epoch; stage cards are discovery hints."
 			: compactRoutingCards
 				? "\n\nThe following compact cards list optional Skills."
 				: "\n\nThe following skills provide specialized instructions for specific tasks.",
@@ -544,7 +544,7 @@ export function formatSkillsForPrompt(skills: Skill[], options: FormatSkillsForP
 	}
 	if (hasPromptProjection) {
 		const families = new Map<string, string[]>();
-		for (const skill of deferredSkills) {
+		for (const skill of visibleSkills) {
 			const family = skill.promptCatalog?.family || "other";
 			const names = families.get(family) ?? [];
 			names.push(skill.name);

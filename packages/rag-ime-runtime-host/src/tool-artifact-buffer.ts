@@ -4,6 +4,21 @@ const MEDIA_ID_PATTERN = /^media_[A-Za-z0-9_-]{12,80}$/u;
 const SESSION_ID_PATTERN = /^[A-Za-z0-9._:-]{1,240}$/u;
 const SHA256_PATTERN = /^[0-9a-f]{64}$/u;
 const ROOM_DELIVERY_TOOLS = new Set(["room_post", "room_commit"]);
+const ROOM_LIFECYCLE_TOOLS = new Set(["room_state", "room_post", "room_collaborate", "room_commit"]);
+const INTERNAL_ROOM_RECEIPT_KEYS = new Set([
+	"invocationReceipt",
+	"executionReceipt",
+	"roomInvocationReceipt",
+	"roomExecutionReceipt",
+]);
+const MODEL_HIDDEN_TOOL_RESULT_KEYS = new Set([
+	...INTERNAL_ROOM_RECEIPT_KEYS,
+	"agentBlocks",
+	"approval",
+	"approvalId",
+	"auditId",
+	"memoryCheckpoint",
+]);
 
 export interface PreparedToolArguments {
 	arguments: unknown;
@@ -140,6 +155,17 @@ export function modelVisibleResult(value: unknown): unknown {
 	return best;
 }
 
+/**
+ * Keep governance receipts in ToolResult.details while giving the model only
+ * the short successful evidence ref it may cite in room_commit.
+ */
+export function modelVisibleToolGatewayResult(value: unknown): unknown {
+	const evidenceRef = successfulProductEvidenceRef(value);
+	const stripped = stripToolGatewayAuditFields(value);
+	const projected = evidenceRef && isRecord(stripped) ? evidenceFirst(stripped, evidenceRef) : stripped;
+	return modelVisibleResult(projected);
+}
+
 function stripAgentBlocks(value: unknown): unknown {
 	if (Array.isArray(value)) return value.map(stripAgentBlocks);
 	if (!isRecord(value)) return value;
@@ -148,6 +174,41 @@ function stripAgentBlocks(value: unknown): unknown {
 			.filter(([key]) => key !== "agentBlocks")
 			.map(([key, item]) => [key, stripAgentBlocks(item)]),
 	);
+}
+
+function stripToolGatewayAuditFields(value: unknown): unknown {
+	if (Array.isArray(value)) return value.map(stripToolGatewayAuditFields);
+	if (!isRecord(value)) return value;
+	return Object.fromEntries(
+		Object.entries(value)
+			.filter(([key]) => !MODEL_HIDDEN_TOOL_RESULT_KEYS.has(key))
+			.map(([key, item]) => [key, stripToolGatewayAuditFields(item)]),
+	);
+}
+
+function evidenceFirst(value: Record<string, unknown>, evidenceRef: string): Record<string, unknown> {
+	return {
+		evidenceRef,
+		...Object.fromEntries(Object.entries(value).filter(([key]) => key !== "evidenceRef")),
+	};
+}
+
+function successfulProductEvidenceRef(value: unknown, depth = 0): string {
+	if (!isRecord(value) || depth > 5) return "";
+	for (const key of ["roomExecutionReceipt", "executionReceipt"] as const) {
+		const receipt = value[key];
+		if (!isRecord(receipt)) continue;
+		const toolName = text(receipt.toolName);
+		const receiptId = text(receipt.executionReceiptId);
+		if (receipt.status === "applied" && receiptId && toolName && !ROOM_LIFECYCLE_TOOLS.has(toolName)) {
+			return receiptId;
+		}
+	}
+	for (const key of ["result", "details", "approval", "receipt"] as const) {
+		const nested = successfulProductEvidenceRef(value[key], depth + 1);
+		if (nested) return nested;
+	}
+	return "";
 }
 
 function isManagedFileBlock(value: unknown): value is Record<string, unknown> {

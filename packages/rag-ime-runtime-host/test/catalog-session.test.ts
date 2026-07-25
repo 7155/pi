@@ -31,7 +31,7 @@ describe("PiProductSession catalog updates", () => {
 		const agentDir = join(root, "agent");
 		const sessionDir = join(root, "sessions");
 		const activePluginDir = join(root, "plugins", "active");
-		const skillDir = join(root, "product-skills", "room-structured-handoff");
+		const skillDir = join(root, "product-skills", "structured-handoff");
 		const body = "# Structured Handoff\n\nCarry the exact remaining work and evidence to the next owner.";
 		const skillHash = createHash("sha256").update(body).digest("hex");
 		await Promise.all([
@@ -44,7 +44,7 @@ describe("PiProductSession catalog updates", () => {
 			join(skillDir, "SKILL.md"),
 			[
 				"---",
-				"name: room-structured-handoff",
+				"name: structured-handoff",
 				"description: Hand off bounded work.",
 				"when:",
 				"  - another owner must continue",
@@ -77,7 +77,7 @@ describe("PiProductSession catalog updates", () => {
 			systemPrompt: "stable managed prompt",
 			roomSkillPolicy: {
 				selection: "required",
-				skillId: "room-structured-handoff",
+				skillId: "structured-handoff",
 				skillHash,
 			},
 			noContextFiles: true,
@@ -87,7 +87,7 @@ describe("PiProductSession catalog updates", () => {
 		try {
 			expect(productSession.roomSkillLoad).toEqual({
 				schemaVersion: "rag-ime.skill-load.v1",
-				name: "room-structured-handoff",
+				name: "structured-handoff",
 				catalogRevision: expect.stringMatching(/^[a-f0-9]{64}$/u),
 				contentRevision: skillHash,
 				loadReason: "stage_required",
@@ -95,7 +95,7 @@ describe("PiProductSession catalog updates", () => {
 			const internal = productSession as unknown as { session: { systemPrompt: string } };
 			expect(internal.session.systemPrompt).toContain("stable managed prompt");
 			expect(internal.session.systemPrompt).toContain(
-				`<loaded_skill name="room-structured-handoff" revision="sha256:${skillHash}">`,
+				`<loaded_skill name="structured-handoff" revision="sha256:${skillHash}">`,
 			);
 			expect(internal.session.systemPrompt).toContain(body);
 			expect(internal.session.systemPrompt).not.toContain("description: Hand off bounded work.");
@@ -104,7 +104,7 @@ describe("PiProductSession catalog updates", () => {
 				/<available_skills[^>]*>([\s\S]*?)<\/available_skills>/u,
 			)?.[1];
 			expect(deferredCatalog).toBeDefined();
-			expect(deferredCatalog).not.toContain("room-structured-handoff");
+			expect(deferredCatalog).not.toContain("structured-handoff");
 			expect(internal.session.systemPrompt).toContain("never load that Skill again");
 			expect(productSession.snapshot()).toMatchObject({ roomSkillLoad: productSession.roomSkillLoad });
 		} finally {
@@ -175,6 +175,12 @@ describe("PiProductSession catalog updates", () => {
 								},
 							],
 						},
+						runtimeProjections: [
+							{
+								name: "memory_capture",
+								operation: "capture",
+							},
+						],
 					},
 				],
 				roomCapability: {
