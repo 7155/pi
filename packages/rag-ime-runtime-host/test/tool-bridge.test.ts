@@ -326,7 +326,9 @@ describe("BackendToolRegistry", () => {
 				approvalState: "applied",
 				approval: { receipt: { summary: "设置已应用" } },
 			});
-			const visible = JSON.parse(result.content[0]?.text ?? "{}") as Record<string, unknown>;
+			const visibleContent = result.content[0];
+			if (visibleContent?.type !== "text") throw new Error("Expected a model-visible text result");
+			const visible = JSON.parse(visibleContent.text) as Record<string, unknown>;
 			expect(visible).toMatchObject({
 				summary: "设置已应用",
 				approvalState: "applied",
@@ -372,7 +374,9 @@ describe("BackendToolRegistry", () => {
 				undefined,
 				{} as never,
 			);
-			const visible = JSON.parse(result.content[0]?.text ?? "{}") as Record<string, unknown>;
+			const visibleContent = result.content[0];
+			if (visibleContent?.type !== "text") throw new Error("Expected a model-visible text result");
+			const visible = JSON.parse(visibleContent.text) as Record<string, unknown>;
 			expect(visible).toEqual({
 				summary: "已读取文件",
 				content: "bounded",

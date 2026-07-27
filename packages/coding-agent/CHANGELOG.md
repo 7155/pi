@@ -32,6 +32,7 @@
 
 - Fixed configured-provider catalog refresh to parse pi.dev's model-ID keyed responses, throttle checks to once per four hours, send the versioned pi user agent, treat unimplemented routes as unavailable overlays, and show concise refresh status in `/model`.
 - Fixed adjacent assistant thinking blocks to render as one thinking section.
+- Fixed embedded Runtime Host Provider requests bypassing `HTTP_PROXY` and `HTTPS_PROXY` after npm undici replaced Node's environment-aware global dispatcher.
 
 ## [0.80.7] - 2026-07-14
 

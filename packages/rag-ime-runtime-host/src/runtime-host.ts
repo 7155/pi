@@ -9,7 +9,7 @@ import {
 	type Model,
 	type ModelThinkingLevel,
 } from "@earendil-works/pi-ai";
-import { ModelRuntime } from "@earendil-works/pi-coding-agent";
+import { configureHttpDispatcher, ModelRuntime } from "@earendil-works/pi-coding-agent";
 import { pendingRoomCancellationSurfaces, roomCancellationSurfaces } from "./cancellation-receipts.ts";
 import { PiProductSession } from "./pi-session.ts";
 import { ManagedPluginManager } from "./plugin-manager.ts";
@@ -290,6 +290,13 @@ export class RagImeRuntimeHost {
 			mkdir(options.pluginsRoot, { recursive: true, mode: 0o700 }),
 			mkdir(options.pluginInbox, { recursive: true, mode: 0o700 }),
 		]);
+		if (!options.modelRuntime) {
+			// Importing coding-agent loads npm undici, whose default dispatcher
+			// replaces Node's env-aware dispatcher. Reinstall Pi's configured
+			// dispatcher before creating the production model runtime so both
+			// WebSocket and SSE Provider traffic honor HTTP(S)_PROXY.
+			configureHttpDispatcher();
+		}
 		const modelRuntime =
 			options.modelRuntime ??
 			(await ModelRuntime.create({

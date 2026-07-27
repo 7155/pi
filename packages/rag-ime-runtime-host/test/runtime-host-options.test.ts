@@ -1,8 +1,13 @@
 import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { homedir, tmpdir } from "node:os";
 import { delimiter, join, resolve } from "node:path";
+import { Agent, EnvHttpProxyAgent, getGlobalDispatcher, setGlobalDispatcher } from "undici";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { RUNTIME_PRIMITIVE_CAPABILITIES, runtimeHostOptionsFromEnvironment } from "../src/runtime-host.ts";
+import {
+	RagImeRuntimeHost,
+	RUNTIME_PRIMITIVE_CAPABILITIES,
+	runtimeHostOptionsFromEnvironment,
+} from "../src/runtime-host.ts";
 
 describe("runtime host primitive capabilities", () => {
 	it("advertises only the product-neutral primitives available in this release", () => {
@@ -23,6 +28,62 @@ describe("runtime host primitive capabilities", () => {
 			},
 			roomTypes: true,
 		});
+	});
+});
+
+describe("runtime host provider transport", () => {
+	it("restores an environment-aware dispatcher before creating the production model runtime", async () => {
+		const root = await mkdtemp(join(tmpdir(), "rag-ime-runtime-transport-"));
+		const originalDispatcher = getGlobalDispatcher();
+		const directDispatcher = new Agent();
+		const originalFetch = globalThis.fetch;
+		const originalHttpProxy = process.env.HTTP_PROXY;
+		const originalHttpsProxy = process.env.HTTPS_PROXY;
+		let host: RagImeRuntimeHost | undefined;
+		try {
+			process.env.HTTP_PROXY = "http://127.0.0.1:7890";
+			process.env.HTTPS_PROXY = "http://127.0.0.1:7890";
+			setGlobalDispatcher(directDispatcher);
+			// Prevent the test from replacing all web-platform globals when the
+			// dispatcher is configured; production keeps the original fetch and
+			// therefore installs the matching undici globals.
+			globalThis.fetch = (async () => {
+				throw new Error("fetch is not used by this transport composition test");
+			}) as typeof globalThis.fetch;
+
+			host = await RagImeRuntimeHost.create({
+				agentDir: join(root, "agent"),
+				sessionDir: join(root, "sessions"),
+				pluginsRoot: join(root, "plugins"),
+				pluginInbox: join(root, "plugin-inbox"),
+				maxSessions: 1,
+				emitEvent: () => undefined,
+			});
+
+			expect(getGlobalDispatcher()).toBeInstanceOf(EnvHttpProxyAgent);
+		} finally {
+			await host?.dispose();
+			const activeDispatcher = getGlobalDispatcher();
+			setGlobalDispatcher(originalDispatcher);
+			if (activeDispatcher !== originalDispatcher) {
+				await activeDispatcher.close();
+			}
+			if (directDispatcher !== activeDispatcher) {
+				await directDispatcher.close();
+			}
+			globalThis.fetch = originalFetch;
+			if (originalHttpProxy === undefined) {
+				delete process.env.HTTP_PROXY;
+			} else {
+				process.env.HTTP_PROXY = originalHttpProxy;
+			}
+			if (originalHttpsProxy === undefined) {
+				delete process.env.HTTPS_PROXY;
+			} else {
+				process.env.HTTPS_PROXY = originalHttpsProxy;
+			}
+			await rm(root, { recursive: true, force: true });
+		}
 	});
 });
 
