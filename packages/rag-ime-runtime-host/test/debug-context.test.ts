@@ -404,6 +404,19 @@ describe("PiDebugContextRecorder", () => {
 		}
 	});
 
+	it("accepts a multi-GiB archive budget and keeps an upper safety bound", () => {
+		const fiveGiB = 5 * 1024 * 1024 * 1024;
+		const recorder = new PiDebugContextRecorder("session-five-gib", () => undefined, {
+			maxBytes: fiveGiB,
+		});
+		expect(recorder.storage().maxBytes).toBe(fiveGiB);
+
+		const oversized = new PiDebugContextRecorder("session-oversized", () => undefined, {
+			maxBytes: 128 * 1024 * 1024 * 1024,
+		});
+		expect(oversized.storage().maxBytes).toBe(64 * 1024 * 1024 * 1024);
+	});
+
 	it("returns a structurally valid record when the complete inspection exceeds the per-value clone cap", () => {
 		const activeTurn = { turnId: "turn-large" };
 		const recorder = new PiDebugContextRecorder("session-large", () => activeTurn);

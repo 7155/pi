@@ -158,7 +158,8 @@ const MAX_CONFIGURED_CALLS_PER_TURN = 256;
 const MAX_TOOLS_PER_TURN = 96;
 const MAX_TOOL_UPDATES = 12;
 const MAX_SERIALIZED_CHARS = 6_000_000;
-const MAX_STORAGE_BYTES = 1024 * 1024 * 1024;
+const DEFAULT_STORAGE_BYTES = 5 * 1024 * 1024 * 1024;
+const MAX_STORAGE_BYTES = 64 * 1024 * 1024 * 1024;
 let storageTaskQueue: Promise<void> = Promise.resolve();
 
 /**
@@ -196,7 +197,7 @@ export class PiDebugContextRecorder {
 		this.activeTurn = activeTurn;
 		this.storageDirectory = storage.directory?.trim() ?? "";
 		const requestedMax = Number.isFinite(storage.maxBytes) ? Math.floor(storage.maxBytes ?? 0) : 0;
-		this.storageMaxBytes = Math.min(MAX_STORAGE_BYTES, Math.max(1, requestedMax || MAX_STORAGE_BYTES));
+		this.storageMaxBytes = Math.min(MAX_STORAGE_BYTES, Math.max(1, requestedMax || DEFAULT_STORAGE_BYTES));
 		const requestedCalls = Number.isFinite(storage.maxCallsPerTurn) ? Math.floor(storage.maxCallsPerTurn ?? 0) : 0;
 		this.maxCallsPerTurn = Math.min(MAX_CONFIGURED_CALLS_PER_TURN, Math.max(1, requestedCalls || MAX_CALLS_PER_TURN));
 		this.contributionRefs = cloneForInspection(storage.contributionRefs ?? []) as Array<Record<string, unknown>>;
