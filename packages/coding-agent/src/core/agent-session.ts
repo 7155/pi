@@ -407,6 +407,8 @@ export class AgentSession {
 	private _baseSystemPrompt = "";
 	private _baseSystemPromptOptions!: BuildSystemPromptOptions;
 	private _systemPromptOverride?: string;
+	/** Per-run prompts waiting for their exact continuation envelope to be leased. */
+	private readonly _systemPromptByContinuationId = new Map<string, string>();
 
 	constructor(config: AgentSessionConfig) {
 		this.agent = config.agent;
@@ -431,6 +433,16 @@ export class AgentSession {
 		this.agent.onContinuationReady = () => {
 			if (!this._isAgentRunActive) {
 				void this._runAgentContinuation().catch(() => undefined);
+			}
+		};
+		this.agent.onContinuationsLeased = (continuations) => {
+			for (const continuation of continuations) {
+				const systemPrompt = this._systemPromptByContinuationId.get(continuation.id);
+				if (systemPrompt === undefined) continue;
+				this._systemPromptByContinuationId.delete(continuation.id);
+				this._systemPromptOverride = systemPrompt;
+				this.agent.state.systemPrompt = systemPrompt;
+				break;
 			}
 		};
 		this._installAgentToolHooks();
@@ -1173,7 +1185,7 @@ export class AgentSession {
 			throw error;
 		} finally {
 			unregisterProvider();
-			this._systemPromptOverride = undefined;
+			this._resetPerRunSystemPrompt();
 			this._flushPendingBashMessages();
 			const receipt = this._settledReceipt(scope);
 			if (settleFailure) this._emitAgentSettleFailed(settleFailure, receipt);
@@ -1200,12 +1212,30 @@ export class AgentSession {
 		} finally {
 			unregisterTimer();
 			unregisterProvider();
-			this._systemPromptOverride = undefined;
+			this._resetPerRunSystemPrompt();
 			this._flushPendingBashMessages();
 			const receipt = this._settledReceipt(scope);
 			if (settleFailure) this._emitAgentSettleFailed(settleFailure, receipt);
 			else await this._emitAgentSettled(receipt);
 			if (this._cancelScope === scope) this._cancelScope = undefined;
+		}
+	}
+
+	private _resetPerRunSystemPrompt(): void {
+		this._systemPromptOverride = undefined;
+		this.agent.state.systemPrompt = this._baseSystemPrompt;
+		this._pruneContinuationSystemPrompts();
+	}
+
+	private _pruneContinuationSystemPrompts(): void {
+		const pendingIds = new Set(
+			this.agent
+				.listContinuations()
+				.filter((item) => item.state === "pending")
+				.map((item) => item.id),
+		);
+		for (const id of this._systemPromptByContinuationId.keys()) {
+			if (!pendingIds.has(id)) this._systemPromptByContinuationId.delete(id);
 		}
 	}
 
@@ -1576,6 +1606,40 @@ export class AgentSession {
 	}
 
 	/**
+	 * Queue an idle continuation and bind its explicit per-run prompt to the
+	 * exact envelope that the Agent queue later leases.
+	 *
+	 * A replay of an already-completed idempotency key therefore installs
+	 * nothing, and a delayed or lower-priority owner cannot leak its prompt
+	 * into a different continuation that runs first.
+	 */
+	async followUpWithSystemPrompt(
+		text: string,
+		systemPrompt: string,
+		images?: ImageContent[],
+		continuation?: ContinuationOptions,
+	): Promise<AgentContinuation> {
+		if (!this.isIdle) {
+			throw new Error("A continuation system prompt can only be installed while the session is idle");
+		}
+		if (this.agent.followUpMode !== "one-at-a-time") {
+			throw new Error("A continuation system prompt requires one-at-a-time follow-up delivery");
+		}
+		if (
+			continuation?.cancelGeneration !== undefined &&
+			continuation.cancelGeneration !== this.agent.currentContinuationGeneration
+		) {
+			throw new Error("A continuation system prompt cannot target a stale cancellation generation");
+		}
+		const admitted = await this.followUp(text, images, continuation);
+		const current = this.agent.listContinuations().find((item) => item.id === admitted.id);
+		if (current?.state === "pending") {
+			this._systemPromptByContinuationId.set(admitted.id, systemPrompt);
+		}
+		return admitted;
+	}
+
+	/**
 	 * Internal: Queue a steering message (already expanded, no extension command check).
 	 */
 	private async _queueSteer(
@@ -1744,9 +1808,16 @@ export class AgentSession {
 	clearQueue(): { steering: string[]; followUp: string[] } {
 		const steering = this._steeringMessages.map((item) => item.text);
 		const followUp = this._followUpMessages.map((item) => item.text);
+		const clearedContinuationIds = new Set(
+			this.agent
+				.listContinuations()
+				.filter((item) => item.state === "pending")
+				.map((item) => item.id),
+		);
 		this._steeringMessages = [];
 		this._followUpMessages = [];
 		this.agent.clearAllQueues();
+		this._deleteContinuationSystemPrompts(clearedContinuationIds);
 		this._emitQueueUpdate();
 		return { steering, followUp };
 	}
@@ -1772,6 +1843,7 @@ export class AgentSession {
 	private _applyContinuationCancellation(receipt: { cancelledIds: string[] }): void {
 		if (receipt.cancelledIds.length > 0) {
 			const cancelled = new Set(receipt.cancelledIds);
+			this._deleteContinuationSystemPrompts(cancelled);
 			const activeIds = new Set(
 				this.agent
 					.listContinuations()
@@ -1783,6 +1855,10 @@ export class AgentSession {
 			this._emitQueueUpdate();
 		}
 		this._resolveIdleWaitIfIdle();
+	}
+
+	private _deleteContinuationSystemPrompts(continuationIds: ReadonlySet<string>): void {
+		for (const id of continuationIds) this._systemPromptByContinuationId.delete(id);
 	}
 
 	/** Get pending steering messages (read-only) */

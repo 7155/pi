@@ -232,6 +232,17 @@ export interface AgentLoopConfig extends SimpleStreamOptions {
 	) => AgentLoopTurnUpdate | undefined | Promise<AgentLoopTurnUpdate | undefined>;
 
 	/**
+	 * Called after a steering or follow-up queue leases messages and before
+	 * those messages start their Provider turn.
+	 *
+	 * Runtimes use this narrower hook when queue admission owns per-envelope
+	 * context that must not affect a different continuation.
+	 */
+	prepareQueuedTurn?: (
+		context: AgentContext,
+	) => AgentLoopTurnUpdate | undefined | Promise<AgentLoopTurnUpdate | undefined>;
+
+	/**
 	 * Returns steering messages to inject into the conversation mid-run.
 	 *
 	 * Called after the current assistant turn finishes executing its tool calls, unless `shouldStopAfterTurn` exits first.

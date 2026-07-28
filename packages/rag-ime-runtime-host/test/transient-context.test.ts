@@ -35,7 +35,7 @@ describe("runtime context envelope", () => {
 });
 
 describe("provider context journal", () => {
-	it("keeps the previous provider prompt as an exact prefix in one epoch", () => {
+	it("keeps stable Provider context as an exact prefix in one epoch", () => {
 		const journal = new ProviderContextJournal();
 		const first = journal.project("基础角色提示词", {
 			roomContext: "Room 冻结任务",
@@ -69,6 +69,40 @@ describe("provider context journal", () => {
 		expect(journal.snapshot().entryCount).toBe(1);
 	});
 
+	it("keeps stable context append-only while replacing the per-turn tail", () => {
+		const journal = new ProviderContextJournal();
+		const stable = journal.project("基础角色提示词", {
+			roomContext: "Room 当前责任",
+			sessionContext: "当前记忆",
+			transientContext: "",
+		});
+		const firstTurn = journal.project(stable, {
+			roomContext: "Room 当前责任",
+			sessionContext: "当前记忆",
+			transientContext: "旧输入与界面状态",
+		});
+		const secondTurn = journal.project(firstTurn, {
+			roomContext: "Room 当前责任",
+			sessionContext: "当前记忆",
+			transientContext: "新输入与界面状态",
+		});
+
+		expect(firstTurn.startsWith(stable)).toBe(true);
+		expect(secondTurn.startsWith(stable)).toBe(true);
+		expect(secondTurn).not.toContain("旧输入与界面状态");
+		expect(secondTurn).toContain("新输入与界面状态");
+		expect(secondTurn.match(/type="turn_context"/g)).toHaveLength(1);
+		expect(journal.snapshot().entryCount).toBe(3);
+
+		const cleared = journal.project(secondTurn, {
+			roomContext: "Room 当前责任",
+			sessionContext: "当前记忆",
+			transientContext: "",
+		});
+		expect(cleared).toBe(stable);
+		expect(journal.snapshot().entryCount).toBe(2);
+	});
+
 	it("projects Room-only context through the before-agent-start hook", async () => {
 		const handlers = new Map<string, (event: { systemPrompt: string }) => unknown>();
 		const extension = createProviderContextJournalExtension(new ProviderContextJournal(), () => ({
@@ -86,6 +120,30 @@ describe("provider context journal", () => {
 
 		expect(result?.systemPrompt).toContain('type="room_context"');
 		expect(result?.systemPrompt).toContain("Room 当前责任与验收");
+	});
+
+	it("removes a stale turn tail when the next start has no transient context", async () => {
+		let transientContext = "旧前台输入";
+		const handlers = new Map<string, (event: { systemPrompt: string }) => unknown>();
+		const extension = createProviderContextJournalExtension(new ProviderContextJournal(), () => ({
+			roomContext: "",
+			sessionContext: "",
+			transientContext,
+		}));
+		extension({
+			on: (event: string, handler: (value: { systemPrompt: string }) => unknown) => handlers.set(event, handler),
+		} as never);
+
+		const first = (await handlers.get("before_agent_start")?.({ systemPrompt: "基础角色提示词" })) as {
+			systemPrompt: string;
+		};
+		expect(first.systemPrompt).toContain("旧前台输入");
+
+		transientContext = "";
+		const second = (await handlers.get("before_agent_start")?.({ systemPrompt: first.systemPrompt })) as {
+			systemPrompt: string;
+		};
+		expect(second.systemPrompt).toBe("基础角色提示词");
 	});
 
 	it("starts a recorded new epoch only after compaction", () => {

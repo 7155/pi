@@ -365,6 +365,7 @@ describe("prompt preflight diagnostics", () => {
 			activeTurn: undefined,
 			sessionContext: "",
 			transientContext: "",
+			providerContextJournal: new ProviderContextJournal(),
 			session: {
 				isIdle: true,
 				prompt: vi.fn(async (_message, options) => {
@@ -378,6 +379,104 @@ describe("prompt preflight diagnostics", () => {
 			"Room recovery receipt revision does not match",
 		);
 		expect((productSession as unknown as { activeTurn?: unknown }).activeTurn).toBeUndefined();
+	});
+});
+
+describe("per-turn Provider context lifecycle", () => {
+	it("clears the projected turn tail when the Agent settles", () => {
+		const productSession = Object.create(PiProductSession.prototype) as PiProductSession;
+		const providerContextJournal = new ProviderContextJournal();
+		const withTurnContext = providerContextJournal.project("stable system prompt", {
+			roomContext: "",
+			sessionContext: "stable memory",
+			transientContext: "current input and UI",
+		});
+		const mutable = productSession as unknown as Record<string, any>;
+		Object.assign(mutable, {
+			activeTurn: { turnId: "turn:1" },
+			activeRoom: undefined,
+			roomUsageBaseline: undefined,
+			transientContext: "current input and UI",
+			providerContextJournal,
+			sequence: 0,
+			emitEvent: vi.fn(),
+			telemetry: vi.fn(() => ({})),
+			session: {
+				getSessionStats: () => ({ tokens: { input: 0, output: 0 } }),
+				getContextUsage: () => undefined,
+				messages: [],
+				model: undefined,
+				setRetryLimitOverride: vi.fn(),
+			},
+			settingsManager: {
+				getCompactionSettings: () => ({ reserveTokens: 0 }),
+			},
+		});
+
+		mutable.onSessionEvent({ type: "agent_settled" });
+
+		expect(mutable.transientContext).toBe("");
+		expect(providerContextJournal.snapshot().entryCount).toBe(1);
+		const afterSettle = providerContextJournal.project(withTurnContext, {
+			roomContext: "",
+			sessionContext: "stable memory",
+			transientContext: "",
+		});
+		expect(afterSettle).not.toContain("current input and UI");
+		expect(afterSettle).toContain("stable memory");
+	});
+
+	it("reprojects the managed prompt before an idle Room repair continuation", async () => {
+		const productSession = Object.create(PiProductSession.prototype) as PiProductSession;
+		const providerContextJournal = new ProviderContextJournal();
+		const followUpWithSystemPrompt = vi.fn(async () => ({
+			id: "continuation:repair",
+			state: "pending",
+		}));
+		const mutable = productSession as unknown as Record<string, any>;
+		Object.assign(mutable, {
+			activeTurn: { turnId: "turn:room" },
+			roomContext: "Room frozen responsibility",
+			sessionContext: "approved memory",
+			transientContext: "current UI evidence",
+			providerContextJournal,
+			session: {
+				isIdle: true,
+				systemPrompt: "stable system prompt",
+				followUpWithSystemPrompt,
+			},
+		});
+
+		const result = await mutable.queueRoomContinuation({
+			message: "repair the missing commit",
+			dispatchId: "dispatch:1",
+			rootId: "root:1",
+			generation: 2,
+		});
+
+		expect(followUpWithSystemPrompt).toHaveBeenCalledOnce();
+		const call = followUpWithSystemPrompt.mock.calls[0] as unknown as [
+			string,
+			string,
+			undefined,
+			Record<string, unknown>,
+		];
+		expect(call[0]).toBe("repair the missing commit");
+		expect(call[1]).toContain("Room frozen responsibility");
+		expect(call[1]).toContain("approved memory");
+		expect(call[1]).toContain("current UI evidence");
+		expect(call.slice(2)).toEqual([
+			undefined,
+			{
+				correlationId: "root:1",
+				idempotencyKey: "dispatch:1",
+			},
+		]);
+		expect(result).toEqual({
+			delivery: "followUp",
+			turnId: "turn:room",
+			continuationId: "continuation:repair",
+		});
 	});
 });
 

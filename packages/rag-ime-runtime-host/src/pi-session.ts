@@ -981,10 +981,12 @@ export class PiProductSession implements PooledSession {
 			this.roomUsageBaseline = undefined;
 			this.session.setRetryLimitOverride(undefined);
 			this.transientContext = "";
+			this.providerContextJournal.clearTurnContext();
 		} else if (event.type === "agent_settle_failed" && !this.activeRoom) {
 			this.activeTurn = undefined;
 			this.session.setRetryLimitOverride(undefined);
 			this.transientContext = "";
+			this.providerContextJournal.clearTurnContext();
 		}
 	}
 
@@ -1434,6 +1436,7 @@ export class PiProductSession implements PooledSession {
 						}
 						this.activeTurn = undefined;
 						this.transientContext = "";
+						this.providerContextJournal.clearTurnContext();
 						// AgentSession reports preflight=false immediately before
 						// rethrowing the concrete failure. Let the Promise rejection
 						// preserve that diagnostic instead of replacing it with a
@@ -1451,6 +1454,7 @@ export class PiProductSession implements PooledSession {
 						preflightSettled = true;
 						this.activeTurn = undefined;
 						this.transientContext = "";
+						this.providerContextJournal.clearTurnContext();
 						reject(error);
 					}
 				});
@@ -1554,7 +1558,7 @@ export class PiProductSession implements PooledSession {
 			}
 			throw error;
 		}
-		if (!this.activeTurn || this.session.isIdle) {
+		if (!this.activeTurn) {
 			try {
 				const turn = await this.prompt({ message: options.message });
 				return {
@@ -1577,12 +1581,39 @@ export class PiProductSession implements PooledSession {
 				throw error;
 			}
 		}
-		const continuation = await this.session.followUp(options.message, undefined, {
+		return this.queueRoomContinuation(options);
+	}
+
+	private async queueRoomContinuation(options: {
+		message: string;
+		dispatchId: string;
+		rootId: string;
+		generation: number;
+	}): Promise<Record<string, unknown>> {
+		const turnId = this.activeTurn?.turnId;
+		if (!turnId) {
+			throw new Error("room continuation requires an active turn");
+		}
+		const continuationOptions = {
 			correlationId: options.rootId,
-			cancelGeneration: options.generation,
 			idempotencyKey: options.dispatchId,
-		});
-		return { delivery: "followUp", turnId: this.activeTurn.turnId, continuationId: continuation.id };
+		};
+		const continuation = this.session.isIdle
+			? await this.session.followUpWithSystemPrompt(
+					options.message,
+					this.providerContextJournal.project(this.session.systemPrompt, {
+						roomContext: this.roomContext,
+						sessionContext: this.sessionContext,
+						transientContext: this.transientContext,
+					}),
+					undefined,
+					continuationOptions,
+				)
+			: await this.session.followUp(options.message, undefined, {
+					...continuationOptions,
+					cancelGeneration: options.generation,
+				});
+		return { delivery: "followUp", turnId, continuationId: continuation.id };
 	}
 
 	private beginRoomDispatch(options: ActiveRoomDispatch & { roomResourceLimits?: RoomResourceLimits }): void {
@@ -1659,6 +1690,7 @@ export class PiProductSession implements PooledSession {
 		this.activeRoom = undefined;
 		this.roomUsageBaseline = undefined;
 		this.transientContext = "";
+		this.providerContextJournal.clearTurnContext();
 	}
 
 	private messageQueue(): Record<string, unknown> {
@@ -1768,6 +1800,7 @@ export class PiProductSession implements PooledSession {
 		}
 		this.pendingDecisions.clear();
 		this.transientContext = "";
+		this.providerContextJournal.clearTurnContext();
 		this.unsubscribe?.();
 		this.unsubscribe = undefined;
 		this.debugContextRecorder.clear();

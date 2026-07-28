@@ -343,10 +343,125 @@ describe("AgentSession model and extension characterization", () => {
 		await harness.session.prompt("hello");
 
 		expect(providerSystemPrompt).toContain("extra instructions");
+		expect(harness.session.systemPrompt).not.toContain("extra instructions");
 		expect(sawInjectedUserMessage).toBe(true);
 		expect(
 			harness.session.messages.some((message) => message.role === "custom" && message.customType === "before-start"),
 		).toBe(true);
+	});
+
+	it("does not strand a system prompt when an idle continuation replay is already complete", async () => {
+		const harness = await createHarness();
+		harnesses.push(harness);
+		const providerPrompts: string[] = [];
+		harness.setResponses([
+			(context) => {
+				providerPrompts.push(context.systemPrompt ?? "");
+				return fauxAssistantMessage("initial");
+			},
+			(context) => {
+				providerPrompts.push(context.systemPrompt ?? "");
+				return fauxAssistantMessage("repaired");
+			},
+		]);
+		const basePrompt = harness.session.systemPrompt;
+
+		await harness.session.prompt("start");
+		const first = await harness.session.followUpWithSystemPrompt("repair", "managed repair prompt", undefined, {
+			id: "repair:1",
+			idempotencyKey: "repair-key:1",
+		});
+		expect(first.state).toBe("pending");
+		await harness.session.waitForIdle();
+
+		expect(providerPrompts).toEqual([basePrompt, "managed repair prompt"]);
+		expect(harness.session.systemPrompt).toBe(basePrompt);
+
+		const duplicate = await harness.session.followUpWithSystemPrompt("repair", "must not be installed", undefined, {
+			id: "repair:duplicate",
+			idempotencyKey: "repair-key:1",
+		});
+		expect(duplicate).toMatchObject({ id: "repair:1", state: "completed" });
+		expect(harness.session.systemPrompt).toBe(basePrompt);
+		expect(providerPrompts).toHaveLength(2);
+	});
+
+	it("clears only the owned system prompt when a pending idle continuation is cancelled", async () => {
+		const harness = await createHarness();
+		harnesses.push(harness);
+		let providerCalls = 0;
+		harness.setResponses([
+			() => {
+				providerCalls += 1;
+				return fauxAssistantMessage("initial");
+			},
+		]);
+		const basePrompt = harness.session.systemPrompt;
+
+		await harness.session.prompt("start");
+		const pending = await harness.session.followUpWithSystemPrompt("repair", "managed repair prompt", undefined, {
+			id: "repair:cancel",
+			idempotencyKey: "repair-key:cancel",
+		});
+		expect(pending.state).toBe("pending");
+		expect(harness.session.systemPrompt).toBe(basePrompt);
+
+		const cancellation = harness.session.cancelContinuation({ id: pending.id }, "test_cancel_before_delivery");
+		expect(cancellation.cancelledIds).toEqual([pending.id]);
+		await new Promise((resolve) => setTimeout(resolve, 0));
+		await harness.session.waitForIdle();
+
+		expect(providerCalls).toBe(1);
+		expect(harness.session.systemPrompt).toBe(basePrompt);
+	});
+
+	it("rejects a per-run system prompt for a stale cancellation generation", async () => {
+		const harness = await createHarness();
+		harnesses.push(harness);
+
+		await expect(
+			harness.session.followUpWithSystemPrompt("repair", "managed repair prompt", undefined, {
+				cancelGeneration: 7,
+			}),
+		).rejects.toThrow("stale cancellation generation");
+		expect(harness.session.listContinuations()).toHaveLength(0);
+	});
+
+	it("leases a per-run system prompt only to its exact continuation", async () => {
+		const harness = await createHarness();
+		harnesses.push(harness);
+		const providerPrompts: string[] = [];
+		harness.setResponses([
+			(context) => {
+				providerPrompts.push(context.systemPrompt ?? "");
+				return fauxAssistantMessage("initial");
+			},
+			(context) => {
+				providerPrompts.push(context.systemPrompt ?? "");
+				return fauxAssistantMessage("urgent");
+			},
+			(context) => {
+				providerPrompts.push(context.systemPrompt ?? "");
+				return fauxAssistantMessage("repair");
+			},
+		]);
+		const basePrompt = harness.session.systemPrompt;
+
+		await harness.session.prompt("start");
+		await harness.session.followUpWithSystemPrompt("repair", "managed repair prompt", undefined, {
+			id: "repair:owned",
+			idempotencyKey: "repair-key:owned",
+			priority: 0,
+		});
+		await harness.session.followUp("urgent normal follow-up", undefined, {
+			id: "normal:urgent",
+			idempotencyKey: "normal-key:urgent",
+			priority: 10,
+		});
+		await harness.session.waitForIdle();
+
+		expect(providerPrompts).toEqual([basePrompt, basePrompt, "managed repair prompt"]);
+		expect(harness.session.systemPrompt).toBe(basePrompt);
 	});
 
 	it("bindExtensions emits session_start and reload emits session_shutdown then session_start", async () => {

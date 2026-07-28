@@ -21,12 +21,20 @@ export interface ProviderContextJournalSnapshot {
 	contentHashes: string[];
 }
 
-/** Owns the immutable Provider-only prefix for one Pi Session. */
+/**
+ * Owns one Pi Session's Provider-only context.
+ *
+ * Room and approved Session memory form the append-only, cache-friendly
+ * prefix for an epoch. Current input and UI evidence is a replaceable tail:
+ * keeping older turn_context blocks would make stale foreground state look
+ * simultaneously true and would grow every later Provider request.
+ */
 export class ProviderContextJournal {
 	private epoch: number;
 	private epochReason: string;
 	private entries: ProviderContextEntry[] = [];
 	private contentHashes = new Set<string>();
+	private turnContext: ProviderContextEntry | undefined;
 
 	constructor(initialEpoch = 1, initialReason = "session_open") {
 		if (!Number.isSafeInteger(initialEpoch) || initialEpoch < 1) {
@@ -39,8 +47,12 @@ export class ProviderContextJournal {
 	project(systemPrompt: string, context: RuntimeContextSnapshot): string {
 		this.append("room_context", context.roomContext ?? "");
 		this.append("session_memory", context.sessionContext);
-		this.append("turn_context", context.transientContext);
+		this.replaceTurnContext(context.transientContext);
 		return this.render(systemPrompt);
+	}
+
+	clearTurnContext(): void {
+		this.turnContext = undefined;
 	}
 
 	beginEpoch(
@@ -57,16 +69,18 @@ export class ProviderContextJournal {
 		this.epochReason = reason;
 		this.entries = [];
 		this.contentHashes.clear();
+		this.turnContext = undefined;
 		return this.project(systemPrompt, context);
 	}
 
 	snapshot(): ProviderContextJournalSnapshot {
+		const currentEntries = this.currentEntries();
 		return {
 			schemaVersion: "rag-ime.provider-context-journal.v1",
 			epoch: this.epoch,
 			epochReason: this.epochReason,
-			entryCount: this.entries.length,
-			contentHashes: this.entries.map((entry) => entry.contentHash),
+			entryCount: currentEntries.length,
+			contentHashes: currentEntries.map((entry) => entry.contentHash),
 		};
 	}
 
@@ -79,10 +93,28 @@ export class ProviderContextJournal {
 		this.entries.push({ kind, body, contentHash });
 	}
 
+	private replaceTurnContext(value: string): void {
+		const body = value.trim();
+		if (!body) {
+			this.turnContext = undefined;
+			return;
+		}
+		this.turnContext = {
+			kind: "turn_context",
+			body,
+			contentHash: createHash("sha256").update(`turn_context\0${body}`).digest("hex"),
+		};
+	}
+
+	private currentEntries(): ProviderContextEntry[] {
+		return this.turnContext ? [...this.entries, this.turnContext] : this.entries;
+	}
+
 	private render(systemPrompt: string): string {
 		const base = systemPrompt.replace(MANAGED_CONTEXT_BLOCK_PATTERN, "").trimEnd();
-		if (this.entries.length === 0) return base;
-		const blocks = this.entries.map((entry) =>
+		const entries = this.currentEntries();
+		if (entries.length === 0) return base;
+		const blocks = entries.map((entry) =>
 			[`<rag-ime-context type="${entry.kind}">`, entry.body, "</rag-ime-context>"].join("\n"),
 		);
 		return [base, ...blocks].filter(Boolean).join("\n\n");
@@ -96,16 +128,8 @@ export function createProviderContextJournalExtension(
 	return (pi) => {
 		pi.on("before_agent_start", (event) => {
 			const context = getContext();
-			if (
-				!(context.roomContext ?? "").trim() &&
-				!context.sessionContext.trim() &&
-				!context.transientContext.trim()
-			) {
-				return;
-			}
-			return {
-				systemPrompt: journal.project(event.systemPrompt, context),
-			};
+			const systemPrompt = journal.project(event.systemPrompt, context);
+			return systemPrompt === event.systemPrompt ? undefined : { systemPrompt };
 		});
 	};
 }

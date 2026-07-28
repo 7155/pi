@@ -145,12 +145,20 @@ class PendingMessageQueue {
 	private readonly kind: "steer" | "follow_up";
 	private readonly getGeneration: () => number;
 	private readonly wake: () => void;
+	private readonly onLease: (continuations: AgentContinuation[]) => void;
 
-	constructor(mode: QueueMode, kind: "steer" | "follow_up", getGeneration: () => number, wake: () => void) {
+	constructor(
+		mode: QueueMode,
+		kind: "steer" | "follow_up",
+		getGeneration: () => number,
+		wake: () => void,
+		onLease: (continuations: AgentContinuation[]) => void,
+	) {
 		this.mode = mode;
 		this.kind = kind;
 		this.getGeneration = getGeneration;
 		this.wake = wake;
+		this.onLease = onLease;
 	}
 
 	enqueue(message: AgentMessage, options: ContinuationOptions = {}): AgentContinuation {
@@ -193,6 +201,7 @@ class PendingMessageQueue {
 			limit: this.mode === "all" ? Number.MAX_SAFE_INTEGER : 1,
 		});
 		for (const item of leased) this.queue.complete(item.id);
+		if (leased.length > 0) this.onLease(leased);
 		this.schedule();
 		return leased.map((item) => item.payload);
 	}
@@ -296,6 +305,8 @@ export class Agent {
 	public resolveToolForExecution?: (name: string) => AgentTool<any> | undefined;
 	/** Runtime hook used to start a due continuation through its owning session lifecycle. */
 	public onContinuationReady?: () => void;
+	/** Runtime hook invoked after exact continuation envelopes are leased, before Provider context is captured. */
+	public onContinuationsLeased?: (continuations: AgentContinuation[]) => void;
 
 	constructor(options: AgentOptions = {}) {
 		this._state = createMutableAgentState(options.initialState);
@@ -319,12 +330,14 @@ export class Agent {
 			"steer",
 			() => this.continuationGeneration,
 			wake,
+			(continuations) => this.onContinuationsLeased?.(continuations),
 		);
 		this.followUpQueue = new PendingMessageQueue(
 			options.followUpMode ?? "one-at-a-time",
 			"follow_up",
 			() => this.continuationGeneration,
 			wake,
+			(continuations) => this.onContinuationsLeased?.(continuations),
 		);
 		this.sessionId = options.sessionId;
 		this.thinkingBudgets = options.thinkingBudgets;
@@ -374,6 +387,10 @@ export class Agent {
 
 	get followUpMode(): QueueMode {
 		return this.followUpQueue.mode;
+	}
+
+	get currentContinuationGeneration(): number {
+		return this.continuationGeneration;
 	}
 
 	/** Queue a message to be injected after the current assistant turn finishes. */
@@ -590,6 +607,15 @@ export class Agent {
 							return await this.prepareNextTurn?.(this.signal);
 						}
 					: undefined,
+			prepareQueuedTurn: (context) => ({
+				context: {
+					...context,
+					systemPrompt: this._state.systemPrompt,
+					tools: this._state.tools.slice(),
+				},
+				model: this._state.model,
+				thinkingLevel: this._state.thinkingLevel,
+			}),
 			convertToLlm: this.convertToLlm,
 			transformContext: this.transformContext,
 			getApiKey: this.getApiKey,

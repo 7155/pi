@@ -15,6 +15,7 @@ import type {
 	AgentContext,
 	AgentEvent,
 	AgentLoopConfig,
+	AgentLoopTurnUpdate,
 	AgentMessage,
 	AgentTool,
 	AgentToolCall,
@@ -162,9 +163,27 @@ async function runLoop(
 ): Promise<void> {
 	let currentContext = initialContext;
 	let config = initialConfig;
+	const applyTurnUpdate = (snapshot: AgentLoopTurnUpdate | undefined): void => {
+		if (!snapshot) return;
+		currentContext = snapshot.context ?? currentContext;
+		config = {
+			...config,
+			model: snapshot.model ?? config.model,
+			reasoning:
+				snapshot.thinkingLevel === undefined
+					? config.reasoning
+					: snapshot.thinkingLevel === "off"
+						? undefined
+						: snapshot.thinkingLevel,
+		};
+	};
+	const refreshQueuedTurn = async (): Promise<void> => {
+		applyTurnUpdate(await config.prepareQueuedTurn?.(currentContext));
+	};
 	let firstTurn = true;
 	// Check for steering messages at start (user may have typed while waiting)
 	let pendingMessages: AgentMessage[] = (await config.getSteeringMessages?.()) || [];
+	if (pendingMessages.length > 0) await refreshQueuedTurn();
 
 	// Outer loop: continues when queued follow-up messages arrive after agent would stop
 	while (true) {
@@ -230,19 +249,7 @@ async function runLoop(
 				newMessages,
 			};
 			const nextTurnSnapshot = await config.prepareNextTurn?.(nextTurnContext);
-			if (nextTurnSnapshot) {
-				currentContext = nextTurnSnapshot.context ?? currentContext;
-				config = {
-					...config,
-					model: nextTurnSnapshot.model ?? config.model,
-					reasoning:
-						nextTurnSnapshot.thinkingLevel === undefined
-							? config.reasoning
-							: nextTurnSnapshot.thinkingLevel === "off"
-								? undefined
-								: nextTurnSnapshot.thinkingLevel,
-				};
-			}
+			applyTurnUpdate(nextTurnSnapshot);
 
 			if (
 				await config.shouldStopAfterTurn?.({
@@ -257,6 +264,7 @@ async function runLoop(
 			}
 
 			pendingMessages = (await config.getSteeringMessages?.()) || [];
+			if (pendingMessages.length > 0) await refreshQueuedTurn();
 		}
 
 		// Agent would stop here. Check for follow-up messages.
@@ -264,6 +272,7 @@ async function runLoop(
 		if (followUpMessages.length > 0) {
 			// Set as pending so inner loop processes them
 			pendingMessages = followUpMessages;
+			await refreshQueuedTurn();
 			continue;
 		}
 
