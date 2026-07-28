@@ -1,12 +1,21 @@
-import { randomUUID } from "node:crypto";
-import type { ExtensionFactory } from "@earendil-works/pi-coding-agent";
+import { createHash, randomUUID } from "node:crypto";
+import type { BeforeAgentSettleEvent, ExtensionFactory } from "@earendil-works/pi-coding-agent";
 import { type BackendToolBridgeOptions, requestProductGateway } from "./tool-bridge.ts";
 
 const WORKFLOW_BLOCK_PATTERN =
 	/\n*(?:<workflow-state\b[^>]*>[\s\S]*?<\/workflow-state>|<rag-ime-context type="workflow_control"[^>]*>[\s\S]*?<\/rag-ime-context>)\n*/gu;
+const MAX_TOOL_EVIDENCE_FINGERPRINTS = 10_000;
+// Loopback should normally answer in milliseconds. Eight seconds tolerates a
+// loaded local process while still bounding Agent settlement deterministically.
+const GOAL_SETTLE_GATEWAY_TIMEOUT_MS = 8_000;
+// The Product Room Kernel already bounds recovery to four repairs
+// (`SYSTEM_MAX_REPAIRS = 4`). Ordinary Goals get the same four native
+// continuation opportunities; attempt five is the final typed settle decision.
+const MAX_GOAL_SETTLE_ATTEMPTS_PER_SCOPE = 5;
 
 interface WorkflowControlOptions {
 	bridge: BackendToolBridgeOptions;
+	hasActiveRoom?(): boolean;
 	onProjectComplete?(details: Record<string, unknown>): Promise<void>;
 }
 
@@ -29,6 +38,51 @@ function text(value: unknown): string {
 function numberValue(value: unknown): number {
 	const parsed = Number(value);
 	return Number.isFinite(parsed) ? Math.max(0, parsed) : 0;
+}
+
+function canonicalJson(value: unknown, ancestors = new Set<object>()): string {
+	if (Array.isArray(value)) {
+		if (ancestors.has(value)) return '"[circular]"';
+		ancestors.add(value);
+		const result = `[${value.map((item) => canonicalJson(item, ancestors)).join(",")}]`;
+		ancestors.delete(value);
+		return result;
+	}
+	if (value && typeof value === "object") {
+		if (ancestors.has(value)) return '"[circular]"';
+		ancestors.add(value);
+		const result = `{${Object.entries(value as Record<string, unknown>)
+			.sort(([left], [right]) => (left < right ? -1 : left > right ? 1 : 0))
+			.map(([key, item]) => `${JSON.stringify(key)}:${canonicalJson(item, ancestors)}`)
+			.join(",")}}`;
+		ancestors.delete(value);
+		return result;
+	}
+	if (typeof value === "bigint") return JSON.stringify(value.toString());
+	if (typeof value === "number" && !Number.isFinite(value)) return "null";
+	return JSON.stringify(value) ?? "null";
+}
+
+function toolEvidenceFingerprint(toolName: string, args: unknown, result: unknown): string {
+	const visibleResult =
+		result &&
+		typeof result === "object" &&
+		!Array.isArray(result) &&
+		Array.isArray((result as Record<string, unknown>).content)
+			? {
+					content: (result as Record<string, unknown>).content,
+					...((result as Record<string, unknown>).terminate === true ? { terminate: true } : {}),
+				}
+			: result;
+	return createHash("sha256")
+		.update(canonicalJson({ args, result: visibleResult, toolName }))
+		.digest("hex");
+}
+
+function evidenceSetDigest(fingerprints: ReadonlySet<string>): string {
+	return createHash("sha256")
+		.update([...fingerprints].sort().join("\n"))
+		.digest("hex");
 }
 
 function optionalNumber(value: unknown): number | undefined {
@@ -126,20 +180,20 @@ function replaceWorkflowBlock(systemPrompt: string, body: string): string {
 	return [base, "<workflow-state>", body, "</workflow-state>"].filter(Boolean).join("\n");
 }
 
-function lastAssistantUsage(messages: readonly unknown[]): { tokenDelta: number } {
-	for (let index = messages.length - 1; index >= 0; index -= 1) {
-		const record = messages[index] as unknown as Record<string, unknown>;
+function assistantUsage(messages: readonly unknown[]): { tokenDelta: number } {
+	let tokenDelta = 0;
+	for (const message of messages) {
+		const record = message as unknown as Record<string, unknown>;
 		if (record.role !== "assistant") continue;
 		const usage = asRecord(record.usage);
-		const total =
+		tokenDelta +=
 			numberValue(usage.totalTokens) ||
 			numberValue(usage.input) +
 				numberValue(usage.output) +
 				numberValue(usage.cacheRead) +
 				numberValue(usage.cacheWrite);
-		return { tokenDelta: total };
 	}
-	return { tokenDelta: 0 };
+	return { tokenDelta };
 }
 
 function completionKey(snapshot: WorkflowSnapshot): string {
@@ -160,14 +214,11 @@ export function createWorkflowControlExtension(options: WorkflowControlOptions):
 	let initializedCompletionState = false;
 	let goalActive = false;
 	let activeTurnId = "";
-	let activeUsageReport:
-		| {
-				turnId: string;
-				idempotencyKey: string;
-				tokenDelta: number;
-				elapsedDeltaMs: number;
-		  }
-		| undefined;
+	let usageReportSequence = 0;
+	let usageReportedAtMs = 0;
+	const toolArgsByCallId = new Map<string, unknown>();
+	const seenToolEvidenceFingerprints = new Set<string>();
+	const freshToolEvidenceFingerprints = new Set<string>();
 
 	async function fetchState(
 		path: "workflow-state" | "goal-usage",
@@ -204,7 +255,11 @@ export function createWorkflowControlExtension(options: WorkflowControlOptions):
 		pi.on("before_agent_start", async (event) => {
 			turnStartedAtMs = Date.now();
 			activeTurnId = `turn:${randomUUID()}`;
-			activeUsageReport = undefined;
+			usageReportSequence = 0;
+			usageReportedAtMs = turnStartedAtMs;
+			toolArgsByCallId.clear();
+			seenToolEvidenceFingerprints.clear();
+			freshToolEvidenceFingerprints.clear();
 			try {
 				const snapshot = await fetchState("workflow-state", {
 					sessionId: options.bridge.sessionId,
@@ -224,19 +279,28 @@ export function createWorkflowControlExtension(options: WorkflowControlOptions):
 
 		pi.on("agent_end", async (event) => {
 			if (!options.bridge.gatewayUrl || !goalActive) return;
-			const { tokenDelta } = lastAssistantUsage(event.messages);
+			const { tokenDelta } = assistantUsage(event.messages);
 			const turnId = activeTurnId;
 			if (!turnId) return;
-			activeUsageReport ??= {
+			const sequence = ++usageReportSequence;
+			const reportAtMs = Date.now();
+			const report = {
 				turnId,
-				idempotencyKey: `goal-usage:${turnId}`,
+				eventId: `agent-end:${turnId}:${sequence}`,
+				idempotencyKey: `goal-usage:${turnId}:agent-end:${sequence}`,
 				tokenDelta,
-				elapsedDeltaMs: turnStartedAtMs > 0 ? Math.max(0, Date.now() - turnStartedAtMs) : 0,
+				elapsedDeltaMs:
+					usageReportedAtMs > 0
+						? Math.max(0, reportAtMs - usageReportedAtMs)
+						: turnStartedAtMs > 0
+							? Math.max(0, reportAtMs - turnStartedAtMs)
+							: 0,
 			};
+			usageReportedAtMs = reportAtMs;
 			try {
 				const snapshot = await fetchState("goal-usage", {
 					sessionId: options.bridge.sessionId,
-					...activeUsageReport,
+					...report,
 				});
 				const goal = asRecord(snapshot.goal);
 				goalActive = goal.configured === true && text(goal.status) === "active";
@@ -245,6 +309,96 @@ export function createWorkflowControlExtension(options: WorkflowControlOptions):
 				// Usage telemetry must not turn a successful model response into
 				// a failed turn. Product-side enforcement remains authoritative.
 			}
+		});
+
+		pi.on("tool_execution_start", (event) => {
+			if (toolArgsByCallId.size < MAX_TOOL_EVIDENCE_FINGERPRINTS) {
+				toolArgsByCallId.set(event.toolCallId, event.args);
+			}
+		});
+
+		pi.on("tool_execution_end", (event) => {
+			const args = toolArgsByCallId.get(event.toolCallId);
+			toolArgsByCallId.delete(event.toolCallId);
+			if (!event.isError && seenToolEvidenceFingerprints.size < MAX_TOOL_EVIDENCE_FINGERPRINTS) {
+				const fingerprint = toolEvidenceFingerprint(event.toolName, args, event.result);
+				if (!seenToolEvidenceFingerprints.has(fingerprint)) {
+					seenToolEvidenceFingerprints.add(fingerprint);
+					freshToolEvidenceFingerprints.add(fingerprint);
+				}
+			}
+		});
+
+		pi.on("before_agent_settle", async (event: BeforeAgentSettleEvent) => {
+			// Room Dispatch settlement has its own Kernel-backed owner.  Never
+			// compete with it for Pi's single before_agent_settle continuation.
+			if (options.hasActiveRoom?.()) return;
+			if (!options.bridge.gatewayUrl || !goalActive) return;
+			if (event.message.stopReason === "error" || event.message.stopReason === "aborted") {
+				return;
+			}
+			const reachedAttemptLimit = event.settleAttempt >= MAX_GOAL_SETTLE_ATTEMPTS_PER_SCOPE;
+			const evidenceDigest = evidenceSetDigest(freshToolEvidenceFingerprints);
+			const controller = new AbortController();
+			const timeout = setTimeout(() => {
+				controller.abort(new Error(`Goal settle gateway timed out after ${GOAL_SETTLE_GATEWAY_TIMEOUT_MS}ms`));
+			}, GOAL_SETTLE_GATEWAY_TIMEOUT_MS);
+			let response: Awaited<ReturnType<typeof requestProductGateway>>;
+			try {
+				response = await requestProductGateway(
+					options.bridge,
+					"goal-settle",
+					{
+						schemaVersion: "rag-ime.agent-goal-settle-request.v1",
+						sessionId: options.bridge.sessionId,
+						settleScopeId: event.cancelScope.scopeId,
+						settleAttempt: event.settleAttempt,
+						freshToolEvidenceCount: freshToolEvidenceFingerprints.size,
+						freshToolEvidenceSha256: evidenceDigest,
+					},
+					controller.signal,
+				);
+			} catch (error) {
+				if (controller.signal.aborted) {
+					throw new Error(`Goal settle gateway timed out after ${GOAL_SETTLE_GATEWAY_TIMEOUT_MS}ms`, {
+						cause: error,
+					});
+				}
+				if (!reachedAttemptLimit) throw error;
+				// The local cap is authoritative even if the Product gateway is
+				// temporarily unavailable for its typed `settle_attempt_limit`
+				// receipt. Never turn attempt five into another continuation.
+				goalActive = false;
+				return;
+			} finally {
+				clearTimeout(timeout);
+			}
+			const result = asRecord(response.result);
+			const state = text(result.state);
+			goalActive = state === "continue" && !reachedAttemptLimit;
+			if (state !== "continue" || reachedAttemptLimit) return;
+			const message = text(result.message);
+			const followUpKey = text(result.followUpKey);
+			const goalId = text(result.goalId);
+			if (!message || !followUpKey || !goalId) {
+				throw new Error("Goal settle follow-up response is incomplete");
+			}
+			// Evidence belongs to the work completed since the previous Goal
+			// continuation. Once this continuation is accepted for queuing, the
+			// next settle attempt must prove fresh progress instead of reusing it.
+			freshToolEvidenceFingerprints.clear();
+			return {
+				followUp: {
+					text: message,
+					continuation: {
+						id: `goal-settle-follow-up:${followUpKey}`,
+						correlationId: goalId,
+						origin: "goal_supervisor",
+						idempotencyKey: followUpKey,
+						maxAttempts: 1,
+					},
+				},
+			};
 		});
 	};
 }

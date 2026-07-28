@@ -44,7 +44,7 @@ export class ProviderContextJournal {
 	}
 
 	beginEpoch(
-		reason: "compaction" | "task_switch" | "session_restart" | "history_rewrite",
+		reason: "compaction" | "task_switch" | "session_restart" | "history_rewrite" | "session_memory_refresh",
 		systemPrompt: string,
 		context: RuntimeContextSnapshot,
 		targetEpoch?: number,

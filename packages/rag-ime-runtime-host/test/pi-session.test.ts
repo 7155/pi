@@ -381,6 +381,108 @@ describe("prompt preflight diagnostics", () => {
 	});
 });
 
+describe("ordinary Session memory context epochs", () => {
+	it("rebases changed or cleared memory without accumulating the prior turn", async () => {
+		const productSession = Object.create(PiProductSession.prototype) as PiProductSession;
+		const providerContextJournal = new ProviderContextJournal();
+		const prompt = vi.fn(async (_message, options) => {
+			options.preflightResult(true);
+		});
+		const mutable = productSession as unknown as Record<string, any>;
+		Object.assign(mutable, {
+			activeRoom: undefined,
+			activeTurn: undefined,
+			roomContext: "",
+			sessionContext: "",
+			transientContext: "",
+			providerContextJournal,
+			session: {
+				isIdle: true,
+				systemPrompt: "stable system prompt",
+				prompt,
+			},
+		});
+
+		await productSession.prompt({ message: "first", sessionContext: "memory A" });
+		mutable.activeTurn = undefined;
+		let rendered = providerContextJournal.project("stable system prompt", {
+			roomContext: "",
+			sessionContext: mutable.sessionContext,
+			transientContext: "",
+		});
+		expect(providerContextJournal.snapshot()).toMatchObject({
+			epoch: 1,
+			epochReason: "session_open",
+		});
+		expect(rendered).toContain("memory A");
+
+		await productSession.prompt({ message: "second", sessionContext: "memory B" });
+		mutable.activeTurn = undefined;
+		rendered = providerContextJournal.project(rendered, {
+			roomContext: "",
+			sessionContext: mutable.sessionContext,
+			transientContext: "",
+		});
+		expect(providerContextJournal.snapshot()).toMatchObject({
+			epoch: 2,
+			epochReason: "session_memory_refresh",
+			entryCount: 1,
+		});
+		expect(rendered).toContain("memory B");
+		expect(rendered).not.toContain("memory A");
+
+		await productSession.prompt({ message: "same", sessionContext: "memory B" });
+		mutable.activeTurn = undefined;
+		expect(providerContextJournal.snapshot().epoch).toBe(2);
+
+		await productSession.prompt({ message: "clear", sessionContext: "" });
+		mutable.activeTurn = undefined;
+		rendered = providerContextJournal.project(rendered, {
+			roomContext: "",
+			sessionContext: mutable.sessionContext,
+			transientContext: "",
+		});
+		expect(providerContextJournal.snapshot()).toMatchObject({
+			epoch: 3,
+			epochReason: "session_memory_refresh",
+			entryCount: 0,
+		});
+		expect(rendered).not.toContain("memory B");
+	});
+
+	it("leaves active Room context epoch ownership to the Room lifecycle", async () => {
+		const productSession = Object.create(PiProductSession.prototype) as PiProductSession;
+		const providerContextJournal = new ProviderContextJournal(3, "task_switch");
+		const mutable = productSession as unknown as Record<string, any>;
+		Object.assign(mutable, {
+			activeRoom: {
+				dispatchId: "dispatch:1",
+				rootId: "root:1",
+				generation: 0,
+				capabilityEpoch: 1,
+			},
+			activeTurn: undefined,
+			roomContext: "Room task",
+			sessionContext: "memory A",
+			transientContext: "",
+			providerContextJournal,
+			session: {
+				isIdle: true,
+				systemPrompt: "stable system prompt",
+				prompt: vi.fn(async (_message, options) => {
+					options.preflightResult(true);
+				}),
+			},
+		});
+
+		await productSession.prompt({ message: "Room-owned", sessionContext: "memory B" });
+		expect(providerContextJournal.snapshot()).toMatchObject({
+			epoch: 3,
+			epochReason: "task_switch",
+		});
+	});
+});
+
 describe("managed Room retry budget", () => {
 	it("caps the Agent lifecycle and reports each retry to Kernel settlement", () => {
 		const productSession = Object.create(PiProductSession.prototype) as PiProductSession;

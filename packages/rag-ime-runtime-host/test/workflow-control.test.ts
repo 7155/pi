@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { createWorkflowControlExtension } from "../src/workflow-control.ts";
 
@@ -20,8 +21,46 @@ function register(extension: ReturnType<typeof createWorkflowControlExtension>):
 	return handlers;
 }
 
+const EMPTY_EVIDENCE_SHA256 = createHash("sha256").update("").digest("hex");
+
+async function finishTool(
+	handlers: Map<string, Handler>,
+	input: {
+		toolCallId: string;
+		toolName?: string;
+		args?: unknown;
+		result: unknown;
+		isError?: boolean;
+	},
+): Promise<void> {
+	const toolName = input.toolName ?? "read";
+	await handlers.get("tool_execution_start")?.({
+		type: "tool_execution_start",
+		toolCallId: input.toolCallId,
+		toolName,
+		args: input.args ?? {},
+	});
+	await handlers.get("tool_execution_end")?.({
+		type: "tool_execution_end",
+		toolCallId: input.toolCallId,
+		toolName,
+		result: input.result,
+		isError: input.isError ?? false,
+	});
+}
+
+const settleEvent = {
+	type: "before_agent_settle",
+	settleAttempt: 1,
+	cancelScope: { scopeId: "scope:goal:1", generation: 1 },
+	message: { role: "assistant", content: [], stopReason: "stop" },
+};
+
 describe("workflow control", () => {
-	afterEach(() => vi.unstubAllGlobals());
+	afterEach(() => {
+		vi.useRealTimers();
+		vi.unstubAllGlobals();
+	});
 
 	it("injects the approved plan and thread goal without changing the user prompt", async () => {
 		const fetchMock = vi.fn(async () => ({
@@ -76,7 +115,7 @@ describe("workflow control", () => {
 		expect(body).not.toHaveProperty("prompt");
 	});
 
-	it("reports per-turn usage without failing the completed response", async () => {
+	it("reports every agent run exactly once, including all assistant messages", async () => {
 		const fetchMock = vi.fn(async () => ({
 			ok: true,
 			status: 200,
@@ -107,15 +146,21 @@ describe("workflow control", () => {
 					role: "assistant",
 					usage: { input: 120, output: 30, cacheRead: 50, cacheWrite: 0 },
 				},
+				{ role: "toolResult", content: [] },
+				{
+					role: "assistant",
+					usage: { input: 80, output: 20, cacheRead: 0, cacheWrite: 0 },
+				},
 			],
 		});
 		expect(fetchMock).toHaveBeenCalledTimes(2);
 		expect(fetchCall(fetchMock, 1)[0]).toBe("http://127.0.0.1:8766/api/agent/tool/goal-usage");
 		const body = fetchBody(fetchMock, 1);
-		expect(body.tokenDelta).toBe(200);
+		expect(body.tokenDelta).toBe(300);
 		expect(body.elapsedDeltaMs).toBeGreaterThanOrEqual(0);
 		expect(body.turnId).toMatch(/^turn:[0-9a-f-]{36}$/);
-		expect(body.idempotencyKey).toBe(`goal-usage:${body.turnId}`);
+		expect(body.eventId).toBe(`agent-end:${body.turnId}:1`);
+		expect(body.idempotencyKey).toBe(`goal-usage:${body.turnId}:agent-end:1`);
 
 		await handlers.get("agent_end")?.({
 			messages: [
@@ -125,9 +170,535 @@ describe("workflow control", () => {
 				},
 			],
 		});
-		const replayBody = fetchBody(fetchMock, 2);
-		expect(replayBody.turnId).toBe(body.turnId);
-		expect(replayBody.idempotencyKey).toBe(body.idempotencyKey);
+		const continuationBody = fetchBody(fetchMock, 2);
+		expect(continuationBody.turnId).toBe(body.turnId);
+		expect(continuationBody.eventId).toBe(`agent-end:${body.turnId}:2`);
+		expect(continuationBody.idempotencyKey).toBe(`goal-usage:${body.turnId}:agent-end:2`);
+		expect(continuationBody.tokenDelta).toBe(200);
+	});
+
+	it("turns one active Goal decision into one bounded native continuation", async () => {
+		const fetchMock = vi.fn(async (url: string, init?: { body?: unknown }) => {
+			const body = init?.body ? (JSON.parse(String(init.body)) as Record<string, unknown>) : {};
+			const continueGoal = Number(body.settleAttempt) === 1 || Number(body.freshToolEvidenceCount) > 0;
+			return {
+				ok: true,
+				status: 200,
+				json: async () =>
+					url.endsWith("/goal-settle")
+						? {
+								ok: true,
+								result: continueGoal
+									? {
+											state: "continue",
+											goalId: "goal:1",
+											followUpKey: `goal-settle:key-${String(body.settleAttempt)}`,
+											message: "<managed-goal-follow-up>继续完成验收</managed-goal-follow-up>",
+										}
+									: { state: "stalled", reason: "no_progress" },
+							}
+						: {
+								ok: true,
+								result: {
+									plan: {
+										status: "approved",
+										items: [{ text: "完成验收", status: "in_progress" }],
+									},
+									goal: { configured: true, status: "active", goalId: "goal:1" },
+									actGate: { allowed: true },
+								},
+							},
+			};
+		});
+		vi.stubGlobal("fetch", fetchMock);
+		const handlers = register(
+			createWorkflowControlExtension({
+				bridge: {
+					sessionId: "agent:goal-settle",
+					registry: {} as never,
+					gatewayUrl: "http://127.0.0.1:8766/api/agent/tool/execute",
+				},
+			}),
+		);
+		await handlers.get("before_agent_start")?.({ prompt: "继续", systemPrompt: "base" });
+
+		await expect(handlers.get("before_agent_settle")?.(settleEvent)).resolves.toEqual({
+			followUp: {
+				text: "<managed-goal-follow-up>继续完成验收</managed-goal-follow-up>",
+				continuation: {
+					id: "goal-settle-follow-up:goal-settle:key-1",
+					correlationId: "goal:1",
+					origin: "goal_supervisor",
+					idempotencyKey: "goal-settle:key-1",
+					maxAttempts: 1,
+				},
+			},
+		});
+		expect(fetchCall(fetchMock, 1)[0]).toBe("http://127.0.0.1:8766/api/agent/tool/goal-settle");
+		expect(fetchBody(fetchMock, 1)).toEqual({
+			schemaVersion: "rag-ime.agent-goal-settle-request.v1",
+			sessionId: "agent:goal-settle",
+			settleScopeId: "scope:goal:1",
+			settleAttempt: 1,
+			freshToolEvidenceCount: 0,
+			freshToolEvidenceSha256: EMPTY_EVIDENCE_SHA256,
+		});
+
+		await expect(
+			handlers.get("before_agent_settle")?.({
+				...settleEvent,
+				settleAttempt: 2,
+			}),
+		).resolves.toBeUndefined();
+		expect(fetchBody(fetchMock, 2)).toMatchObject({
+			settleAttempt: 2,
+			freshToolEvidenceCount: 0,
+		});
+	});
+
+	it("requires fresh successful tool evidence after each issued Goal follow-up", async () => {
+		const fetchMock = vi.fn(async (url: string, init?: { body?: unknown }) => {
+			const body = init?.body ? (JSON.parse(String(init.body)) as Record<string, unknown>) : {};
+			const shouldContinue = Number(body.settleAttempt) === 1 || Number(body.freshToolEvidenceCount) > 0;
+			return {
+				ok: true,
+				status: 200,
+				json: async () =>
+					url.endsWith("/goal-settle")
+						? {
+								ok: true,
+								result: shouldContinue
+									? {
+											state: "continue",
+											goalId: "goal:progress",
+											followUpKey: `goal-progress:${String(body.settleAttempt)}`,
+											message: "继续",
+										}
+									: { state: "stalled", reason: "no_progress" },
+							}
+						: {
+								ok: true,
+								result: {
+									plan: { status: "approved", items: [] },
+									goal: { configured: true, status: "active" },
+									actGate: { allowed: true },
+								},
+							},
+			};
+		});
+		vi.stubGlobal("fetch", fetchMock);
+		const handlers = register(
+			createWorkflowControlExtension({
+				bridge: {
+					sessionId: "agent:progress",
+					registry: {} as never,
+					gatewayUrl: "http://127.0.0.1:8766/api/agent/tool/execute",
+				},
+			}),
+		);
+		await handlers.get("before_agent_start")?.({ prompt: "继续", systemPrompt: "base" });
+		await expect(handlers.get("before_agent_settle")?.(settleEvent)).resolves.toHaveProperty("followUp");
+
+		await finishTool(handlers, {
+			toolCallId: "tool:success:1",
+			args: { path: "status.json" },
+			result: {
+				content: [{ type: "text", text: '{"status":"ready","revision":1}' }],
+				details: { receiptId: "receipt:first", capturedAtMs: 100 },
+			},
+		});
+		// A new call id and volatile internal receipt metadata do not make the
+		// same model-visible observation fresh evidence.
+		await finishTool(handlers, {
+			toolCallId: "tool:success:2",
+			args: { path: "status.json" },
+			result: {
+				content: [{ type: "text", text: '{"status":"ready","revision":1}' }],
+				details: { receiptId: "receipt:second", capturedAtMs: 200 },
+			},
+		});
+		await expect(
+			handlers.get("before_agent_settle")?.({
+				...settleEvent,
+				settleAttempt: 2,
+			}),
+		).resolves.toHaveProperty("followUp");
+		expect(fetchBody(fetchMock, 2)).toMatchObject({
+			settleAttempt: 2,
+			freshToolEvidenceCount: 1,
+		});
+		const firstEvidenceDigest = String(fetchBody(fetchMock, 2).freshToolEvidenceSha256);
+		expect(firstEvidenceDigest).toMatch(/^[0-9a-f]{64}$/);
+		expect(firstEvidenceDigest).not.toBe(EMPTY_EVIDENCE_SHA256);
+
+		// The cumulative seen set survives the issued continuation, so replaying
+		// the same observation under another call id is not fresh progress.
+		await finishTool(handlers, {
+			toolCallId: "tool:success:3",
+			args: { path: "status.json" },
+			result: {
+				content: [{ type: "text", text: '{"status":"ready","revision":1}' }],
+				details: { receiptId: "receipt:third", capturedAtMs: 300 },
+			},
+		});
+		await expect(
+			handlers.get("before_agent_settle")?.({
+				...settleEvent,
+				settleAttempt: 3,
+			}),
+		).resolves.toBeUndefined();
+		expect(fetchBody(fetchMock, 3)).toMatchObject({
+			settleAttempt: 3,
+			freshToolEvidenceCount: 0,
+			freshToolEvidenceSha256: EMPTY_EVIDENCE_SHA256,
+		});
+	});
+
+	it("treats changed read output as fresh evidence in the same settle scope", async () => {
+		const fetchMock = vi.fn(async (url: string, init?: { body?: unknown }) => {
+			const body = init?.body ? (JSON.parse(String(init.body)) as Record<string, unknown>) : {};
+			const shouldContinue = Number(body.settleAttempt) === 1 || Number(body.freshToolEvidenceCount) > 0;
+			return {
+				ok: true,
+				status: 200,
+				json: async () =>
+					url.endsWith("/goal-settle")
+						? {
+								ok: true,
+								result: shouldContinue
+									? {
+											state: "continue",
+											goalId: "goal:changed-read",
+											followUpKey: `goal-changed:${String(body.settleAttempt)}`,
+											message: "继续",
+										}
+									: { state: "stalled", reason: "no_progress" },
+							}
+						: {
+								ok: true,
+								result: {
+									plan: { status: "approved", items: [] },
+									goal: { configured: true, status: "active" },
+									actGate: { allowed: true },
+								},
+							},
+			};
+		});
+		vi.stubGlobal("fetch", fetchMock);
+		const handlers = register(
+			createWorkflowControlExtension({
+				bridge: {
+					sessionId: "agent:changed-read",
+					registry: {} as never,
+					gatewayUrl: "http://127.0.0.1:8766/api/agent/tool/execute",
+				},
+			}),
+		);
+		await handlers.get("before_agent_start")?.({ prompt: "继续", systemPrompt: "base" });
+		await expect(handlers.get("before_agent_settle")?.(settleEvent)).resolves.toHaveProperty("followUp");
+
+		await finishTool(handlers, {
+			toolCallId: "tool:read:1",
+			args: { path: "status.json" },
+			result: { revision: 1 },
+		});
+		await expect(handlers.get("before_agent_settle")?.({ ...settleEvent, settleAttempt: 2 })).resolves.toHaveProperty(
+			"followUp",
+		);
+		const firstDigest = String(fetchBody(fetchMock, 2).freshToolEvidenceSha256);
+
+		await finishTool(handlers, {
+			toolCallId: "tool:read:2",
+			args: { path: "status.json" },
+			result: { revision: 2 },
+		});
+		await expect(handlers.get("before_agent_settle")?.({ ...settleEvent, settleAttempt: 3 })).resolves.toHaveProperty(
+			"followUp",
+		);
+		const secondBody = fetchBody(fetchMock, 3);
+		expect(secondBody.freshToolEvidenceCount).toBe(1);
+		expect(secondBody.freshToolEvidenceSha256).toMatch(/^[0-9a-f]{64}$/);
+		expect(secondBody.freshToolEvidenceSha256).not.toBe(firstDigest);
+	});
+
+	it("does not count failed tool executions as Goal progress", async () => {
+		const fetchMock = vi.fn(async (url: string, init?: { body?: unknown }) => {
+			const body = init?.body ? (JSON.parse(String(init.body)) as Record<string, unknown>) : {};
+			const shouldContinue = Number(body.settleAttempt) === 1 || Number(body.freshToolEvidenceCount) > 0;
+			return {
+				ok: true,
+				status: 200,
+				json: async () =>
+					url.endsWith("/goal-settle")
+						? {
+								ok: true,
+								result: shouldContinue
+									? {
+											state: "continue",
+											goalId: "goal:failure",
+											followUpKey: "goal-failure:first",
+											message: "继续",
+										}
+									: { state: "stalled", reason: "no_progress" },
+							}
+						: {
+								ok: true,
+								result: {
+									plan: { status: "approved", items: [] },
+									goal: { configured: true, status: "active" },
+									actGate: { allowed: true },
+								},
+							},
+			};
+		});
+		vi.stubGlobal("fetch", fetchMock);
+		const handlers = register(
+			createWorkflowControlExtension({
+				bridge: {
+					sessionId: "agent:failure",
+					registry: {} as never,
+					gatewayUrl: "http://127.0.0.1:8766/api/agent/tool/execute",
+				},
+			}),
+		);
+		await handlers.get("before_agent_start")?.({ prompt: "继续", systemPrompt: "base" });
+		await expect(handlers.get("before_agent_settle")?.(settleEvent)).resolves.toHaveProperty("followUp");
+		await finishTool(handlers, {
+			toolCallId: "tool:failed",
+			toolName: "write",
+			args: { path: "status.json" },
+			result: { error: "denied" },
+			isError: true,
+		});
+
+		await expect(
+			handlers.get("before_agent_settle")?.({
+				...settleEvent,
+				settleAttempt: 2,
+			}),
+		).resolves.toBeUndefined();
+		expect(fetchBody(fetchMock, 2)).toMatchObject({
+			settleAttempt: 2,
+			freshToolEvidenceCount: 0,
+			freshToolEvidenceSha256: EMPTY_EVIDENCE_SHA256,
+		});
+	});
+
+	it("stops at the local settle-scope cap even if the gateway requests more work", async () => {
+		const fetchMock = vi.fn(async (url: string, init?: { body?: unknown }) => {
+			const body = init?.body ? (JSON.parse(String(init.body)) as Record<string, unknown>) : {};
+			return {
+				ok: true,
+				status: 200,
+				json: async () =>
+					url.endsWith("/goal-settle")
+						? {
+								ok: true,
+								result: {
+									state: "continue",
+									goalId: "goal:bounded",
+									followUpKey: `goal-bounded:${String(body.settleAttempt)}`,
+									message: "继续",
+								},
+							}
+						: {
+								ok: true,
+								result: {
+									plan: { status: "approved", items: [] },
+									goal: { configured: true, status: "active" },
+									actGate: { allowed: true },
+								},
+							},
+			};
+		});
+		vi.stubGlobal("fetch", fetchMock);
+		const handlers = register(
+			createWorkflowControlExtension({
+				bridge: {
+					sessionId: "agent:bounded",
+					registry: {} as never,
+					gatewayUrl: "http://127.0.0.1:8766/api/agent/tool/execute",
+				},
+			}),
+		);
+		await handlers.get("before_agent_start")?.({ prompt: "继续", systemPrompt: "base" });
+
+		for (let attempt = 1; attempt < 5; attempt += 1) {
+			if (attempt > 1) {
+				await finishTool(handlers, {
+					toolCallId: `tool:bounded:${attempt}`,
+					args: { path: "status.json" },
+					result: { revision: attempt },
+				});
+			}
+			await expect(
+				handlers.get("before_agent_settle")?.({
+					...settleEvent,
+					settleAttempt: attempt,
+				}),
+			).resolves.toHaveProperty("followUp");
+		}
+		await finishTool(handlers, {
+			toolCallId: "tool:bounded:5",
+			args: { path: "status.json" },
+			result: { revision: 5 },
+		});
+		await expect(
+			handlers.get("before_agent_settle")?.({
+				...settleEvent,
+				settleAttempt: 5,
+			}),
+		).resolves.toBeUndefined();
+		expect(fetchBody(fetchMock, 5)).toMatchObject({
+			settleAttempt: 5,
+			freshToolEvidenceCount: 1,
+		});
+	});
+
+	it("aborts a hanging Goal settle gateway at the local timeout", async () => {
+		vi.useFakeTimers();
+		let settleSignal: AbortSignal | undefined;
+		const fetchMock = vi.fn(async (url: string, init?: { signal?: AbortSignal }) => {
+			if (!url.endsWith("/goal-settle")) {
+				return {
+					ok: true,
+					status: 200,
+					json: async () => ({
+						ok: true,
+						result: {
+							plan: { status: "approved", items: [] },
+							goal: { configured: true, status: "active" },
+							actGate: { allowed: true },
+						},
+					}),
+				};
+			}
+			settleSignal = init?.signal;
+			return await new Promise<never>((_resolve, reject) => {
+				init?.signal?.addEventListener("abort", () => reject(init.signal?.reason ?? new Error("aborted")), {
+					once: true,
+				});
+			});
+		});
+		vi.stubGlobal("fetch", fetchMock);
+		const handlers = register(
+			createWorkflowControlExtension({
+				bridge: {
+					sessionId: "agent:hanging-settle",
+					registry: {} as never,
+					gatewayUrl: "http://127.0.0.1:8766/api/agent/tool/execute",
+				},
+			}),
+		);
+		await handlers.get("before_agent_start")?.({ prompt: "继续", systemPrompt: "base" });
+
+		const settlement = Promise.resolve(handlers.get("before_agent_settle")?.(settleEvent));
+		const boundedFailure = expect(settlement).rejects.toThrow("Goal settle gateway timed out after 8000ms");
+		await vi.advanceTimersByTimeAsync(7_999);
+		expect(settleSignal?.aborted).toBe(false);
+		await vi.advanceTimersByTimeAsync(1);
+		await boundedFailure;
+		expect(settleSignal?.aborted).toBe(true);
+		expect(fetchMock).toHaveBeenCalledTimes(2);
+	});
+
+	it.each(["inactive", "paused", "completed", "cancelled", "blocked", "stalled", "budget_exhausted"])(
+		"does not continue a %s Goal decision",
+		async (state) => {
+			const fetchMock = vi.fn(async (url: string) => ({
+				ok: true,
+				status: 200,
+				json: async () =>
+					url.endsWith("/goal-settle")
+						? { ok: true, result: { state } }
+						: {
+								ok: true,
+								result: {
+									plan: { status: "approved", items: [] },
+									goal: { configured: true, status: "active" },
+									actGate: { allowed: true },
+								},
+							},
+			}));
+			vi.stubGlobal("fetch", fetchMock);
+			const handlers = register(
+				createWorkflowControlExtension({
+					bridge: {
+						sessionId: "agent:terminal-goal",
+						registry: {} as never,
+						gatewayUrl: "http://127.0.0.1:8766/api/agent/tool/execute",
+					},
+				}),
+			);
+			await handlers.get("before_agent_start")?.({ prompt: "继续", systemPrompt: "base" });
+
+			await expect(handlers.get("before_agent_settle")?.(settleEvent)).resolves.toBeUndefined();
+			expect(fetchMock).toHaveBeenCalledTimes(2);
+		},
+	);
+
+	it.each(["error", "aborted"] as const)("does not continue after a %s Provider turn", async (stopReason) => {
+		const fetchMock = vi.fn(async () => ({
+			ok: true,
+			status: 200,
+			json: async () => ({
+				ok: true,
+				result: {
+					plan: { status: "approved", items: [] },
+					goal: { configured: true, status: "active" },
+					actGate: { allowed: true },
+				},
+			}),
+		}));
+		vi.stubGlobal("fetch", fetchMock);
+		const handlers = register(
+			createWorkflowControlExtension({
+				bridge: {
+					sessionId: "agent:failed-goal",
+					registry: {} as never,
+					gatewayUrl: "http://127.0.0.1:8766/api/agent/tool/execute",
+				},
+			}),
+		);
+		await handlers.get("before_agent_start")?.({ prompt: "继续", systemPrompt: "base" });
+
+		await expect(
+			handlers.get("before_agent_settle")?.({
+				...settleEvent,
+				message: { ...settleEvent.message, stopReason },
+			}),
+		).resolves.toBeUndefined();
+		expect(fetchMock).toHaveBeenCalledTimes(1);
+	});
+
+	it("leaves settle ownership to the active Room lifecycle", async () => {
+		const fetchMock = vi.fn(async () => ({
+			ok: true,
+			status: 200,
+			json: async () => ({
+				ok: true,
+				result: {
+					plan: { status: "draft", items: [] },
+					goal: { configured: true, status: "active" },
+					actGate: { allowed: true },
+				},
+			}),
+		}));
+		vi.stubGlobal("fetch", fetchMock);
+		const handlers = register(
+			createWorkflowControlExtension({
+				bridge: {
+					sessionId: "agent:room-goal",
+					registry: {} as never,
+					gatewayUrl: "http://127.0.0.1:8766/api/agent/tool/execute",
+				},
+				hasActiveRoom: () => true,
+			}),
+		);
+		await handlers.get("before_agent_start")?.({ prompt: "继续 Room", systemPrompt: "base" });
+
+		await expect(handlers.get("before_agent_settle")?.(settleEvent)).resolves.toBeUndefined();
+		expect(fetchMock).toHaveBeenCalledTimes(1);
 	});
 
 	it("does not call goal usage when the Session has no active Goal", async () => {

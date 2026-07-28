@@ -589,6 +589,7 @@ export class PiProductSession implements PooledSession {
 				}),
 				createWorkflowControlExtension({
 					bridge: backendBridge,
+					hasActiveRoom: () => productSession?.activeRoom !== undefined,
 					onProjectComplete: (details) => lifecycleHooks.projectComplete(details),
 				}),
 				createRoomResourceLimitExtension(
@@ -1393,10 +1394,30 @@ export class PiProductSession implements PooledSession {
 		}
 		const turn = { turnId: randomUUID(), clientMessageId: options.clientMessageId };
 		this.activeTurn = turn;
-		if (options.sessionContext !== undefined) {
-			this.sessionContext = options.sessionContext.trim();
+		const previousSessionContext = this.sessionContext;
+		const nextSessionContext =
+			options.sessionContext !== undefined ? options.sessionContext.trim() : previousSessionContext;
+		const nextTransientContext = options.transientContext?.trim() ?? "";
+		if (
+			!this.activeRoom &&
+			options.sessionContext !== undefined &&
+			previousSessionContext.length > 0 &&
+			previousSessionContext !== nextSessionContext
+		) {
+			// ProviderContextJournal is append-only inside an epoch.  A changed
+			// ordinary-Session memory snapshot must therefore start a new epoch;
+			// otherwise superseded Atom text from the previous turn remains in
+			// the Provider system prompt beside the replacement.
+			this.providerContextJournal.beginEpoch("session_memory_refresh", this.session.systemPrompt, {
+				roomContext: this.roomContext,
+				sessionContext: nextSessionContext,
+				transientContext: nextTransientContext,
+			});
 		}
-		this.transientContext = options.transientContext?.trim() ?? "";
+		if (options.sessionContext !== undefined) {
+			this.sessionContext = nextSessionContext;
+		}
+		this.transientContext = nextTransientContext;
 		let preflightSettled = false;
 		let preflightFallback: ReturnType<typeof setTimeout> | undefined;
 		return new Promise<ActiveTurn>((accept, reject) => {
