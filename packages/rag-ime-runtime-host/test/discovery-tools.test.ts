@@ -167,6 +167,55 @@ describe("runtime discovery tools", () => {
 		}
 	});
 
+	it("keeps grill-me-docs deferred until an ordinary Agent explicitly loads it", async () => {
+		const root = await mkdtemp(join(tmpdir(), "pi-runtime-grill-me-docs-"));
+		try {
+			const filePath = join(root, "SKILL.md");
+			await writeFile(
+				filePath,
+				[
+					"---",
+					"name: grill-me-docs",
+					"description: Preserve a user-confirmed durable decision.",
+					"---",
+					"",
+					"Ask one consequential question, then document only the user's confirmed decision.",
+				].join("\n"),
+			);
+			const grillMeDocs = skill({
+				name: "grill-me-docs",
+				description: "Preserve a user-confirmed durable decision.",
+				filePath,
+				routing: {
+					when: ["User asks for an ADR, glossary, or durable decision record."],
+					notFor: ["Routine repair or an ordinary Room stage."],
+					input: "Verified evidence and one user-owned choice.",
+					output: "A confirmed decision or an explicitly open question.",
+					does: "Records only a user-confirmed durable decision.",
+				},
+			});
+
+			const beforeExplicitLoad = searchSkills([grillMeDocs], {
+				query: "ADR glossary durable decision",
+			});
+			expect(beforeExplicitLoad.items).toEqual([expect.objectContaining({ name: "grill-me-docs" })]);
+			expect(JSON.stringify(beforeExplicitLoad)).not.toContain("<loaded_skill");
+
+			const loaded = await loadSkill([grillMeDocs], { name: "grill-me-docs" });
+			expect(loaded.text).toContain('<loaded_skill name="grill-me-docs" revision="sha256:');
+			expect(loaded.text).toContain("Ask one consequential question");
+			expect(loaded.text).not.toContain("description: Preserve a user-confirmed durable decision.");
+
+			expect(
+				searchSkills([grillMeDocs], { query: "ADR glossary durable decision" }, ["grill-me-docs"]).items as Array<{
+					name: string;
+				}>,
+			).toEqual([]);
+		} finally {
+			await rm(root, { recursive: true, force: true });
+		}
+	});
+
 	it("keeps active Skill bodies mutually exclusive with deferred search and load", async () => {
 		const active = skill({
 			name: "managed-task-execution",

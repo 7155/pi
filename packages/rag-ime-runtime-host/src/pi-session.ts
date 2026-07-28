@@ -26,7 +26,7 @@ import {
 } from "./discovery-tools.ts";
 import { createLifecycleHookController } from "./lifecycle-hooks.ts";
 import { createMemoryCaptureExtension, prepareGovernedMemoryCapture } from "./memory-capture-tool.ts";
-import { createNativeWorkspaceToolsExtension } from "./native-workspace-tools.ts";
+import { bootstrapNativeWorkspaceToolTargets, createNativeWorkspaceToolsExtension } from "./native-workspace-tools.ts";
 import { PROTOCOL_VERSION, type RuntimeEventEnvelope, RuntimeProtocolError } from "./protocol.ts";
 import { createProviderContextJournalExtension, ProviderContextJournal } from "./provider-context-journal.ts";
 import { roomSkillPromptFocus, roomToolPromptFocus } from "./room-prompt-catalog.ts";
@@ -631,6 +631,7 @@ export class PiProductSession implements PooledSession {
 		});
 		await resourceLoader.reload();
 		await bootstrapRoomTools(backendBridge);
+		await bootstrapNativeWorkspaceToolTargets(backendBridge);
 		await prepareGovernedMemoryCapture(backendBridge);
 		let roomSkillLoad: RoomSkillLoadReceipt | undefined;
 		const requiredSkill = requiredRoomSkill(options.roomSkillPolicy);

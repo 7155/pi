@@ -15,6 +15,7 @@ import {
 	FIND_TOOL_NAME,
 	GREP_TOOL_NAME,
 	LS_TOOL_NAME,
+	NATIVE_WORKSPACE_TOOL_NAMES,
 	READ_TOOL_NAME,
 	WRITE_TOOL_NAME,
 } from "./runtime-tool-names.ts";
@@ -23,6 +24,7 @@ import {
 	type BackendToolBridgeOptions,
 	type BackendToolManifest,
 	createProjectedBackendToolDefinition,
+	requestGovernedNativeTargetLoads,
 } from "./tool-bridge.ts";
 import { isToolResultHandle } from "./tool-result-store.ts";
 
@@ -55,6 +57,44 @@ function projectionTarget(
 		if (projection) return { manifest, operation: projection.operation };
 	}
 	return undefined;
+}
+
+function nativeWorkspaceTargets(options: BackendToolBridgeOptions): string[] {
+	const nativeNames = new Set<string>(NATIVE_WORKSPACE_TOOL_NAMES);
+	return options.registry
+		.list()
+		.filter(
+			(tool) =>
+				tool.modelVisible === false &&
+				tool.runtimeProjections?.some((projection) => nativeNames.has(projection.name)),
+		)
+		.map((tool) => tool.name);
+}
+
+/** Bind resident native coding tools to their hidden governed Room targets. */
+export async function bootstrapNativeWorkspaceToolTargets(options: BackendToolBridgeOptions): Promise<string[]> {
+	if (!options.roomCapability || !options.gatewayUrl) return [];
+	const targetNames = nativeWorkspaceTargets(options);
+	const manifestHash = String(options.roomCapability.manifestHash ?? "").slice(0, 16) || "room";
+	const loaded: Array<{ name: string; receiptId: string }> = [];
+	for (let index = 0; index < targetNames.length; index += 4) {
+		const batch = targetNames.slice(index, index + 4).map((name) => ({
+			name,
+			receiptId: `load:native:${options.sessionId}:${manifestHash}:${name}`,
+		}));
+		const receipts = await requestGovernedNativeTargetLoads(options, batch);
+		for (const [offset, item] of receipts.entries()) {
+			const receiptId = typeof item?.receiptId === "string" ? item.receiptId : "";
+			if (!receiptId) {
+				throw new Error(`Native coding target load failed: ${batch[offset].name}`);
+			}
+			loaded.push({ name: batch[offset].name, receiptId });
+		}
+	}
+	for (const item of loaded) {
+		options.registry.recordLoadReceipt(item.name, item.receiptId);
+	}
+	return loaded.map((item) => item.name);
 }
 
 function resultReceipt(details: Record<string, unknown>): Record<string, unknown> {

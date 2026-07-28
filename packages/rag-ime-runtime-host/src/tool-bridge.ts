@@ -1,7 +1,7 @@
 import { createHash } from "node:crypto";
 import type { InlineExtension, ToolDefinition } from "@earendil-works/pi-coding-agent";
 import { RuntimeProtocolError } from "./protocol.ts";
-import { RESERVED_RUNTIME_TOOL_NAMES } from "./runtime-tool-names.ts";
+import { NATIVE_WORKSPACE_TOOL_NAMES, RESERVED_RUNTIME_TOOL_NAMES } from "./runtime-tool-names.ts";
 import { modelVisibleResult, modelVisibleToolGatewayResult, ToolArtifactBuffer } from "./tool-artifact-buffer.ts";
 import type { ToolResultStore } from "./tool-result-store.ts";
 
@@ -560,6 +560,69 @@ export async function requestGovernedToolLoads(
 	});
 }
 
+/**
+ * Preload only hidden execution targets owned by the resident native coding
+ * tools. This is deliberately separate from tool_load: the target schemas stay
+ * absent from ToolSearch and Provider context while Room authorization still
+ * receives an exact, hash-bound load receipt.
+ */
+export async function requestGovernedNativeTargetLoads(
+	options: BackendToolBridgeOptions,
+	loads: ReadonlyArray<{ name: string; receiptId: string }>,
+	signal?: AbortSignal,
+): Promise<Array<Record<string, unknown> | undefined>> {
+	if (loads.length < 1 || loads.length > 4) {
+		throw new RuntimeProtocolError("INVALID_PARAMS", "Native target load batch must contain one to four items");
+	}
+	if (!options.roomCapability) return loads.map(() => undefined);
+	const nativeNames = new Set<string>(NATIVE_WORKSPACE_TOOL_NAMES);
+	for (const load of loads) {
+		const target = options.registry.get(load.name);
+		if (
+			!target ||
+			target.modelVisible !== false ||
+			!target.runtimeProjections?.some((projection) => nativeNames.has(projection.name))
+		) {
+			throw new RuntimeProtocolError("TOOL_NOT_FOUND", `Unknown native coding target: ${load.name}`);
+		}
+	}
+	const governed = await requestProductGateway(
+		options,
+		"load",
+		{
+			sessionId: options.sessionId,
+			loads: loads.map((load) => ({
+				receiptId: load.receiptId,
+				toolName: load.name,
+			})),
+			createdAtMs: Date.now(),
+		},
+		signal,
+	);
+	const items = governed.result?.items;
+	if (!Array.isArray(items) || items.length !== loads.length) {
+		throw new RuntimeProtocolError(
+			"INVALID_TOOL_RECEIPT",
+			"Native target load batch returned an invalid receipt set",
+		);
+	}
+	return items.map((item, index) => {
+		if (
+			typeof item !== "object" ||
+			item === null ||
+			Array.isArray(item) ||
+			(item as Record<string, unknown>).receiptId !== loads[index].receiptId ||
+			(item as Record<string, unknown>).toolName !== loads[index].name
+		) {
+			throw new RuntimeProtocolError(
+				"INVALID_TOOL_RECEIPT",
+				`Native target load receipt does not match request: ${loads[index].name}`,
+			);
+		}
+		return item as Record<string, unknown>;
+	});
+}
+
 /** Rebind disclosed schemas to the active Dispatch without reinjecting them. */
 export async function rebindGovernedToolReceipts(
 	options: BackendToolBridgeOptions,
@@ -567,11 +630,39 @@ export async function rebindGovernedToolReceipts(
 ): Promise<Array<{ name: string; receiptId: string }>> {
 	if (!options.roomCapability || !options.gatewayUrl) return [];
 	const rebound: Array<{ name: string; receiptId: string }> = [];
+	const nativeNames = new Set<string>(NATIVE_WORKSPACE_TOOL_NAMES);
+	const nativeTargets: Array<{ name: string; receiptId: string }> = [];
+	const regularTargets: Array<{ name: string; receiptId: string }> = [];
 	for (const item of options.registry.rebindableLoadReceipts()) {
-		const result = await requestGovernedToolLoad(options, item.name, `load:rebind:${dispatchId}:${item.name}`);
+		const manifest = options.registry.get(item.name);
+		const target = {
+			name: item.name,
+			receiptId: `load:rebind:${dispatchId}:${item.name}`,
+		};
+		if (
+			manifest?.modelVisible === false &&
+			manifest.runtimeProjections?.some((projection) => nativeNames.has(projection.name))
+		) {
+			nativeTargets.push(target);
+		} else {
+			regularTargets.push(target);
+		}
+	}
+	for (const item of regularTargets) {
+		const result = await requestGovernedToolLoad(options, item.name, item.receiptId);
 		const receiptId = String(result?.receiptId ?? "");
 		options.registry.recordLoadReceipt(item.name, receiptId);
 		rebound.push({ name: item.name, receiptId });
+	}
+	for (let index = 0; index < nativeTargets.length; index += 4) {
+		const batch = nativeTargets.slice(index, index + 4);
+		const receipts = await requestGovernedNativeTargetLoads(options, batch);
+		for (const [offset, result] of receipts.entries()) {
+			const item = batch[offset];
+			const receiptId = String(result?.receiptId ?? "");
+			options.registry.recordLoadReceipt(item.name, receiptId);
+			rebound.push({ name: item.name, receiptId });
+		}
 	}
 	return rebound;
 }

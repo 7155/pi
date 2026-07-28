@@ -11,12 +11,19 @@ export const DETERMINISTIC_TEST_PROVIDER = "rag-ime-deterministic";
 export const DETERMINISTIC_TEST_MODEL = "room-v2-test";
 const CONTEXT_EPOCH_SCENARIO = "context-epoch";
 const PROJECT_TASK_SCENARIO = "project-task";
+const PROJECT_TOOL_RECOVERY_SCENARIO = "project-tool-recovery";
 const PROJECT_COLLABORATION_SCENARIO = "project-collaboration";
 const AGENT_SESSION_SCENARIO = "agent-session";
 const AGENT_SESSION_TASK_MARKER = "AGENT-SESSION-RESILIENCE";
 const AGENT_SESSION_FINAL_MARKER = "AGENT-SESSION-CANARY-OK";
 const AGENT_SESSION_RECOVERY_MARKER = "AGENT-SESSION-RECOVERY-OK";
 const AGENT_SESSION_SKILL = "test-driven-implementation";
+const PROJECT_TOOL_RECOVERY_MARKER = "PROJECT-TOOL-RECOVERY-CANARY";
+
+// Coding tools are resident Pi tools. Their hidden governed targets are bound
+// during runtime bootstrap, so a model must never spend turns loading the
+// backend-only workspace_* names.
+const NATIVE_CODING_TOOL_NAMES = ["ls", "find", "grep", "read", "edit", "bash"] as const;
 
 function contextText(context: Context): string {
 	return JSON.stringify({ systemPrompt: context.systemPrompt ?? "", messages: context.messages });
@@ -49,6 +56,20 @@ function contextHasJsonField(context: Context, field: string, expected: unknown)
 		} catch {}
 	}
 	return false;
+}
+
+function contextHasNonzeroExitCode(context: Context): boolean {
+	return parsedContextRecords(context).some((record) => {
+		const exitCode = record.exitCode;
+		return typeof exitCode === "number" && Number.isFinite(exitCode) && exitCode !== 0;
+	});
+}
+
+function requireResidentNativeCodingTools(tools: Set<string>, names: readonly string[]): void {
+	const missing = names.filter((name) => !tools.has(name));
+	if (missing.length > 0) {
+		throw new Error(`Native coding tools must be resident before model execution: ${missing.join(", ")}`);
+	}
 }
 
 function contextHasLoadedSkill(context: Context, name: string): boolean {
@@ -163,25 +184,18 @@ export function contextEpochCanaryResponse(context: Context): AssistantMessage {
 	const serialized = contextText(context);
 	const tools = activeToolNames(context);
 	const prefix = `epoch-${epoch}`;
-	if (!tools.has("workspace_read")) {
-		return fauxAssistantMessage(
-			fauxToolCall("tool_load", { name: "workspace_read" }, { id: `${prefix}-load-read` }),
-			{
-				stopReason: "toolUse",
-			},
-		);
-	}
+	requireResidentNativeCodingTools(tools, ["read"]);
 	if (!serialized.includes(`${prefix}-read-a`)) {
 		return fauxAssistantMessage(
 			[
 				fauxToolCall(
-					"workspace_read",
-					{ op: "read", path: "rag_ime/agent_service.py", offset: 0, limit: 65_536 },
+					"read",
+					{ path: "rag_ime/agent_service.py", offset: 0, limit: 65_536 },
 					{ id: `${prefix}-read-a` },
 				),
 				fauxToolCall(
-					"workspace_read",
-					{ op: "read", path: "rag_ime/agent_room_kernel.py", offset: 0, limit: 65_536 },
+					"read",
+					{ path: "rag_ime/agent_room_kernel.py", offset: 0, limit: 65_536 },
 					{ id: `${prefix}-read-b` },
 				),
 			],
@@ -229,38 +243,47 @@ export function contextEpochCanaryResponse(context: Context): AssistantMessage {
 	return fauxAssistantMessage(`CANARY-${epoch}-OK`);
 }
 
-/** Drive an approved read, patch, test, publish and settle task in an isolated project. */
+/** Drive an approved read, edit, test, publish and settle task in an isolated project. */
 export function projectTaskCanaryResponse(context: Context): AssistantMessage {
 	const task = currentRoomTask(context);
-	if (!task || !task.includes("PROJECT-TASK-CANARY")) {
-		return fauxAssistantMessage("A managed PROJECT-TASK-CANARY dispatch is required.");
+	const recovery = task?.includes(PROJECT_TOOL_RECOVERY_MARKER) === true;
+	if (!task || (!task.includes("PROJECT-TASK-CANARY") && !recovery)) {
+		return fauxAssistantMessage(
+			"A managed PROJECT-TASK-CANARY or PROJECT-TOOL-RECOVERY-CANARY dispatch is required.",
+		);
 	}
 	const serialized = contextText(context);
 	const tools = activeToolNames(context);
-	const requiredDiscoveryTools = ["workspace_list", "workspace_search", "workspace_read"];
-	const missingDiscoveryTools = requiredDiscoveryTools.filter((name) => !tools.has(name));
-	if (missingDiscoveryTools.length > 0) {
+	requireResidentNativeCodingTools(tools, NATIVE_CODING_TOOL_NAMES);
+	if (recovery && !serialized.includes("project-missing-read")) {
 		return fauxAssistantMessage(
-			missingDiscoveryTools.map((name) => fauxToolCall("tool_load", { name }, { id: `project-load-${name}` })),
+			fauxToolCall(
+				"read",
+				{ path: "missing_requirements.md", offset: 0, limit: 16_384 },
+				{ id: "project-missing-read" },
+			),
 			{ stopReason: "toolUse" },
 		);
 	}
 	if (!serialized.includes("project-list")) {
-		return fauxAssistantMessage(
-			fauxToolCall("workspace_list", { op: "list", path: ".", depth: 2, limit: 50 }, { id: "project-list" }),
-			{ stopReason: "toolUse" },
-		);
+		return fauxAssistantMessage(fauxToolCall("ls", { path: ".", limit: 50 }, { id: "project-list" }), {
+			stopReason: "toolUse",
+		});
 	}
 	if (!serialized.includes("project-search")) {
+		if (!serialized.includes("project-find")) {
+			return fauxAssistantMessage(
+				fauxToolCall("find", { pattern: "*.py", path: ".", limit: 20 }, { id: "project-find" }),
+				{ stopReason: "toolUse" },
+			);
+		}
 		return fauxAssistantMessage(
 			fauxToolCall(
-				"workspace_search",
+				"grep",
 				{
-					op: "search",
-					query: "ROOM_PROJECT_TASK",
+					pattern: "ROOM_PROJECT_TASK",
 					path: ".",
-					mode: "both",
-					caseSensitive: true,
+					literal: true,
 					limit: 20,
 				},
 				{ id: "project-search" },
@@ -271,37 +294,38 @@ export function projectTaskCanaryResponse(context: Context): AssistantMessage {
 	if (!serialized.includes("project-read-app")) {
 		return fauxAssistantMessage(
 			[
-				fauxToolCall(
-					"workspace_read",
-					{ op: "read", path: "calculator.py", offset: 0, limit: 16_384 },
-					{ id: "project-read-app" },
-				),
-				fauxToolCall(
-					"workspace_read",
-					{ op: "read", path: "test_calculator.py", offset: 0, limit: 16_384 },
-					{ id: "project-read-test" },
-				),
+				fauxToolCall("read", { path: "calculator.py", offset: 0, limit: 16_384 }, { id: "project-read-app" }),
+				fauxToolCall("read", { path: "test_calculator.py", offset: 0, limit: 16_384 }, { id: "project-read-test" }),
 			],
 			{ stopReason: "toolUse" },
 		);
 	}
-	if (!tools.has("workspace_patch")) {
+	if (recovery && !serialized.includes("project-baseline-test")) {
 		return fauxAssistantMessage(
-			fauxToolCall("tool_load", { name: "workspace_patch" }, { id: "project-load-patch" }),
+			fauxToolCall(
+				"bash",
+				{ command: "/usr/bin/python3 -m unittest -v", timeout: 30 },
+				{ id: "project-baseline-test" },
+			),
 			{ stopReason: "toolUse" },
 		);
+	}
+	if (recovery && !contextHasNonzeroExitCode(context)) {
+		throw new Error("The project recovery canary requires one failed baseline test receipt before repair");
 	}
 	if (!serialized.includes("project-patch")) {
 		return fauxAssistantMessage(
 			fauxToolCall(
-				"workspace_patch",
+				"edit",
 				{
-					op: "apply",
 					path: "calculator.py",
-					oldText: '    raise NotImplementedError("ROOM_PROJECT_TASK")',
-					newText:
-						"    if not values:\n        return []\n    minimum = min(values)\n    return [value - minimum for value in values]",
-					expectedOccurrences: 1,
+					edits: [
+						{
+							oldText: '    raise NotImplementedError("ROOM_PROJECT_TASK")',
+							newText:
+								"    if not values:\n        return []\n    minimum = min(values)\n    return [value - minimum for value in values]",
+						},
+					],
 				},
 				{ id: "project-patch" },
 			),
@@ -311,25 +335,9 @@ export function projectTaskCanaryResponse(context: Context): AssistantMessage {
 	if (!contextHasJsonField(context, "mutationApplied", true)) {
 		throw new Error("The approved project patch did not produce an applied receipt");
 	}
-	if (!tools.has("workspace_shell")) {
-		return fauxAssistantMessage(
-			fauxToolCall("tool_load", { name: "workspace_shell" }, { id: "project-load-shell" }),
-			{ stopReason: "toolUse" },
-		);
-	}
 	if (!serialized.includes("project-test")) {
 		return fauxAssistantMessage(
-			fauxToolCall(
-				"workspace_shell",
-				{
-					op: "run",
-					command: "/usr/bin/python3 -m unittest -v",
-					cwd: ".",
-					timeoutSeconds: 30,
-					allowNetwork: false,
-				},
-				{ id: "project-test" },
-			),
+			fauxToolCall("bash", { command: "/usr/bin/python3 -m unittest -v", timeout: 30 }, { id: "project-test" }),
 			{ stopReason: "toolUse" },
 		);
 	}
@@ -427,7 +435,7 @@ export function projectCollaborationCanaryResponse(context: Context): AssistantM
 						intent: "review",
 						objective:
 							"B 先调用 room_state，再独立读取 calculator.py 与 test_calculator.py；" +
-							"不得调用 workspace_patch 或 workspace_shell；room_post 以 COLLAB-B-REVIEWED 开头，" +
+							"不得调用 edit 或 bash；room_post 以 COLLAB-B-REVIEWED 开头，" +
 							"最后用 room_commit 交付 COLLAB-B-COMMIT-RESULT 和 AC 证据。",
 						expectedOutput: "B 交付只读测试意图复核与两份文件证据。",
 						acceptance: currentAcceptanceAliases(context, task).filter((alias) => alias === "AC-4"),
@@ -439,42 +447,28 @@ export function projectCollaborationCanaryResponse(context: Context): AssistantM
 		}
 	}
 
-	if (!tools.has("workspace_read")) {
-		return fauxAssistantMessage(fauxToolCall("tool_load", { name: "workspace_read" }, { id: callId("load-read") }), {
-			stopReason: "toolUse",
-		});
-	}
+	requireResidentNativeCodingTools(tools, member === "A" || member === "C" ? NATIVE_CODING_TOOL_NAMES : ["read"]);
 	if (member === "A" && !serialized.includes(callId("missing-read"))) {
 		return fauxAssistantMessage(
 			fauxToolCall(
-				"workspace_read",
-				{ op: "read", path: "missing_requirements.md", offset: 0, limit: 16_384 },
+				"read",
+				{ path: "missing_requirements.md", offset: 0, limit: 16_384 },
 				{ id: callId("missing-read") },
 			),
 			{ stopReason: "toolUse" },
 		);
 	}
 	if (member === "A") {
-		const missingDiscoveryTools = ["workspace_list", "workspace_search"].filter((name) => !tools.has(name));
-		if (missingDiscoveryTools.length > 0) {
-			return fauxAssistantMessage(
-				missingDiscoveryTools.map((name) =>
-					fauxToolCall("tool_load", { name }, { id: callId(`load-${name.replace("workspace_", "")}`) }),
-				),
-				{ stopReason: "toolUse" },
-			);
-		}
 		if (!serialized.includes(callId("list"))) {
-			return fauxAssistantMessage(
-				fauxToolCall("workspace_list", { op: "list", path: ".", depth: 2, limit: 50 }, { id: callId("list") }),
-				{ stopReason: "toolUse" },
-			);
+			return fauxAssistantMessage(fauxToolCall("ls", { path: ".", limit: 50 }, { id: callId("list") }), {
+				stopReason: "toolUse",
+			});
 		}
 		if (!serialized.includes(callId("search"))) {
 			return fauxAssistantMessage(
 				fauxToolCall(
-					"workspace_search",
-					{ op: "search", query: "ROOM_PROJECT_TASK", path: ".", mode: "both", caseSensitive: true, limit: 20 },
+					"grep",
+					{ pattern: "ROOM_PROJECT_TASK", path: ".", literal: true, limit: 20 },
 					{ id: callId("search") },
 				),
 				{ stopReason: "toolUse" },
@@ -484,65 +478,37 @@ export function projectCollaborationCanaryResponse(context: Context): AssistantM
 	if (!serialized.includes(callId("read-app"))) {
 		return fauxAssistantMessage(
 			[
-				fauxToolCall(
-					"workspace_read",
-					{ op: "read", path: "calculator.py", offset: 0, limit: 16_384 },
-					{ id: callId("read-app") },
-				),
-				fauxToolCall(
-					"workspace_read",
-					{ op: "read", path: "test_calculator.py", offset: 0, limit: 16_384 },
-					{ id: callId("read-test") },
-				),
+				fauxToolCall("read", { path: "calculator.py", offset: 0, limit: 16_384 }, { id: callId("read-app") }),
+				fauxToolCall("read", { path: "test_calculator.py", offset: 0, limit: 16_384 }, { id: callId("read-test") }),
 			],
 			{ stopReason: "toolUse" },
 		);
 	}
 
 	if (member === "A" || member === "C") {
-		if (!tools.has("workspace_shell")) {
-			return fauxAssistantMessage(
-				fauxToolCall("tool_load", { name: "workspace_shell" }, { id: callId("load-shell") }),
-				{ stopReason: "toolUse" },
-			);
-		}
 		const shellId = member === "A" ? callId("baseline-shell") : callId("acceptance-shell");
 		if (!serialized.includes(shellId)) {
 			return fauxAssistantMessage(
-				fauxToolCall(
-					"workspace_shell",
-					{
-						op: "run",
-						command: "/usr/bin/python3 -m unittest -v",
-						cwd: ".",
-						timeoutSeconds: 30,
-						allowNetwork: false,
-					},
-					{ id: shellId },
-				),
+				fauxToolCall("bash", { command: "/usr/bin/python3 -m unittest -v", timeout: 30 }, { id: shellId }),
 				{ stopReason: "toolUse" },
 			);
 		}
 	}
 
 	if (member === "A") {
-		if (!tools.has("workspace_patch")) {
-			return fauxAssistantMessage(
-				fauxToolCall("tool_load", { name: "workspace_patch" }, { id: callId("load-patch") }),
-				{ stopReason: "toolUse" },
-			);
-		}
 		if (!serialized.includes(callId("patch"))) {
 			return fauxAssistantMessage(
 				fauxToolCall(
-					"workspace_patch",
+					"edit",
 					{
-						op: "apply",
 						path: "calculator.py",
-						oldText: '    raise NotImplementedError("ROOM_PROJECT_TASK")',
-						newText:
-							"    if not values:\n        return []\n    minimum = min(values)\n    return [value - minimum for value in values]",
-						expectedOccurrences: 1,
+						edits: [
+							{
+								oldText: '    raise NotImplementedError("ROOM_PROJECT_TASK")',
+								newText:
+									"    if not values:\n        return []\n    minimum = min(values)\n    return [value - minimum for value in values]",
+							},
+						],
 					},
 					{ id: callId("patch") },
 				),
@@ -555,14 +521,8 @@ export function projectCollaborationCanaryResponse(context: Context): AssistantM
 		if (!serialized.includes(callId("regression-shell"))) {
 			return fauxAssistantMessage(
 				fauxToolCall(
-					"workspace_shell",
-					{
-						op: "run",
-						command: "/usr/bin/python3 -m unittest -v",
-						cwd: ".",
-						timeoutSeconds: 30,
-						allowNetwork: false,
-					},
+					"bash",
+					{ command: "/usr/bin/python3 -m unittest -v", timeout: 30 },
 					{ id: callId("regression-shell") },
 				),
 				{ stopReason: "toolUse" },
@@ -611,7 +571,7 @@ export function projectCollaborationCanaryResponse(context: Context): AssistantM
 						intent: "close",
 						nextTask:
 							"C 先调用 room_state，独立读取 calculator.py 与 test_calculator.py；" +
-							"运行 /usr/bin/python3 -m unittest -v，不得调用 workspace_patch；" +
+							"运行 /usr/bin/python3 -m unittest -v，不得调用 edit；" +
 							"room_post 以 COLLAB-C-ACCEPTED 开头；最后用 room_commit 交付 " +
 							"COLLAB-C-COMMIT-RESULT，并覆盖全部 AC 验收别名。",
 						expectedOutput: "C 交付独立测试验收证据并最终关闭 Root。",
@@ -666,45 +626,31 @@ export function agentSessionCanaryResponse(context: Context): AssistantMessage {
 			{ stopReason: "toolUse" },
 		);
 	}
-	if (!tools.has("workspace_read")) {
-		return fauxAssistantMessage(fauxToolCall("tool_load", { name: "workspace_read" }, { id: "agent-load-read" }), {
-			stopReason: "toolUse",
-		});
-	}
+	requireResidentNativeCodingTools(tools, NATIVE_CODING_TOOL_NAMES);
 	if (!serialized.includes("agent-missing-read")) {
 		return fauxAssistantMessage(
 			fauxToolCall(
-				"workspace_read",
-				{ op: "read", path: "missing_requirements.md", offset: 0, limit: 16_384 },
+				"read",
+				{ path: "missing_requirements.md", offset: 0, limit: 16_384 },
 				{ id: "agent-missing-read" },
 			),
 			{ stopReason: "toolUse" },
 		);
 	}
 
-	const discoveryTools = ["workspace_list", "workspace_search"].filter((name) => !tools.has(name));
-	if (discoveryTools.length > 0) {
-		return fauxAssistantMessage(
-			discoveryTools.map((name) => fauxToolCall("tool_load", { name }, { id: `agent-load-${name}` })),
-			{ stopReason: "toolUse" },
-		);
-	}
 	if (!serialized.includes("agent-list")) {
-		return fauxAssistantMessage(
-			fauxToolCall("workspace_list", { op: "list", path: ".", depth: 2, limit: 50 }, { id: "agent-list" }),
-			{ stopReason: "toolUse" },
-		);
+		return fauxAssistantMessage(fauxToolCall("ls", { path: ".", limit: 50 }, { id: "agent-list" }), {
+			stopReason: "toolUse",
+		});
 	}
 	if (!serialized.includes("agent-search")) {
 		return fauxAssistantMessage(
 			fauxToolCall(
-				"workspace_search",
+				"grep",
 				{
-					op: "search",
-					query: "ROOM_PROJECT_TASK",
+					pattern: "ROOM_PROJECT_TASK",
 					path: ".",
-					mode: "both",
-					caseSensitive: true,
+					literal: true,
 					limit: 20,
 				},
 				{ id: "agent-search" },
@@ -715,16 +661,8 @@ export function agentSessionCanaryResponse(context: Context): AssistantMessage {
 	if (!serialized.includes("agent-read-app")) {
 		return fauxAssistantMessage(
 			[
-				fauxToolCall(
-					"workspace_read",
-					{ op: "read", path: "calculator.py", offset: 0, limit: 16_384 },
-					{ id: "agent-read-app" },
-				),
-				fauxToolCall(
-					"workspace_read",
-					{ op: "read", path: "test_calculator.py", offset: 0, limit: 16_384 },
-					{ id: "agent-read-test" },
-				),
+				fauxToolCall("read", { path: "calculator.py", offset: 0, limit: 16_384 }, { id: "agent-read-app" }),
+				fauxToolCall("read", { path: "test_calculator.py", offset: 0, limit: 16_384 }, { id: "agent-read-test" }),
 			],
 			{ stopReason: "toolUse" },
 		);
@@ -735,11 +673,7 @@ export function agentSessionCanaryResponse(context: Context): AssistantMessage {
 			throw new Error("The Agent Session boundary read did not return a structured receipt");
 		}
 		return fauxAssistantMessage(
-			fauxToolCall(
-				"workspace_read",
-				{ op: "read", path: "read-boundary.txt", offset: 0, limit: 65_536 },
-				{ id: "agent-read-boundary-0" },
-			),
+			fauxToolCall("read", { path: "read-boundary.txt", offset: 0, limit: 65_536 }, { id: "agent-read-boundary-0" }),
 			{ stopReason: "toolUse" },
 		);
 	}
@@ -749,29 +683,25 @@ export function agentSessionCanaryResponse(context: Context): AssistantMessage {
 		Number(boundaryReceipt.modelResultLimitBytes) !== 50 * 1024 ||
 		Buffer.byteLength(JSON.stringify(boundaryReceipt), "utf8") > 50 * 1024
 	) {
-		throw new Error("workspace_read exceeded the Pi model-visible result budget");
+		throw new Error("read exceeded the Pi model-visible result budget");
 	}
 	if (boundaryReceipt.truncated === true) {
 		const nextOffset = Number(boundaryReceipt.nextOffset);
 		const currentOffset = Number(boundaryReceipt.offset);
 		if (!Number.isSafeInteger(nextOffset) || nextOffset <= currentOffset) {
-			throw new Error("workspace_read did not advance its UTF-8 continuation offset");
+			throw new Error("read did not advance its UTF-8 continuation offset");
 		}
 		const callId = `agent-read-boundary-${nextOffset}`;
 		if (serialized.includes(`"id":"${callId}"`)) {
 			throw new Error("The Agent Session boundary continuation did not advance");
 		}
 		return fauxAssistantMessage(
-			fauxToolCall(
-				"workspace_read",
-				{ op: "read", path: "read-boundary.txt", offset: nextOffset, limit: 65_536 },
-				{ id: callId },
-			),
+			fauxToolCall("read", { path: "read-boundary.txt", offset: nextOffset, limit: 65_536 }, { id: callId }),
 			{ stopReason: "toolUse" },
 		);
 	}
 	if (Number(boundaryReceipt.nextOffset) !== Number(boundaryReceipt.byteSize)) {
-		throw new Error("workspace_read ended before the boundary fixture was fully consumed");
+		throw new Error("read ended before the boundary fixture was fully consumed");
 	}
 
 	if (!tools.has("agent_plan")) {
@@ -807,22 +737,11 @@ export function agentSessionCanaryResponse(context: Context): AssistantMessage {
 		return fauxAssistantMessage("执行计划已提交审阅，等待原生控制中心批准。");
 	}
 
-	if (!tools.has("workspace_shell")) {
-		return fauxAssistantMessage(fauxToolCall("tool_load", { name: "workspace_shell" }, { id: "agent-load-shell" }), {
-			stopReason: "toolUse",
-		});
-	}
 	if (!serialized.includes("agent-baseline-shell")) {
 		return fauxAssistantMessage(
 			fauxToolCall(
-				"workspace_shell",
-				{
-					op: "run",
-					command: "/usr/bin/python3 -m unittest -v",
-					cwd: ".",
-					timeoutSeconds: 30,
-					allowNetwork: false,
-				},
+				"bash",
+				{ command: "/usr/bin/python3 -m unittest -v", timeout: 30 },
 				{ id: "agent-baseline-shell" },
 			),
 			{ stopReason: "toolUse" },
@@ -838,22 +757,19 @@ export function agentSessionCanaryResponse(context: Context): AssistantMessage {
 			{ stopReason: "toolUse" },
 		);
 	}
-	if (!tools.has("workspace_patch")) {
-		return fauxAssistantMessage(fauxToolCall("tool_load", { name: "workspace_patch" }, { id: "agent-load-patch" }), {
-			stopReason: "toolUse",
-		});
-	}
 	if (!serialized.includes("agent-patch")) {
 		return fauxAssistantMessage(
 			fauxToolCall(
-				"workspace_patch",
+				"edit",
 				{
-					op: "apply",
 					path: "calculator.py",
-					oldText: '    raise NotImplementedError("ROOM_PROJECT_TASK")',
-					newText:
-						"    if not values:\n        return []\n    minimum = min(values)\n    return [value - minimum for value in values]",
-					expectedOccurrences: 1,
+					edits: [
+						{
+							oldText: '    raise NotImplementedError("ROOM_PROJECT_TASK")',
+							newText:
+								"    if not values:\n        return []\n    minimum = min(values)\n    return [value - minimum for value in values]",
+						},
+					],
 				},
 				{ id: "agent-patch" },
 			),
@@ -876,14 +792,8 @@ export function agentSessionCanaryResponse(context: Context): AssistantMessage {
 	if (!serialized.includes("agent-regression-shell")) {
 		return fauxAssistantMessage(
 			fauxToolCall(
-				"workspace_shell",
-				{
-					op: "run",
-					command: "/usr/bin/python3 -m unittest -v",
-					cwd: ".",
-					timeoutSeconds: 30,
-					allowNetwork: false,
-				},
+				"bash",
+				{ command: "/usr/bin/python3 -m unittest -v", timeout: 30 },
 				{ id: "agent-regression-shell" },
 			),
 			{ stopReason: "toolUse" },
@@ -927,7 +837,10 @@ export async function createDeterministicTestModelRuntime(): Promise<ModelRuntim
 	});
 	if (process.env.RAG_IME_PI_DETERMINISTIC_SCENARIO === CONTEXT_EPOCH_SCENARIO) {
 		faux.setResponses(Array.from({ length: 96 }, () => contextEpochCanaryResponse));
-	} else if (process.env.RAG_IME_PI_DETERMINISTIC_SCENARIO === PROJECT_TASK_SCENARIO) {
+	} else if (
+		process.env.RAG_IME_PI_DETERMINISTIC_SCENARIO === PROJECT_TASK_SCENARIO ||
+		process.env.RAG_IME_PI_DETERMINISTIC_SCENARIO === PROJECT_TOOL_RECOVERY_SCENARIO
+	) {
 		faux.setResponses(Array.from({ length: 96 }, () => projectTaskCanaryResponse));
 	} else if (process.env.RAG_IME_PI_DETERMINISTIC_SCENARIO === PROJECT_COLLABORATION_SCENARIO) {
 		faux.setResponses(Array.from({ length: 128 }, () => projectCollaborationCanaryResponse));

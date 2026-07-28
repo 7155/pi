@@ -44,6 +44,8 @@ function tool(options: {
 	profile?: string;
 	risk?: string;
 	parameters?: Record<string, unknown>;
+	modelVisible?: boolean;
+	runtimeProjections?: Array<{ name: string; operation: string }>;
 }) {
 	return {
 		name: options.name,
@@ -58,6 +60,8 @@ function tool(options: {
 			} as Record<string, unknown>),
 		profile: options.profile,
 		risk: options.risk,
+		modelVisible: options.modelVisible,
+		runtimeProjections: options.runtimeProjections,
 	};
 }
 
@@ -674,6 +678,65 @@ describe("BackendToolRegistry", () => {
 			expect(request).toMatchObject({
 				receiptId: "load:rebind:dispatch:2:ime_memory",
 				toolName: "ime_memory",
+			});
+		} finally {
+			vi.unstubAllGlobals();
+		}
+	});
+
+	it("rebinds hidden native coding targets without making them discoverable", async () => {
+		const registry = new BackendToolRegistry();
+		registry.sync([
+			tool({
+				name: "workspace_read",
+				modelVisible: false,
+				parameters: {
+					type: "object",
+					oneOf: [
+						{
+							type: "object",
+							properties: {
+								op: { const: "read" },
+								path: { type: "string" },
+							},
+							required: ["op", "path"],
+						},
+					],
+				},
+				runtimeProjections: [{ name: "read", operation: "read" }],
+			}),
+		]);
+		registry.recordLoadReceipt("workspace_read", "load:old-read");
+		const receiptId = "load:rebind:dispatch:2:workspace_read";
+		const fetchMock = vi.fn<typeof fetch>().mockResolvedValue(
+			new Response(
+				JSON.stringify({
+					ok: true,
+					result: { items: [{ receiptId, toolName: "workspace_read" }] },
+				}),
+				{ status: 200, headers: { "Content-Type": "application/json" } },
+			),
+		);
+		vi.stubGlobal("fetch", fetchMock);
+		try {
+			const rebound = await rebindGovernedToolReceipts(
+				{
+					sessionId: "session-room",
+					registry,
+					gatewayUrl: "http://127.0.0.1:8766/api/agent/tool/execute",
+					roomCapability: { manifestId: "manifest:2", manifestHash: "b".repeat(64) },
+				},
+				"dispatch:2",
+			);
+
+			expect(rebound).toEqual([{ name: "workspace_read", receiptId }]);
+			expect(registry.loadReceipt("workspace_read")).toBe(receiptId);
+			expect(registry.catalog()).toEqual([]);
+			expect(registry.disclosed()).toEqual([]);
+			const request = JSON.parse(String(fetchMock.mock.calls[0]?.[1]?.body)) as Record<string, unknown>;
+			expect(request).toMatchObject({
+				sessionId: "session-room",
+				loads: [{ receiptId, toolName: "workspace_read" }],
 			});
 		} finally {
 			vi.unstubAllGlobals();

@@ -13,6 +13,8 @@ const tool = (name: string): Tool => ({
 	parameters: { type: "object" },
 });
 
+const nativeCodingTools = ["read", "grep", "find", "ls", "edit", "write", "bash"];
+
 const taskPrompt = `<room-fact kind="dispatch_state">## Room 任务
 当前任务：
 - 预期产物：CANARY-2-OK
@@ -52,9 +54,9 @@ const projectTaskPrompt = `<room-fact kind="dispatch_state">## Room 任务
 	- AC-2 | 待验收 | 公开结果并提交
 </room-fact>`;
 
-function projectContext(tools: string[], history = ""): Context {
+function projectContext(tools: string[], history = "", marker = "PROJECT-TASK-CANARY"): Context {
 	return {
-		systemPrompt: projectTaskPrompt,
+		systemPrompt: projectTaskPrompt.replaceAll("PROJECT-TASK-CANARY", marker),
 		messages: history ? ([{ role: "user", content: history, timestamp: 1 }] as Context["messages"]) : [],
 		tools: tools.map(tool),
 	};
@@ -122,23 +124,19 @@ function collaborationContext(task: string, tools: string[], history: Record<str
 }
 
 describe("deterministic context epoch Provider", () => {
-	it("loads, reads, publishes and commits through progressive Tool stages", () => {
-		expect(calls(contextEpochCanaryResponse(context(["tool_load"])))).toEqual([
-			expect.objectContaining({ name: "tool_load", arguments: { name: "workspace_read" } }),
-		]);
-
-		expect(calls(contextEpochCanaryResponse(context(["tool_load", "workspace_read"])))).toEqual([
-			expect.objectContaining({ name: "workspace_read", id: "epoch-2-read-a" }),
-			expect.objectContaining({ name: "workspace_read", id: "epoch-2-read-b" }),
+	it("uses resident native reads, then publishes and commits through progressive Room stages", () => {
+		expect(calls(contextEpochCanaryResponse(context(["tool_load", ...nativeCodingTools])))).toEqual([
+			expect.objectContaining({ name: "read", id: "epoch-2-read-a" }),
+			expect.objectContaining({ name: "read", id: "epoch-2-read-b" }),
 		]);
 
 		const readHistory = '"id":"epoch-2-read-a"';
-		expect(calls(contextEpochCanaryResponse(context(["tool_load", "workspace_read"], readHistory)))).toEqual([
+		expect(calls(contextEpochCanaryResponse(context(["tool_load", ...nativeCodingTools], readHistory)))).toEqual([
 			expect.objectContaining({ name: "tool_load", arguments: { name: "room_post" } }),
 			expect.objectContaining({ name: "tool_load", arguments: { name: "room_commit" } }),
 		]);
 
-		const roomTools = ["tool_load", "workspace_read", "room_post", "room_commit"];
+		const roomTools = ["tool_load", ...nativeCodingTools, "room_post", "room_commit"];
 		expect(calls(contextEpochCanaryResponse(context(roomTools, readHistory)))).toEqual([
 			expect.objectContaining({ name: "room_post", id: "epoch-2-post" }),
 		]);
@@ -161,8 +159,9 @@ describe("deterministic context epoch Provider", () => {
 	});
 
 	it("finds provider-only Room facts outside the stable system prompt", () => {
-		expect(calls(contextEpochCanaryResponse(messageContext(["tool_load"])))).toEqual([
-			expect.objectContaining({ name: "tool_load", arguments: { name: "workspace_read" } }),
+		expect(calls(contextEpochCanaryResponse(messageContext(["tool_load", ...nativeCodingTools])))).toEqual([
+			expect.objectContaining({ name: "read", id: "epoch-2-read-a" }),
+			expect.objectContaining({ name: "read", id: "epoch-2-read-b" }),
 		]);
 	});
 
@@ -174,44 +173,31 @@ describe("deterministic context epoch Provider", () => {
 		const legacyContext = {
 			systemPrompt: legacyPrompt,
 			messages: [{ role: "user", content: '"id":"epoch-7-read-a" "id":"epoch-7-post"', timestamp: 1 }],
-			tools: ["tool_load", "workspace_read", "room_post", "room_commit"].map(tool),
+			tools: ["tool_load", ...nativeCodingTools, "room_post", "room_commit"].map(tool),
 		} as Context;
 		expect(() => contextEpochCanaryResponse(legacyContext)).toThrow("requires explicit AC aliases");
 	});
 
 	it("drives a real project through discovery, approved patch, test and settle", () => {
-		expect(calls(projectTaskCanaryResponse(projectContext(["tool_load"])))).toEqual([
-			expect.objectContaining({ name: "tool_load", arguments: { name: "workspace_list" } }),
-			expect.objectContaining({ name: "tool_load", arguments: { name: "workspace_search" } }),
-			expect.objectContaining({ name: "tool_load", arguments: { name: "workspace_read" } }),
-		]);
-
-		const discoveryTools = ["tool_load", "workspace_list", "workspace_search", "workspace_read"];
+		const discoveryTools = ["tool_load", ...nativeCodingTools];
 		expect(calls(projectTaskCanaryResponse(projectContext(discoveryTools)))).toEqual([
-			expect.objectContaining({ name: "workspace_list", id: "project-list" }),
+			expect.objectContaining({ name: "ls", id: "project-list" }),
 		]);
 		expect(calls(projectTaskCanaryResponse(projectContext(discoveryTools, '"id":"project-list"')))).toEqual([
-			expect.objectContaining({ name: "workspace_search", id: "project-search" }),
+			expect.objectContaining({ name: "find", id: "project-find" }),
 		]);
+		expect(
+			calls(projectTaskCanaryResponse(projectContext(discoveryTools, '"id":"project-list" "id":"project-find"'))),
+		).toEqual([expect.objectContaining({ name: "grep", id: "project-search" })]);
 
-		const inspected = '"id":"project-list" "id":"project-search" "id":"project-read-app"';
+		const inspected = '"id":"project-list" "id":"project-find" "id":"project-search" "id":"project-read-app"';
 		expect(calls(projectTaskCanaryResponse(projectContext(discoveryTools, inspected)))).toEqual([
-			expect.objectContaining({ name: "tool_load", arguments: { name: "workspace_patch" } }),
-		]);
-
-		const patchTools = [...discoveryTools, "workspace_patch"];
-		expect(calls(projectTaskCanaryResponse(projectContext(patchTools, inspected)))).toEqual([
-			expect.objectContaining({ name: "workspace_patch", id: "project-patch" }),
+			expect.objectContaining({ name: "edit", id: "project-patch" }),
 		]);
 
 		const patched = JSON.stringify({ history: `${inspected} project-patch`, mutationApplied: true });
-		expect(calls(projectTaskCanaryResponse(projectContext(patchTools, patched)))).toEqual([
-			expect.objectContaining({ name: "tool_load", arguments: { name: "workspace_shell" } }),
-		]);
-
-		const shellTools = [...patchTools, "workspace_shell"];
-		expect(calls(projectTaskCanaryResponse(projectContext(shellTools, patched)))).toEqual([
-			expect.objectContaining({ name: "workspace_shell", id: "project-test" }),
+		expect(calls(projectTaskCanaryResponse(projectContext(discoveryTools, patched)))).toEqual([
+			expect.objectContaining({ name: "bash", id: "project-test" }),
 		]);
 
 		const tested = JSON.stringify({
@@ -219,7 +205,7 @@ describe("deterministic context epoch Provider", () => {
 			mutationApplied: true,
 			exitCode: 0,
 		});
-		const roomTools = [...shellTools, "room_post", "room_commit"];
+		const roomTools = [...discoveryTools, "room_post", "room_commit"];
 		expect(calls(projectTaskCanaryResponse(projectContext(roomTools, tested)))).toEqual([
 			expect.objectContaining({ name: "room_post", id: "project-post" }),
 		]);
@@ -250,25 +236,70 @@ describe("deterministic context epoch Provider", () => {
 		});
 	});
 
+	it("recovers from one failed native read and baseline test without retrying either call", () => {
+		const recoveryMarker = "PROJECT-TOOL-RECOVERY-CANARY";
+		const tools = ["tool_load", ...nativeCodingTools];
+		expect(calls(projectTaskCanaryResponse(projectContext(tools, "", recoveryMarker)))).toEqual([
+			expect.objectContaining({
+				name: "read",
+				id: "project-missing-read",
+				arguments: { path: "missing_requirements.md", offset: 0, limit: 16_384 },
+			}),
+		]);
+
+		const afterMissingRead = '"id":"project-missing-read"';
+		expect(calls(projectTaskCanaryResponse(projectContext(tools, afterMissingRead, recoveryMarker)))).toEqual([
+			expect.objectContaining({ name: "ls", id: "project-list" }),
+		]);
+		expect(
+			calls(
+				projectTaskCanaryResponse(projectContext(tools, `${afterMissingRead} "id":"project-list"`, recoveryMarker)),
+			),
+		).toEqual([expect.objectContaining({ name: "find", id: "project-find" })]);
+		expect(
+			calls(
+				projectTaskCanaryResponse(
+					projectContext(tools, `${afterMissingRead} "id":"project-list" "id":"project-find"`, recoveryMarker),
+				),
+			),
+		).toEqual([expect.objectContaining({ name: "grep", id: "project-search" })]);
+		const inspected = `${afterMissingRead} "id":"project-list" "id":"project-find" "id":"project-search" "id":"project-read-app"`;
+		expect(calls(projectTaskCanaryResponse(projectContext(tools, inspected, recoveryMarker)))).toEqual([
+			expect.objectContaining({ name: "bash", id: "project-baseline-test" }),
+		]);
+
+		const failedBaseline = JSON.stringify({
+			history: `${inspected} "id":"project-baseline-test"`,
+			exitCode: 1,
+		});
+		const repair = calls(projectTaskCanaryResponse(projectContext(tools, failedBaseline, recoveryMarker)));
+		expect(repair).toEqual([expect.objectContaining({ name: "edit", id: "project-patch" })]);
+		expect(repair.some((call) => call.id === "project-missing-read")).toBe(false);
+
+		const patched = JSON.stringify({
+			history: `${failedBaseline} "id":"project-patch"`,
+			mutationApplied: true,
+			exitCode: 1,
+		});
+		expect(calls(projectTaskCanaryResponse(projectContext(tools, patched, recoveryMarker)))).toEqual([
+			expect.objectContaining({ name: "bash", id: "project-test" }),
+		]);
+	});
+
 	it("drives an ordinary Agent Session through progressive discovery and planning", () => {
-		expect(calls(agentSessionCanaryResponse(agentContext(["skill_load"])))).toEqual([
+		expect(calls(agentSessionCanaryResponse(agentContext(["skill_load", ...nativeCodingTools])))).toEqual([
 			expect.objectContaining({ name: "skill_load", arguments: { name: "test-driven-implementation" } }),
 		]);
 
 		const loadedSkill = '<loaded_skill name="test-driven-implementation">';
-		expect(calls(agentSessionCanaryResponse(agentContext(["tool_load"], loadedSkill)))).toEqual([
-			expect.objectContaining({ name: "tool_load", arguments: { name: "workspace_read" } }),
-		]);
-
-		const readTool = ["tool_load", "workspace_read"];
+		const readTool = ["tool_load", ...nativeCodingTools];
 		expect(calls(agentSessionCanaryResponse(agentContext(readTool, loadedSkill)))).toEqual([
-			expect.objectContaining({ name: "workspace_read", id: "agent-missing-read" }),
+			expect.objectContaining({ name: "read", id: "agent-missing-read" }),
 		]);
 
 		const afterMissing = `${loadedSkill} "id":"agent-missing-read"`;
 		expect(calls(agentSessionCanaryResponse(agentContext(readTool, afterMissing)))).toEqual([
-			expect.objectContaining({ name: "tool_load", arguments: { name: "workspace_list" } }),
-			expect.objectContaining({ name: "tool_load", arguments: { name: "workspace_search" } }),
+			expect.objectContaining({ name: "ls", id: "agent-list" }),
 		]);
 
 		const planHistory = [
@@ -280,10 +311,10 @@ describe("deterministic context epoch Provider", () => {
 			'"id":"agent-plan-patch"',
 			'"id":"agent-plan-regression"',
 		].join(" ");
-		const planTools = ["tool_load", "workspace_read", "workspace_list", "workspace_search", "agent_plan"];
+		const planTools = ["tool_load", ...nativeCodingTools, "agent_plan"];
 		expect(calls(agentSessionCanaryResponse(agentContext(planTools, `${loadedSkill} ${planHistory}`)))).toEqual([
 			expect.objectContaining({
-				name: "workspace_read",
+				name: "read",
 				id: "agent-read-boundary-0",
 				arguments: expect.objectContaining({
 					path: "read-boundary.txt",
@@ -341,14 +372,7 @@ describe("deterministic context epoch Provider", () => {
 			"原生控制中心已经批准当前执行计划",
 			'"id":"agent-baseline-shell"',
 		].join(" ");
-		const shellTools = [
-			"tool_load",
-			"workspace_read",
-			"workspace_list",
-			"workspace_search",
-			"agent_plan",
-			"workspace_shell",
-		];
+		const shellTools = ["tool_load", ...nativeCodingTools, "agent_plan"];
 		expect(
 			calls(
 				agentSessionCanaryResponse(
@@ -371,13 +395,7 @@ describe("deterministic context epoch Provider", () => {
 			...completeBoundaryReceipt(`${baseHistory} "id":"agent-plan-baseline-done" "id":"agent-patch"`),
 			mutationApplied: true,
 		};
-		expect(
-			calls(
-				agentSessionCanaryResponse(
-					agentReceiptContext([...shellTools, "workspace_patch"], patchedReceipt, loadedSkill),
-				),
-			),
-		).toEqual([
+		expect(calls(agentSessionCanaryResponse(agentReceiptContext(shellTools, patchedReceipt, loadedSkill)))).toEqual([
 			expect.objectContaining({
 				name: "agent_plan",
 				id: "agent-plan-patch-done",
@@ -396,13 +414,7 @@ describe("deterministic context epoch Provider", () => {
 			mutationApplied: true,
 			exitCode: 0,
 		};
-		expect(
-			calls(
-				agentSessionCanaryResponse(
-					agentReceiptContext([...shellTools, "workspace_patch"], testedReceipt, loadedSkill),
-				),
-			),
-		).toEqual([
+		expect(calls(agentSessionCanaryResponse(agentReceiptContext(shellTools, testedReceipt, loadedSkill)))).toEqual([
 			expect.objectContaining({
 				name: "agent_plan",
 				id: "agent-plan-regression-done",
@@ -419,13 +431,7 @@ describe("deterministic context epoch Provider", () => {
 			mutationApplied: true,
 			exitCode: 0,
 		};
-		expect(
-			calls(
-				agentSessionCanaryResponse(
-					agentReceiptContext([...shellTools, "workspace_patch"], completedItems, loadedSkill),
-				),
-			),
-		).toEqual([
+		expect(calls(agentSessionCanaryResponse(agentReceiptContext(shellTools, completedItems, loadedSkill)))).toEqual([
 			expect.objectContaining({
 				name: "agent_plan",
 				id: "agent-plan-complete",
@@ -475,18 +481,7 @@ describe("deterministic context epoch Provider", () => {
 			projectCollaborationCanaryResponse(
 				collaborationContext(
 					aTask,
-					[
-						"tool_load",
-						"room_state",
-						"room_collaborate",
-						"workspace_read",
-						"workspace_list",
-						"workspace_search",
-						"workspace_shell",
-						"workspace_patch",
-						"room_post",
-						"room_commit",
-					],
+					["tool_load", "room_state", "room_collaborate", ...nativeCodingTools, "room_post", "room_commit"],
 					{
 						history: [
 							'"id":"collab-a-state"',
@@ -534,7 +529,7 @@ describe("deterministic context epoch Provider", () => {
 		].join("\n");
 		const bCommit = calls(
 			projectCollaborationCanaryResponse(
-				collaborationContext(bTask, ["tool_load", "room_state", "workspace_read", "room_post", "room_commit"], {
+				collaborationContext(bTask, ["tool_load", "room_state", ...nativeCodingTools, "room_post", "room_commit"], {
 					history: [
 						'"id":"collab-b-state"',
 						'"id":"collab-b-read-app"',
@@ -567,19 +562,15 @@ describe("deterministic context epoch Provider", () => {
 		].join("\n");
 		const commit = calls(
 			projectCollaborationCanaryResponse(
-				collaborationContext(
-					cTask,
-					["tool_load", "room_state", "workspace_read", "workspace_shell", "room_post", "room_commit"],
-					{
-						history: [
-							'"id":"collab-c-state"',
-							'"id":"collab-c-read-app"',
-							'"id":"collab-c-acceptance-shell"',
-							'"id":"collab-c-post"',
-						].join(" "),
-						evidenceRef: "execution:c",
-					},
-				),
+				collaborationContext(cTask, ["tool_load", "room_state", ...nativeCodingTools, "room_post", "room_commit"], {
+					history: [
+						'"id":"collab-c-state"',
+						'"id":"collab-c-read-app"',
+						'"id":"collab-c-acceptance-shell"',
+						'"id":"collab-c-post"',
+					].join(" "),
+					evidenceRef: "execution:c",
+				}),
 			),
 		)[0];
 		expect(commit).toMatchObject({
