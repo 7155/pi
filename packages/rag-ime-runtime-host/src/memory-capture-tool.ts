@@ -16,16 +16,20 @@ const MEMORY_CAPTURE_PARAMETERS = {
 		kind: {
 			type: "string",
 			enum: ["preference", "fact", "decision", "correction", "pitfall"],
+			description: "Choose only preference, fact, decision, correction, or pitfall.",
 		},
 		claim: {
 			type: "string",
 			minLength: 1,
 			maxLength: 800,
-			description: "One independently understandable fact that may remain useful in a later Session.",
+			description:
+				"One independently understandable statement that remains true outside this conversation. Do not copy a long passage.",
 		},
 		scope: {
 			type: "string",
 			enum: ["user", "project"],
+			description:
+				"Use user only for information that applies across projects. Use project for facts and constraints local to the current project.",
 		},
 		basis: {
 			type: "string",
@@ -36,13 +40,14 @@ const MEMORY_CAPTURE_PARAMETERS = {
 				"repeated_user_signal",
 				"verified_outcome",
 			],
-			description: "The evidence class supporting this candidate.",
+			description:
+				"explicit_user_request means the user asked to remember it; explicit_user_statement means the user stated it; user_correction means the user corrected it; repeated_user_signal requires at least two independent signals visible in the current context; verified_outcome requires successful Tool or runtime evidence.",
 		},
 		futureUse: {
 			type: "string",
 			minLength: 1,
 			maxLength: 300,
-			description: "How this single claim should help a later Session.",
+			description: "State when and how a future Session should use this candidate. Do not restate the claim.",
 		},
 		supersedes: {
 			type: "string",
@@ -71,7 +76,7 @@ export function createMemoryCaptureExtension(options: BackendToolBridgeOptions):
 					name: MEMORY_CAPTURE_TOOL_NAME,
 					label: "Propose one memory candidate",
 					description:
-						"Propose one evidence-backed preference, fact, decision, correction, or reusable pitfall for governed review. Use for explicit or stable user signals that should change a later Session. Do not use for one-off requests, workflow progress, model guesses, sensitive content, or batch curation. This never writes durable memory directly.",
+						"Propose one evidence-backed preference, fact, decision, correction, or reusable pitfall for governed review. Use only when a later Session would otherwise need the user to repeat a stable fact, preference, decision, correction, or verified pitfall. The runtime owns the Evidence identity: never guess Atom, Book, relationship, or Evidence IDs. Submit the same fact at most once per turn and at most three candidates in a turn, prioritizing future behavioral impact. In a Room, only public evidence-backed delivery, decision, or project conclusions qualify. Do not capture one-off requests, temporary progress, Tool logs, transient failures, guesses, sensitive information, generic praise, greetings, long source passages, private Room process, or the model's unconfirmed advice. A call creates only a governed candidate, never durable memory; do not announce that you remembered it. On failure, keep the receipt, continue the main task, and do not retry in a loop.",
 					parameters: MEMORY_CAPTURE_PARAMETERS,
 					targetToolName: MEMORY_CAPTURE_TARGET,
 					mapArguments(args) {
