@@ -327,6 +327,12 @@ describe("PiProductSession catalog updates", () => {
 				description: "Read workspace files.",
 				parameters: { type: "object", properties: {} },
 			},
+			{
+				name: "workspace.search",
+				description: "Internal governed search target.",
+				parameters: { type: "object", properties: {} },
+				modelVisible: false,
+			},
 		]);
 		const sessionManager = {
 			getBranch: () => [
@@ -346,6 +352,15 @@ describe("PiProductSession catalog updates", () => {
 				{
 					type: "message",
 					message: { role: "toolResult", toolName: "unknown.tool", isError: false },
+				},
+				{
+					type: "message",
+					message: {
+						role: "toolResult",
+						toolName: "tool_load",
+						isError: false,
+						details: { tool: { name: "workspace.search" } },
+					},
 				},
 				{
 					type: "message",

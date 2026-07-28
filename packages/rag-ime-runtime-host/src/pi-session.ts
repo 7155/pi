@@ -26,6 +26,7 @@ import {
 } from "./discovery-tools.ts";
 import { createLifecycleHookController } from "./lifecycle-hooks.ts";
 import { createMemoryCaptureExtension, prepareGovernedMemoryCapture } from "./memory-capture-tool.ts";
+import { createNativeWorkspaceToolsExtension } from "./native-workspace-tools.ts";
 import { PROTOCOL_VERSION, type RuntimeEventEnvelope, RuntimeProtocolError } from "./protocol.ts";
 import { createProviderContextJournalExtension, ProviderContextJournal } from "./provider-context-journal.ts";
 import { roomSkillPromptFocus, roomToolPromptFocus } from "./room-prompt-catalog.ts";
@@ -45,6 +46,7 @@ import {
 	diffBackendToolCatalog,
 	rebindGovernedToolReceipts,
 } from "./tool-bridge.ts";
+import { ToolResultStore } from "./tool-result-store.ts";
 import { createWorkflowControlExtension } from "./workflow-control.ts";
 
 export interface PiSessionOpenOptions {
@@ -190,7 +192,10 @@ export function restoreBackendToolDisclosures(registry: BackendToolRegistry, ses
 	const restore = (value: unknown, governedValue?: unknown) => {
 		const loadedTool = objectRecord(value);
 		const loadedName = typeof loadedTool?.name === "string" ? loadedTool.name : "";
-		if (!registry.get(loadedName)) return;
+		// A previously disclosed product tool may later become an internal
+		// execution target behind a runtime-native tool. Old session branches
+		// must stay resumable without re-exposing that internal schema.
+		if (!registry.getDiscoverable(loadedName)) return;
 		if (!restoredNames.has(loadedName)) {
 			restoredNames.add(loadedName);
 			restored.push(loadedName);
@@ -499,6 +504,13 @@ export class PiProductSession implements PooledSession {
 			gatewayUrl: options.toolGatewayUrl,
 			gatewayToken: options.toolGatewayToken,
 			roomCapability: options.roomCapability,
+			resultStore: new ToolResultStore(
+				resolve(
+					options.sessionDir,
+					"tool-results",
+					createHash("sha256").update(options.externalSessionId).digest("hex").slice(0, 24),
+				),
+			),
 			waitForDecision: (kind, targetId, details, signal) => {
 				if (!productSession) throw new Error("Product session decision bridge is not ready");
 				return productSession.waitForDecision(kind, targetId, details, signal);
@@ -551,6 +563,10 @@ export class PiProductSession implements PooledSession {
 				}),
 				createMemoryCaptureExtension(backendBridge),
 				createBackendToolExtension(backendBridge),
+				createNativeWorkspaceToolsExtension({
+					...backendBridge,
+					cwd: options.cwd,
+				}),
 				createSessionContextRefreshExtension({
 					bridge: backendBridge,
 					getSessionContext: () => productSession?.sessionContext ?? "",

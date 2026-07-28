@@ -3,6 +3,7 @@ import type { InlineExtension, ToolDefinition } from "@earendil-works/pi-coding-
 import { RuntimeProtocolError } from "./protocol.ts";
 import { RESERVED_RUNTIME_TOOL_NAMES } from "./runtime-tool-names.ts";
 import { modelVisibleResult, modelVisibleToolGatewayResult, ToolArtifactBuffer } from "./tool-artifact-buffer.ts";
+import type { ToolResultStore } from "./tool-result-store.ts";
 
 const TOOL_NAME_PATTERN = /^[a-zA-Z][a-zA-Z0-9_.-]{0,127}$/;
 const MAX_TOOLS = 256;
@@ -11,6 +12,12 @@ export interface BackendToolManifest {
 	name: string;
 	description: string;
 	parameters: Record<string, unknown>;
+	/**
+	 * Hidden manifests remain registered as governed execution targets, but
+	 * never enter ToolSearch, tool_load, or the Provider-visible product
+	 * catalog. Runtime-owned native tools may project onto them.
+	 */
+	modelVisible?: boolean;
 	when?: string[];
 	notFor?: string[];
 	input?: string;
@@ -60,6 +67,10 @@ export class BackendToolRegistry {
 		return structuredClone(this.manifest);
 	}
 
+	catalog(): BackendToolManifest[] {
+		return structuredClone(this.manifest.filter((tool) => tool.modelVisible !== false));
+	}
+
 	disclosed(): BackendToolManifest[] {
 		return [...this.disclosedNames]
 			.map((name) => this.get(name))
@@ -71,8 +82,13 @@ export class BackendToolRegistry {
 		return tool ? structuredClone(tool) : undefined;
 	}
 
+	getDiscoverable(name: string): BackendToolManifest | undefined {
+		const tool = this.manifest.find((candidate) => candidate.name === name && candidate.modelVisible !== false);
+		return tool ? structuredClone(tool) : undefined;
+	}
+
 	disclose(name: string): BackendToolManifest {
-		const tool = this.get(name);
+		const tool = this.getDiscoverable(name);
 		if (!tool) throw new RuntimeProtocolError("TOOL_NOT_FOUND", `Unknown or unavailable product tool: ${name}`);
 		this.disclosedNames.add(name);
 		return tool;
@@ -106,6 +122,10 @@ export class BackendToolRegistry {
 		return backendToolCatalogRevision(this.manifest);
 	}
 
+	catalogRevision(): string {
+		return backendToolCatalogRevision(this.catalog());
+	}
+
 	sync(value: unknown): BackendToolManifest[] {
 		if (!Array.isArray(value)) {
 			throw new RuntimeProtocolError("INVALID_TOOL_MANIFEST", "Tool manifest must be an array");
@@ -114,6 +134,7 @@ export class BackendToolRegistry {
 			throw new RuntimeProtocolError("INVALID_TOOL_MANIFEST", `Tool manifest exceeds ${MAX_TOOLS} tools`);
 		}
 		const names = new Set<string>();
+		const runtimeProjectionOwners = new Map<string, string>();
 		const manifest = value
 			.map((item, index): BackendToolManifest => {
 				if (typeof item !== "object" || item === null || Array.isArray(item)) {
@@ -153,11 +174,27 @@ export class BackendToolRegistry {
 				if (record.risk !== undefined && typeof record.risk !== "string") {
 					throw new RuntimeProtocolError("INVALID_TOOL_MANIFEST", `Tool ${record.name} risk must be a string`);
 				}
+				if (record.modelVisible !== undefined && typeof record.modelVisible !== "boolean") {
+					throw new RuntimeProtocolError(
+						"INVALID_TOOL_MANIFEST",
+						`Tool ${record.name} modelVisible must be a boolean`,
+					);
+				}
 				const runtimeProjections = validateRuntimeProjections(
 					record.name,
 					record.runtimeProjections,
 					record.parameters as Record<string, unknown>,
 				);
+				for (const projection of runtimeProjections) {
+					const existingOwner = runtimeProjectionOwners.get(projection.name);
+					if (existingOwner) {
+						throw new RuntimeProtocolError(
+							"INVALID_TOOL_MANIFEST",
+							`Runtime projection ${projection.name} is owned by both ${existingOwner} and ${record.name}`,
+						);
+					}
+					runtimeProjectionOwners.set(projection.name, record.name);
+				}
 				for (const key of ["when", "notFor"] as const) {
 					if (
 						record[key] !== undefined &&
@@ -183,6 +220,7 @@ export class BackendToolRegistry {
 					name: record.name,
 					description: record.description,
 					parameters: canonicalJson(record.parameters) as Record<string, unknown>,
+					...(record.modelVisible === false ? { modelVisible: false } : {}),
 					when: record.when as string[] | undefined,
 					notFor: record.notFor as string[] | undefined,
 					input: record.input as string | undefined,
@@ -215,7 +253,6 @@ function validateRuntimeProjections(
 	}
 	const operations = operationNames(parameters);
 	const names = new Set<string>();
-	const projectedOperations = new Set<string>();
 	return value.map((item, index) => {
 		if (typeof item !== "object" || item === null || Array.isArray(item)) {
 			throw new RuntimeProtocolError(
@@ -244,14 +281,13 @@ function validateRuntimeProjections(
 				`Tool ${toolName} runtime projection ${projection.name} targets an unavailable operation`,
 			);
 		}
-		if (names.has(projection.name) || projectedOperations.has(projection.operation)) {
+		if (names.has(projection.name)) {
 			throw new RuntimeProtocolError(
 				"INVALID_TOOL_MANIFEST",
-				`Tool ${toolName} runtime projections must have unique names and operations`,
+				`Tool ${toolName} runtime projections must have unique names`,
 			);
 		}
 		names.add(projection.name);
-		projectedOperations.add(projection.operation);
 		return {
 			name: projection.name,
 			operation: projection.operation,
@@ -411,6 +447,7 @@ export interface BackendToolBridgeOptions {
 	gatewayUrl?: string;
 	gatewayToken?: string;
 	roomCapability?: Record<string, unknown>;
+	resultStore?: ToolResultStore;
 	waitForDecision?(
 		kind: "approval" | "review",
 		targetId: string,
@@ -450,7 +487,7 @@ export async function requestGovernedToolLoad(
 	signal?: AbortSignal,
 ): Promise<Record<string, unknown> | undefined> {
 	if (!options.roomCapability) return undefined;
-	if (!options.registry.get(toolName)) {
+	if (!options.registry.getDiscoverable(toolName)) {
 		throw new RuntimeProtocolError("TOOL_NOT_FOUND", `Unknown product tool: ${toolName}`);
 	}
 	const governed = await requestProductGateway(
@@ -485,7 +522,7 @@ export async function requestGovernedToolLoads(
 		return [await requestGovernedToolLoad(options, loads[0].name, loads[0].receiptId, signal)];
 	}
 	for (const load of loads) {
-		if (!options.registry.get(load.name)) {
+		if (!options.registry.getDiscoverable(load.name)) {
 			throw new RuntimeProtocolError("TOOL_NOT_FOUND", `Unknown product tool: ${load.name}`);
 		}
 	}
@@ -582,7 +619,11 @@ async function executeGatewayTool(
 				{
 					type: "text",
 					text: JSON.stringify(
-						modelVisibleResult({ summary, reviewState: reviewed ? "reviewed" : "deferred", runId }),
+						modelVisibleResult(
+							{ summary, reviewState: reviewed ? "reviewed" : "deferred", runId },
+							options.resultStore,
+							tool.name,
+						),
 					),
 				},
 			],
@@ -633,11 +674,15 @@ async function executeGatewayTool(
 				{
 					type: "text",
 					text: JSON.stringify(
-						modelVisibleToolGatewayResult({
-							summary,
-							approvalState,
-							receipt: receipt ?? null,
-						}),
+						modelVisibleToolGatewayResult(
+							{
+								summary,
+								approvalState,
+								receipt: receipt ?? null,
+							},
+							options.resultStore,
+							tool.name,
+						),
 					),
 				},
 			],
@@ -651,7 +696,12 @@ async function executeGatewayTool(
 	}
 	const agentBlocks = artifacts.capture(result);
 	return {
-		content: [{ type: "text", text: JSON.stringify(modelVisibleToolGatewayResult(result)) }],
+		content: [
+			{
+				type: "text",
+				text: JSON.stringify(modelVisibleToolGatewayResult(result, options.resultStore, tool.name)),
+			},
+		],
 		details: { ...result, toolName: tool.name, ...(agentBlocks.length > 0 ? { agentBlocks } : {}) },
 	};
 }
@@ -675,16 +725,15 @@ export function createBackendToolDefinition(
 export function createProjectedBackendToolDefinition(
 	options: BackendToolBridgeOptions,
 	projection: {
-		name: string;
-		label: string;
-		description: string;
-		parameters: ToolDefinition["parameters"];
+		definition: Omit<ToolDefinition<any, any, any>, "execute"> & {
+			execute?: ToolDefinition<any, any, any>["execute"];
+		};
 		targetToolName: string;
 		mapArguments(args: unknown): Record<string, unknown>;
 		projectModelResult?(result: Record<string, unknown>): unknown;
 	},
 	artifacts = new ToolArtifactBuffer(),
-): ToolDefinition {
+): ToolDefinition<any, any, any> {
 	const target = options.registry.get(projection.targetToolName);
 	if (!target) {
 		throw new RuntimeProtocolError(
@@ -693,10 +742,7 @@ export function createProjectedBackendToolDefinition(
 		);
 	}
 	return {
-		name: projection.name,
-		label: projection.label,
-		description: projection.description,
-		parameters: projection.parameters,
+		...projection.definition,
 		executionMode: "parallel",
 		execute: async (toolCallId, args, signal) => {
 			const executed = await executeGatewayTool(
@@ -712,12 +758,14 @@ export function createProjectedBackendToolDefinition(
 				typeof executed.details === "object" && executed.details !== null && !Array.isArray(executed.details)
 					? (executed.details as Record<string, unknown>)
 					: {};
+			const projected = projection.projectModelResult(details);
+			const visible = modelVisibleResult(projected, options.resultStore, projection.definition.name);
 			return {
 				...executed,
 				content: [
 					{
 						type: "text",
-						text: JSON.stringify(modelVisibleResult(projection.projectModelResult(details))),
+						text: typeof visible === "string" ? visible : JSON.stringify(visible),
 					},
 				],
 			};

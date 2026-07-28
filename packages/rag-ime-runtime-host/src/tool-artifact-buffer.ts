@@ -1,3 +1,5 @@
+import type { ToolResultStore } from "./tool-result-store.ts";
+
 const MAX_ARTIFACT_BLOCKS = 16;
 export const MAX_MODEL_VISIBLE_TOOL_RESULT_BYTES = 50 * 1024;
 const MEDIA_ID_PATTERN = /^media_[A-Za-z0-9_-]{12,80}$/u;
@@ -108,62 +110,118 @@ export function toolAgentBlocks(...values: unknown[]): Record<string, unknown>[]
 	return result;
 }
 
-/** Remove opaque UI receipts before a product result enters model context. */
-export function modelVisibleResult(value: unknown): unknown {
+/**
+ * Remove opaque UI receipts and bound a result before it enters model context.
+ *
+ * Large evidence is content-addressed before it is shortened. The handle is
+ * deliberately the first field so Pi compaction retains proof that the call
+ * happened even when the raw payload is later reclaimed.
+ */
+export function modelVisibleResult(value: unknown, store?: ToolResultStore, toolName?: string): unknown {
 	const projected = stripAgentBlocks(value);
-	const serialized = JSON.stringify(projected);
+	const serialized = JSON.stringify(projected) ?? String(projected);
 	const originalBytes = Buffer.byteLength(serialized, "utf8");
 	if (originalBytes <= MAX_MODEL_VISIBLE_TOOL_RESULT_BYTES) return projected;
 
-	const scalars = isRecord(projected)
-		? Object.fromEntries(
-				Object.entries(projected).filter(([key, item]) => {
-					if (
-						["modelResultTruncated", "truncated", "truncatedBy", "originalBytes", "maxBytes", "preview"].includes(
-							key,
-						)
-					) {
-						return false;
-					}
-					if (typeof item === "number" || typeof item === "boolean" || item === null) return true;
-					return typeof item === "string" && item.length <= 512;
-				}),
-			)
-		: {};
-	const base = {
-		...scalars,
+	const readable =
+		typeof projected === "string" ? projected : (JSON.stringify(projected, null, 2) ?? String(projected));
+	const evidence = store?.persist(readable, toolName);
+	const preview = semanticPreview(projected, readable);
+	return {
+		...(evidence ?? {}),
+		...(evidence
+			? {
+					continuation: {
+						tool: "read",
+						path: evidence.evidenceHandle,
+						offset: 1,
+						limit: 1,
+					},
+				}
+			: {}),
+		...preview,
 		truncated: true,
 		modelResultTruncated: true,
 		truncatedBy: "model_result_bytes",
 		originalBytes,
 		maxBytes: MAX_MODEL_VISIBLE_TOOL_RESULT_BYTES,
 	};
-	const codePoints = Array.from(serialized);
-	let low = 0;
-	let high = codePoints.length;
-	let best = { ...base, preview: "" };
-	while (low <= high) {
-		const middle = Math.floor((low + high) / 2);
-		const candidate = { ...base, preview: codePoints.slice(0, middle).join("") };
-		if (Buffer.byteLength(JSON.stringify(candidate), "utf8") <= MAX_MODEL_VISIBLE_TOOL_RESULT_BYTES) {
-			best = candidate;
-			low = middle + 1;
-		} else {
-			high = middle - 1;
-		}
-	}
-	return best;
 }
 
 /**
  * Keep governance receipts in ToolResult.details while giving the model only
  * the short successful evidence ref it may cite in room_commit.
  */
-export function modelVisibleToolGatewayResult(value: unknown): unknown {
+export function modelVisibleToolGatewayResult(value: unknown, store?: ToolResultStore, toolName?: string): unknown {
 	const evidenceRef = successfulProductEvidenceRef(value);
 	const stripped = stripToolGatewayAuditFields(value);
 	const projected = evidenceRef && isRecord(stripped) ? evidenceFirst(stripped, evidenceRef) : stripped;
-	return modelVisibleResult(projected);
+	return modelVisibleResult(projected, store, toolName);
+}
+
+function semanticPreview(projected: unknown, readable: string): Record<string, unknown> {
+	const preview: Record<string, unknown> = {};
+	if (isRecord(projected)) {
+		const retained: Record<string, unknown> = {};
+		const collectionSizes: Record<string, number> = {};
+		for (const [key, item] of Object.entries(projected)) {
+			if (
+				[
+					"evidenceHandle",
+					"evidenceSha256",
+					"evidenceBytes",
+					"evidenceAvailable",
+					"continuation",
+					"truncated",
+					"modelResultTruncated",
+					"truncatedBy",
+					"originalBytes",
+					"maxBytes",
+					"preview",
+					"previewHead",
+					"previewTail",
+				].includes(key)
+			) {
+				continue;
+			}
+			if (
+				Object.keys(retained).length < 24 &&
+				(typeof item === "number" || typeof item === "boolean" || item === null)
+			) {
+				retained[key] = item;
+			} else if (
+				Object.keys(retained).length < 24 &&
+				typeof item === "string" &&
+				Buffer.byteLength(item, "utf8") <= 1024
+			) {
+				retained[key] = item;
+			} else if (Object.keys(collectionSizes).length < 32 && Array.isArray(item)) {
+				collectionSizes[key] = item.length;
+			} else if (Object.keys(collectionSizes).length < 32 && isRecord(item)) {
+				collectionSizes[key] = Object.keys(item).length;
+			}
+		}
+		Object.assign(preview, retained);
+		if (Object.keys(collectionSizes).length > 0) preview.collectionSizes = collectionSizes;
+		const keys = Object.keys(projected);
+		preview.resultKeys = keys.length <= 64 ? keys : [...keys.slice(0, 64), `... ${keys.length - 64} more`];
+	} else if (Array.isArray(projected)) {
+		preview.resultItems = projected.length;
+	}
+	const head = sliceUtf8(readable, 0, 8 * 1024);
+	const tail = sliceUtf8(readable, Math.max(0, Buffer.byteLength(readable, "utf8") - 4 * 1024), 4 * 1024);
+	preview.previewHead = head;
+	if (tail && tail !== head) preview.previewTail = tail;
+	return preview;
+}
+
+function sliceUtf8(value: string, startByte: number, maxBytes: number): string {
+	const encoded = Buffer.from(value, "utf8");
+	let start = Math.max(0, Math.min(encoded.length, startByte));
+	while (start < encoded.length && (encoded[start] & 0xc0) === 0x80) start += 1;
+	let end = Math.min(encoded.length, start + maxBytes);
+	while (end > start && end < encoded.length && (encoded[end] & 0xc0) === 0x80) end -= 1;
+	return encoded.subarray(start, end).toString("utf8");
 }
 
 function stripAgentBlocks(value: unknown): unknown {

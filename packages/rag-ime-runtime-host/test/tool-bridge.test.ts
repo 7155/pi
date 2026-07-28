@@ -1,3 +1,6 @@
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import type { ToolDefinition } from "@earendil-works/pi-coding-agent";
 import { describe, expect, it, vi } from "vitest";
 import {
@@ -16,6 +19,7 @@ import {
 	diffBackendToolCatalog,
 	rebindGovernedToolReceipts,
 } from "../src/tool-bridge.ts";
+import { ToolResultStore } from "../src/tool-result-store.ts";
 
 function managedFileBlock(sessionId = "session-room") {
 	const mediaId = "media_abcdefghijklmnop";
@@ -510,6 +514,8 @@ describe("BackendToolRegistry", () => {
 
 	it("keeps every model-visible product Tool result inside Pi's 50 KiB budget", async () => {
 		const output = '长输出"\\\n'.repeat(40_000);
+		const resultDirectory = mkdtempSync(join(tmpdir(), "pi-tool-result-"));
+		const resultStore = new ToolResultStore(resultDirectory);
 		const fetchMock = vi.fn<typeof fetch>().mockResolvedValue(
 			new Response(
 				JSON.stringify({
@@ -531,6 +537,7 @@ describe("BackendToolRegistry", () => {
 					sessionId: "session-bounded-result",
 					registry: new BackendToolRegistry(),
 					gatewayUrl: "http://127.0.0.1:8768/api/agent/tool/execute",
+					resultStore,
 				},
 				tool({ name: "workspace_shell" }),
 			);
@@ -546,6 +553,7 @@ describe("BackendToolRegistry", () => {
 
 			expect(Buffer.byteLength(text, "utf8")).toBeLessThanOrEqual(MAX_MODEL_VISIBLE_TOOL_RESULT_BYTES);
 			expect(visible).toMatchObject({
+				evidenceAvailable: true,
 				summary: "测试输出已完成",
 				exitCode: 0,
 				mutationApplied: false,
@@ -554,10 +562,13 @@ describe("BackendToolRegistry", () => {
 				truncatedBy: "model_result_bytes",
 				maxBytes: MAX_MODEL_VISIBLE_TOOL_RESULT_BYTES,
 			});
-			expect(String(visible.preview)).toContain("长输出");
+			expect(Object.keys(visible)[0]).toBe("evidenceHandle");
+			expect(String(visible.previewHead)).toContain("长输出");
+			expect(resultStore.read(String(visible.evidenceHandle)).content).toContain("长输出");
 			expect(result.details).toMatchObject({ output });
 		} finally {
 			vi.unstubAllGlobals();
+			rmSync(resultDirectory, { recursive: true, force: true });
 		}
 	});
 

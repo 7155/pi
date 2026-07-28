@@ -526,13 +526,13 @@ export function loadBackendTool(
 	if (registry.isDisclosed(name)) {
 		throw new Error(`Tool schema is already active; call it directly and do not pass it to tool_load: ${name}`);
 	}
-	const tool = registry.get(name);
+	const tool = registry.getDiscoverable(name);
 	if (!tool) throw new Error(`Unknown or unavailable product tool: ${name}`);
 	return {
 		tool,
 		result: {
 			schemaVersion: "rag-ime.tool-load.v1",
-			catalogRevision: registry.revision(),
+			catalogRevision: registry.catalogRevision(),
 			schemaRevision: backendToolSchemaRevision([tool]),
 			tool: {
 				name: tool.name,
@@ -572,7 +572,7 @@ export function loadBackendTools(
 	args: { name?: unknown; names?: unknown },
 ): Array<{ tool: BackendToolManifest; result: Record<string, unknown> }> {
 	const names = exactToolNames(args);
-	const unavailable = names.find((name) => !registry.get(name));
+	const unavailable = names.find((name) => !registry.getDiscoverable(name));
 	if (unavailable) throw new Error(`Unknown or unavailable product tool: ${unavailable}`);
 	const active = names.find((name) => registry.isDisclosed(name));
 	if (active) {
@@ -626,10 +626,14 @@ export function createDiscoveryToolsExtension(options: DiscoveryToolsOptions): I
 			});
 			pi.on("before_agent_start", async (event) => {
 				if (event.systemPrompt.includes(TOOL_CATALOG_MARKER)) return undefined;
-				const toolCatalog = formatBackendToolRouteCatalog(options.registry.list(), options.registry.revision(), {
-					activeNames: options.registry.disclosed().map((tool) => tool.name),
-					...(options.focusToolNames !== undefined ? { focusNames: options.focusToolNames } : {}),
-				});
+				const toolCatalog = formatBackendToolRouteCatalog(
+					options.registry.catalog(),
+					options.registry.catalogRevision(),
+					{
+						activeNames: options.registry.disclosed().map((tool) => tool.name),
+						...(options.focusToolNames !== undefined ? { focusNames: options.focusToolNames } : {}),
+					},
+				);
 				if (!toolCatalog) return undefined;
 				return { systemPrompt: `${event.systemPrompt}${toolCatalog}` };
 			});
@@ -701,9 +705,9 @@ export function createDiscoveryToolsExtension(options: DiscoveryToolsOptions): I
 					parameters: TOOL_SEARCH_PARAMETERS,
 					execute: async (toolCallId, args, signal) => {
 						let result = searchBackendTools(
-							options.registry.list(),
+							options.registry.catalog(),
 							args as { query?: unknown; limit?: unknown },
-							options.registry.revision(),
+							options.registry.catalogRevision(),
 							options.registry.disclosed().map((tool) => tool.name),
 						);
 						if (options.gateway?.roomCapability) {
@@ -783,7 +787,7 @@ export function createDiscoveryToolsExtension(options: DiscoveryToolsOptions): I
 							prepared.length === 1
 								? {
 										schemaVersion: "rag-ime.tool-load.v1",
-										catalogRevision: options.registry.revision(),
+										catalogRevision: options.registry.catalogRevision(),
 										schemaRevision: backendToolSchemaRevision([prepared[0].tool]),
 										tool: backendToolRouteEntry(prepared[0].tool),
 										disclosed: true,
@@ -792,7 +796,7 @@ export function createDiscoveryToolsExtension(options: DiscoveryToolsOptions): I
 									}
 								: {
 										schemaVersion: "rag-ime.tool-load-batch.v1",
-										catalogRevision: options.registry.revision(),
+										catalogRevision: options.registry.catalogRevision(),
 										schemaRevision: backendToolSchemaRevision(prepared.map((item) => item.tool)),
 										tools: prepared.map((item) => ({
 											...backendToolRouteEntry(item.tool),
@@ -812,7 +816,7 @@ export function createDiscoveryToolsExtension(options: DiscoveryToolsOptions): I
 									}
 								: {
 										schemaVersion: "rag-ime.tool-load-batch.v1",
-										catalogRevision: options.registry.revision(),
+										catalogRevision: options.registry.catalogRevision(),
 										schemaRevision: backendToolSchemaRevision(prepared.map((item) => item.tool)),
 										tools: prepared.map((item, index) => ({
 											...item.result,

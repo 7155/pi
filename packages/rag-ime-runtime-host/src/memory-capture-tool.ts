@@ -73,11 +73,13 @@ export function createMemoryCaptureExtension(options: BackendToolBridgeOptions):
 			if (!supportsMemoryCapture(options.registry.get(MEMORY_CAPTURE_TARGET))) return;
 			pi.registerTool(
 				createProjectedBackendToolDefinition(options, {
-					name: MEMORY_CAPTURE_TOOL_NAME,
-					label: "Propose one memory candidate",
-					description:
-						"Propose one evidence-backed preference, fact, decision, correction, or reusable pitfall for governed review. Use only when a later Session would otherwise need the user to repeat a stable fact, preference, decision, correction, or verified pitfall. The runtime owns the Evidence identity: never guess Atom, Book, relationship, or Evidence IDs. Submit the same fact at most once per turn and at most three candidates in a turn, prioritizing future behavioral impact. In a Room, only public evidence-backed delivery, decision, or project conclusions qualify. Do not capture one-off requests, temporary progress, Tool logs, transient failures, guesses, sensitive information, generic praise, greetings, long source passages, private Room process, or the model's unconfirmed advice. A call creates only a governed candidate, never durable memory; do not announce that you remembered it. On failure, keep the receipt, continue the main task, and do not retry in a loop.",
-					parameters: MEMORY_CAPTURE_PARAMETERS,
+					definition: {
+						name: MEMORY_CAPTURE_TOOL_NAME,
+						label: "Propose one memory candidate",
+						description:
+							"Propose one evidence-backed preference, fact, decision, correction, or reusable pitfall for governed review. Use only when a later Session would otherwise need the user to repeat a stable fact, preference, decision, correction, or verified pitfall. The runtime owns the Evidence identity: never guess Atom, Book, relationship, or Evidence IDs. Submit the same fact at most once per turn and at most three candidates in a turn, prioritizing future behavioral impact. In a Room, only public evidence-backed delivery, decision, or project conclusions qualify. Do not capture one-off requests, temporary progress, Tool logs, transient failures, guesses, sensitive information, generic praise, greetings, long source passages, private Room process, or the model's unconfirmed advice. A call creates only a governed candidate, never durable memory; do not announce that you remembered it. On failure, keep the receipt, continue the main task, and do not retry in a loop.",
+						parameters: MEMORY_CAPTURE_PARAMETERS,
+					},
 					targetToolName: MEMORY_CAPTURE_TARGET,
 					mapArguments(args) {
 						const value =
