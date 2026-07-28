@@ -50,6 +50,10 @@ function containsField(value: unknown, field: string, expected: unknown): boolea
 }
 
 function contextHasJsonField(context: Context, field: string, expected: unknown): boolean {
+	// Native projected tools keep machine-readable receipts in tool-result
+	// details while their visible text stays concise. Inspect that structured
+	// context directly before falling back to legacy JSON-in-text receipts.
+	if (containsField(context.messages, field, expected)) return true;
 	for (const source of stringsIn(context.messages)) {
 		try {
 			if (containsField(JSON.parse(source) as unknown, field, expected)) return true;
@@ -85,7 +89,7 @@ function recordsIn(value: unknown): Array<Record<string, unknown>> {
 }
 
 function parsedContextRecords(context: Context): Array<Record<string, unknown>> {
-	const values: unknown[] = [];
+	const values: unknown[] = [context.messages];
 	for (const source of stringsIn(context.messages)) {
 		try {
 			values.push(JSON.parse(source) as unknown);
@@ -160,7 +164,12 @@ function currentAcceptanceAliases(context: Context, task: string): string[] {
 
 function runtimeEvidenceRefs(context: Context, limit = 2): string[] {
 	return parsedContextRecords(context)
-		.map((record) => String(record.evidenceRef ?? ""))
+		.map((record) => {
+			const evidenceRef = String(record.evidenceRef ?? "").trim();
+			if (evidenceRef) return evidenceRef;
+			if (record.status !== "applied") return "";
+			return String(record.executionReceiptId ?? "").trim();
+		})
 		.filter((value, index, values) => value.length > 0 && values.indexOf(value) === index)
 		.slice(-limit);
 }

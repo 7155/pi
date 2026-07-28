@@ -205,8 +205,8 @@ describe("governed Pi-native workspace tools", () => {
 		expect(definitions.get("read")?.description).toContain("offset/limit");
 		expect(definitions.get("bash")?.executionMode).toBe("parallel");
 
-		const fetchMock = vi.fn<typeof fetch>().mockResolvedValue(
-			new Response(
+		const fetchMock = vi.fn<typeof fetch>().mockImplementation(async () => {
+			return new Response(
 				JSON.stringify({
 					ok: true,
 					result: {
@@ -216,9 +216,12 @@ describe("governed Pi-native workspace tools", () => {
 					},
 				}),
 				{ status: 200, headers: { "Content-Type": "application/json" } },
-			),
-		);
+			);
+		});
 		vi.stubGlobal("fetch", fetchMock);
+		await definitions
+			.get("read")
+			?.execute("call-read", { path: "calculator.py", offset: 0, limit: 16_384 }, undefined, undefined, {} as never);
 		const result = await definitions
 			.get("bash")
 			?.execute("call-bash", { command: "run focused tests", timeout: 20 }, undefined, undefined, {} as never);
@@ -227,7 +230,20 @@ describe("governed Pi-native workspace tools", () => {
 			type: "text",
 			text: "three focused tests passed\n[exit code: 0]",
 		});
-		const request = JSON.parse(String(fetchMock.mock.calls[0]?.[1]?.body)) as {
+		const readRequest = JSON.parse(String(fetchMock.mock.calls[0]?.[1]?.body)) as {
+			tool: string;
+			args: Record<string, unknown>;
+		};
+		expect(readRequest).toMatchObject({
+			tool: "workspace_read",
+			args: {
+				op: "read",
+				path: "calculator.py",
+				lineOffset: 1,
+				lineLimit: 2_000,
+			},
+		});
+		const request = JSON.parse(String(fetchMock.mock.calls[1]?.[1]?.body)) as {
 			tool: string;
 			args: Record<string, unknown>;
 		};

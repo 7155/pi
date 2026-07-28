@@ -288,8 +288,11 @@ export function createNativeWorkspaceToolsExtension(
 					read,
 					(input) => ({
 						path: input.path,
-						lineOffset: input.offset,
-						lineLimit: input.limit,
+						// Pi's native read contract is line-based and 1-indexed.
+						// Normalize malformed model input at the adapter boundary,
+						// then preserve Pi's own 2,000-line truncation ceiling.
+						lineOffset: boundedLimit(input.offset, 1, Number.MAX_SAFE_INTEGER),
+						lineLimit: boundedLimit(input.limit, 2_000, 2_000),
 					}),
 					formatReadResult,
 					artifacts,

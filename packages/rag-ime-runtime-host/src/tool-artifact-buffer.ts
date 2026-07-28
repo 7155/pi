@@ -436,7 +436,7 @@ function evidenceFirst(value: Record<string, unknown>, evidenceRef: string): Rec
 	};
 }
 
-function successfulProductEvidenceRef(value: unknown, depth = 0): string {
+export function successfulProductEvidenceRef(value: unknown, depth = 0): string {
 	if (!isRecord(value) || depth > 5) return "";
 	for (const key of ["roomExecutionReceipt", "executionReceipt"] as const) {
 		const receipt = value[key];

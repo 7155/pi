@@ -2,7 +2,12 @@ import { createHash } from "node:crypto";
 import type { InlineExtension, ToolDefinition } from "@earendil-works/pi-coding-agent";
 import { RuntimeProtocolError } from "./protocol.ts";
 import { NATIVE_WORKSPACE_TOOL_NAMES, RESERVED_RUNTIME_TOOL_NAMES } from "./runtime-tool-names.ts";
-import { modelVisibleResult, modelVisibleToolGatewayResult, ToolArtifactBuffer } from "./tool-artifact-buffer.ts";
+import {
+	modelVisibleResult,
+	modelVisibleToolGatewayResult,
+	successfulProductEvidenceRef,
+	ToolArtifactBuffer,
+} from "./tool-artifact-buffer.ts";
 import type { ToolResultStore } from "./tool-result-store.ts";
 
 const TOOL_NAME_PATTERN = /^[a-zA-Z][a-zA-Z0-9_.-]{0,127}$/;
@@ -854,7 +859,28 @@ export function createProjectedBackendToolDefinition(
 					? (executed.details as Record<string, unknown>)
 					: {};
 			const projected = projection.projectModelResult(details);
-			const visible = modelVisibleResult(projected, options.resultStore, projection.definition.name, args);
+			const evidenceRef = successfulProductEvidenceRef(details);
+			const projectedWithEvidence =
+				evidenceRef.length === 0
+					? projected
+					: typeof projected === "string"
+						? `[evidence ref: ${evidenceRef}]\n${projected}`
+						: typeof projected === "object" && projected !== null && !Array.isArray(projected)
+							? {
+									evidenceRef,
+									...Object.fromEntries(
+										Object.entries(projected as Record<string, unknown>).filter(
+											([key]) => key !== "evidenceRef",
+										),
+									),
+								}
+							: { evidenceRef, result: projected };
+			const visible = modelVisibleResult(
+				projectedWithEvidence,
+				options.resultStore,
+				projection.definition.name,
+				args,
+			);
 			return {
 				...executed,
 				content: [
@@ -863,6 +889,7 @@ export function createProjectedBackendToolDefinition(
 						text: typeof visible === "string" ? visible : JSON.stringify(visible),
 					},
 				],
+				details: evidenceRef ? { ...details, evidenceRef } : details,
 			};
 		},
 	};
