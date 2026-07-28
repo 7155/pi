@@ -1,6 +1,18 @@
 import { describe, expect, it, vi } from "vitest";
-import { bootstrapNativeWorkspaceToolTargets } from "../src/native-workspace-tools.ts";
+import {
+	bootstrapNativeWorkspaceToolTargets,
+	createNativeWorkspaceToolsExtension,
+} from "../src/native-workspace-tools.ts";
 import { bootstrapRoomTools, ROOM_BOOTSTRAP_TOOL_NAMES } from "../src/room-tool-bootstrap.ts";
+import {
+	BASH_TOOL_NAME,
+	EDIT_TOOL_NAME,
+	FIND_TOOL_NAME,
+	GREP_TOOL_NAME,
+	LS_TOOL_NAME,
+	READ_TOOL_NAME,
+	WRITE_TOOL_NAME,
+} from "../src/runtime-tool-names.ts";
 import { BackendToolRegistry } from "../src/tool-bridge.ts";
 
 function roomRegistry(): BackendToolRegistry {
@@ -65,6 +77,36 @@ function options(registry: BackendToolRegistry) {
 			manifestHash: "b".repeat(64),
 		},
 	};
+}
+
+function ordinaryRegistryWithNativeTargets(): BackendToolRegistry {
+	const registry = new BackendToolRegistry();
+	const target = (name: string, runtimeProjections: Array<{ name: string; operation: string }>) => ({
+		name,
+		description: `Run ${name}.`,
+		parameters: {
+			type: "object",
+			oneOf: runtimeProjections.map(({ operation }) => ({
+				type: "object",
+				properties: { op: { const: operation } },
+				required: ["op"],
+			})),
+		},
+		modelVisible: false,
+		runtimeProjections,
+	});
+	registry.sync([
+		target("workspace_read", [{ name: READ_TOOL_NAME, operation: "read" }]),
+		target("workspace_search", [
+			{ name: GREP_TOOL_NAME, operation: "search" },
+			{ name: FIND_TOOL_NAME, operation: "search" },
+		]),
+		target("workspace_list", [{ name: LS_TOOL_NAME, operation: "list" }]),
+		target("workspace_edit", [{ name: EDIT_TOOL_NAME, operation: "apply" }]),
+		target("workspace_write", [{ name: WRITE_TOOL_NAME, operation: "apply" }]),
+		target("workspace_shell", [{ name: BASH_TOOL_NAME, operation: "run" }]),
+	]);
+	return registry;
 }
 
 describe("Room bootstrap tools", () => {
@@ -169,5 +211,35 @@ describe("Room bootstrap tools", () => {
 		} finally {
 			vi.unstubAllGlobals();
 		}
+	});
+
+	it("registers every manifest-projected native coding tool for an ordinary Session without Room receipts", () => {
+		const registry = ordinaryRegistryWithNativeTargets();
+		const definitions = new Map<string, unknown>();
+		const extension = createNativeWorkspaceToolsExtension({
+			sessionId: "session-ordinary",
+			registry,
+			gatewayUrl: "http://127.0.0.1:8766/api/agent/tool/execute",
+			cwd: "/workspace",
+		}) as unknown as { factory(pi: unknown): void };
+		extension.factory({
+			registerTool(definition: { name: string }) {
+				definitions.set(definition.name, definition);
+			},
+		} as never);
+
+		expect([...definitions.keys()].sort()).toEqual(
+			[
+				READ_TOOL_NAME,
+				GREP_TOOL_NAME,
+				FIND_TOOL_NAME,
+				LS_TOOL_NAME,
+				EDIT_TOOL_NAME,
+				WRITE_TOOL_NAME,
+				BASH_TOOL_NAME,
+			].sort(),
+		);
+		expect(registry.governedLoadReceipts()).toEqual([]);
+		expect(registry.disclosed()).toEqual([]);
 	});
 });
