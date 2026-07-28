@@ -191,11 +191,17 @@ function withEvidenceRead(
 			if (signal?.aborted) throw new Error("Operation aborted");
 			const evidence = options.resultStore?.read(path, boundedLimit(input.offset, 1, Number.MAX_SAFE_INTEGER));
 			if (!evidence) throw new Error(`Tool-result evidence store is unavailable: ${path}`);
+			const latestObservation = evidence.observations.at(-1);
 			const lines = [
 				`[Tool evidence ${evidence.available ? "available" : "reclaimed"}]`,
 				`handle=${evidence.handle}`,
 				`sha256=${evidence.sha256}`,
 				`originalBytes=${evidence.byteSize}`,
+				latestObservation?.toolName ? `tool=${latestObservation.toolName}` : "",
+				latestObservation ? `status=${latestObservation.status}` : "",
+				latestObservation?.requestSummary ? `request=${JSON.stringify(latestObservation.requestSummary)}` : "",
+				latestObservation?.resultSummary ? `resultSummary=${JSON.stringify(latestObservation.resultSummary)}` : "",
+				latestObservation?.resultFacts ? `resultFacts=${JSON.stringify(latestObservation.resultFacts)}` : "",
 				evidence.segmentCount > 0
 					? `segment=${evidence.segment}/${evidence.segmentCount} (offset selects 48KiB evidence segments)`
 					: "",
@@ -214,6 +220,11 @@ function withEvidenceRead(
 					evidenceAvailable: evidence.available,
 					segment: evidence.segment,
 					segmentCount: evidence.segmentCount,
+					...(latestObservation?.toolName ? { evidenceToolName: latestObservation.toolName } : {}),
+					...(latestObservation ? { evidenceStatus: latestObservation.status } : {}),
+					...(latestObservation?.requestSummary ? { evidenceRequest: latestObservation.requestSummary } : {}),
+					...(latestObservation?.resultSummary ? { evidenceSummary: latestObservation.resultSummary } : {}),
+					...(latestObservation?.resultFacts ? { evidenceFacts: latestObservation.resultFacts } : {}),
 					...(evidence.nextSegment ? { nextSegment: evidence.nextSegment } : {}),
 				},
 			};

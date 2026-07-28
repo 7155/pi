@@ -47,11 +47,11 @@ describe("ToolResultStore", () => {
 		const store = temporaryStore();
 		const output = `first evidence line\n${"semantic tool evidence ".repeat(8_000)}\nlast evidence line`;
 
-		const visible = modelVisibleResult(
-			{ summary: "Search completed", output, matchCount: 8_000 },
-			store,
-			"grep",
-		) as Record<string, unknown>;
+		const visible = modelVisibleResult({ summary: "Search completed", output, matchCount: 8_000 }, store, "grep", {
+			pattern: "semantic evidence",
+			path: "src",
+			limit: 100,
+		}) as Record<string, unknown>;
 		const serialized = JSON.stringify(visible);
 		const handle = String(visible.evidenceHandle);
 
@@ -62,8 +62,18 @@ describe("ToolResultStore", () => {
 		// exact boundary even after the raw payload becomes reclaimable.
 		expect(serialized.slice(0, 2_000)).toContain(handle);
 		expect(serialized.slice(0, 2_000)).toContain("Search completed");
+		expect(serialized.slice(0, 2_000)).toContain("semantic evidence");
 		expect(visible).toMatchObject({
+			evidenceToolName: "grep",
+			evidenceStatus: "completed",
+			evidenceRequest: {
+				pattern: "semantic evidence",
+				path: "src",
+				limit: 100,
+			},
+			evidenceSummary: "Search completed",
 			evidenceAvailable: true,
+			evidenceAvailability: "available_at_capture",
 			summary: "Search completed",
 			matchCount: 8_000,
 			truncated: true,
@@ -98,17 +108,77 @@ describe("ToolResultStore", () => {
 		expect(current.content).toContain("new:");
 	});
 
+	it("keeps a useful semantic tombstone after reclaiming the raw result", () => {
+		const store = temporaryStore(1024 * 1024);
+		const visible = modelVisibleResult(
+			{
+				summary: "Found 100 matching call sites in 24 files",
+				matches: Array.from({ length: 20_000 }, (_, index) => ({
+					path: `src/file-${index % 24}.ts`,
+					line: index + 1,
+				})),
+			},
+			store,
+			"grep",
+			{
+				pattern: "modelVisibleResult",
+				path: "packages/rag-ime-runtime-host/src",
+				limit: 100,
+				apiKey: "must-not-survive",
+			},
+		) as Record<string, unknown>;
+		const handle = String(visible.evidenceHandle);
+		store.persist(`newer:${"z".repeat(900_000)}`, {
+			toolName: "bash",
+			status: "completed",
+			requestSummary: { commandPreview: "run focused tests" },
+			resultSummary: "Focused tests passed",
+		});
+
+		const reclaimed = store.read(handle);
+		expect(reclaimed.available).toBe(false);
+		expect(reclaimed.observations).toHaveLength(1);
+		expect(reclaimed.observations[0]).toMatchObject({
+			toolName: "grep",
+			status: "completed",
+			requestSummary: {
+				pattern: "modelVisibleResult",
+				path: "packages/rag-ime-runtime-host/src",
+				limit: 100,
+				apiKey: "[redacted]",
+			},
+			resultSummary: "Found 100 matching call sites in 24 files",
+		});
+		expect(reclaimed.content).toContain("rawPayloadAvailable=false");
+		expect(reclaimed.content).toContain("observation1.tool=grep");
+		expect(reclaimed.content).toContain("modelVisibleResult");
+		expect(reclaimed.content).toContain("Found 100 matching call sites in 24 files");
+		expect(reclaimed.content).not.toContain("must-not-survive");
+	});
+
 	it("restores an evicted content-addressed payload without changing its handle", () => {
 		const store = temporaryStore(1024 * 1024);
 		const original = `repeatable:${"x".repeat(700_000)}`;
-		const first = store.persist(original, "read");
+		const first = store.persist(original, {
+			toolName: "read",
+			status: "completed",
+			requestSummary: { path: "first.txt" },
+			resultSummary: "Read first.txt",
+		});
 		store.persist(`newer:${"y".repeat(700_000)}`, "read");
 		expect(store.read(first.evidenceHandle).available).toBe(false);
 
-		const restored = store.persist(original, "read");
+		const restored = store.persist(original, {
+			toolName: "grep",
+			status: "completed",
+			requestSummary: { pattern: "repeatable", path: "first.txt" },
+			resultSummary: "Found repeatable text",
+		});
 
 		expect(restored.evidenceHandle).toBe(first.evidenceHandle);
-		expect(store.read(first.evidenceHandle).available).toBe(true);
+		const reread = store.read(first.evidenceHandle);
+		expect(reread.available).toBe(true);
+		expect(reread.observations.map((item) => item.toolName)).toEqual(["read", "grep"]);
 	});
 });
 

@@ -1,4 +1,5 @@
-import type { ToolResultStore } from "./tool-result-store.ts";
+import { createHash } from "node:crypto";
+import type { ToolResultEvidenceDescriptor, ToolResultEvidenceStatus, ToolResultStore } from "./tool-result-store.ts";
 
 const MAX_ARTIFACT_BLOCKS = 16;
 export const MAX_MODEL_VISIBLE_TOOL_RESULT_BYTES = 50 * 1024;
@@ -117,7 +118,12 @@ export function toolAgentBlocks(...values: unknown[]): Record<string, unknown>[]
  * deliberately the first field so Pi compaction retains proof that the call
  * happened even when the raw payload is later reclaimed.
  */
-export function modelVisibleResult(value: unknown, store?: ToolResultStore, toolName?: string): unknown {
+export function modelVisibleResult(
+	value: unknown,
+	store?: ToolResultStore,
+	toolName?: string,
+	args?: unknown,
+): unknown {
 	const projected = stripAgentBlocks(value);
 	const serialized = JSON.stringify(projected) ?? String(projected);
 	const originalBytes = Buffer.byteLength(serialized, "utf8");
@@ -125,8 +131,8 @@ export function modelVisibleResult(value: unknown, store?: ToolResultStore, tool
 
 	const readable =
 		typeof projected === "string" ? projected : (JSON.stringify(projected, null, 2) ?? String(projected));
-	const evidence = store?.persist(readable, toolName);
 	const preview = semanticPreview(projected, readable);
+	const evidence = store?.persist(readable, evidenceDescriptor(projected, readable, preview, toolName, args));
 	return {
 		...(evidence ?? {}),
 		...(evidence
@@ -152,11 +158,16 @@ export function modelVisibleResult(value: unknown, store?: ToolResultStore, tool
  * Keep governance receipts in ToolResult.details while giving the model only
  * the short successful evidence ref it may cite in room_commit.
  */
-export function modelVisibleToolGatewayResult(value: unknown, store?: ToolResultStore, toolName?: string): unknown {
+export function modelVisibleToolGatewayResult(
+	value: unknown,
+	store?: ToolResultStore,
+	toolName?: string,
+	args?: unknown,
+): unknown {
 	const evidenceRef = successfulProductEvidenceRef(value);
 	const stripped = stripToolGatewayAuditFields(value);
 	const projected = evidenceRef && isRecord(stripped) ? evidenceFirst(stripped, evidenceRef) : stripped;
-	return modelVisibleResult(projected, store, toolName);
+	return modelVisibleResult(projected, store, toolName, args);
 }
 
 function semanticPreview(projected: unknown, readable: string): Record<string, unknown> {
@@ -213,6 +224,180 @@ function semanticPreview(projected: unknown, readable: string): Record<string, u
 	preview.previewHead = head;
 	if (tail && tail !== head) preview.previewTail = tail;
 	return preview;
+}
+
+const SAFE_EVIDENCE_ARGUMENT_KEYS = new Set([
+	"op",
+	"path",
+	"paths",
+	"query",
+	"pattern",
+	"glob",
+	"mode",
+	"offset",
+	"limit",
+	"depth",
+	"recursive",
+	"caseSensitive",
+	"fixedStrings",
+	"context",
+	"cwd",
+	"timeout",
+	"timeoutSeconds",
+	"allowNetwork",
+	"encoding",
+	"line",
+	"startLine",
+	"endLine",
+	"file",
+	"targetId",
+	"bookId",
+	"draftId",
+	"proposalId",
+	"runId",
+]);
+const DIGESTED_EVIDENCE_ARGUMENT_KEYS = new Set([
+	"content",
+	"text",
+	"body",
+	"payload",
+	"data",
+	"oldText",
+	"newText",
+	"replacement",
+	"patch",
+]);
+const SENSITIVE_ARGUMENT_KEY = /(api.?key|token|secret|password|cookie|authorization|credential|capability)/iu;
+
+function evidenceDescriptor(
+	projected: unknown,
+	readable: string,
+	preview: Record<string, unknown>,
+	toolName?: string,
+	args?: unknown,
+): ToolResultEvidenceDescriptor {
+	const requestSummary = evidenceRequestSummary(args);
+	const resultFacts = evidenceResultFacts(preview);
+	return {
+		...(toolName ? { toolName } : {}),
+		status: evidenceStatus(projected, readable),
+		...(requestSummary ? { requestSummary } : {}),
+		resultSummary: evidenceResultSummary(projected, readable),
+		...(resultFacts ? { resultFacts } : {}),
+	};
+}
+
+function evidenceRequestSummary(value: unknown): Record<string, unknown> | undefined {
+	if (!isRecord(value)) return undefined;
+	const summary: Record<string, unknown> = {};
+	const omitted: string[] = [];
+	for (const [key, item] of Object.entries(value)) {
+		if (SENSITIVE_ARGUMENT_KEY.test(key)) {
+			summary[key] = "[redacted]";
+			continue;
+		}
+		if (key === "command" && typeof item === "string") {
+			summary.commandPreview = boundedEvidenceText(redactEvidenceText(item), 1_024);
+			summary.commandSha256 = digestText(item);
+			summary.commandBytes = Buffer.byteLength(item, "utf8");
+			continue;
+		}
+		if (DIGESTED_EVIDENCE_ARGUMENT_KEYS.has(key) && typeof item === "string") {
+			summary[`${key}Sha256`] = digestText(item);
+			summary[`${key}Bytes`] = Buffer.byteLength(item, "utf8");
+			continue;
+		}
+		if (SAFE_EVIDENCE_ARGUMENT_KEYS.has(key)) {
+			const safe = evidenceArgumentValue(item);
+			if (safe !== undefined) summary[key] = safe;
+			continue;
+		}
+		omitted.push(key);
+	}
+	if (omitted.length > 0) summary.omittedArgumentKeys = omitted.slice(0, 32);
+	return Object.keys(summary).length > 0 ? summary : undefined;
+}
+
+function evidenceArgumentValue(value: unknown): unknown {
+	if (typeof value === "string") return boundedEvidenceText(redactEvidenceText(value), 1_024);
+	if (typeof value === "number" || typeof value === "boolean" || value === null) return value;
+	if (Array.isArray(value)) {
+		return value.slice(0, 16).map((item) => {
+			if (typeof item === "string") return boundedEvidenceText(redactEvidenceText(item), 512);
+			if (typeof item === "number" || typeof item === "boolean" || item === null) return item;
+			return `[${Array.isArray(item) ? "array" : typeof item}]`;
+		});
+	}
+	return undefined;
+}
+
+function evidenceStatus(projected: unknown, readable: string): ToolResultEvidenceStatus {
+	if (isRecord(projected)) {
+		const status = typeof projected.status === "string" ? projected.status.toLowerCase() : "";
+		const approvalState = typeof projected.approvalState === "string" ? projected.approvalState.toLowerCase() : "";
+		if (status.includes("cancel") || status.includes("abort") || approvalState.includes("cancel")) {
+			return "cancelled";
+		}
+		if (
+			projected.ok === false ||
+			projected.success === false ||
+			typeof projected.error === "string" ||
+			["failed", "error", "rejected", "expired"].some(
+				(value) => status.includes(value) || approvalState.includes(value),
+			) ||
+			(typeof projected.exitCode === "number" && projected.exitCode !== 0)
+		) {
+			return "failed";
+		}
+		return "completed";
+	}
+	const exitCode = /\[exit code:\s*(-?\d+)\]/iu.exec(readable);
+	if (exitCode) return Number(exitCode[1]) === 0 ? "completed" : "failed";
+	return "completed";
+}
+
+function evidenceResultSummary(projected: unknown, readable: string): string {
+	if (isRecord(projected)) {
+		for (const key of ["summary", "message", "error", "reason"] as const) {
+			if (typeof projected[key] === "string" && projected[key].trim()) {
+				return boundedEvidenceText(redactEvidenceText(projected[key]), 2_048);
+			}
+		}
+	}
+	const redacted = redactEvidenceText(readable);
+	const head = sliceUtf8(redacted, 0, 1_280);
+	if (Buffer.byteLength(redacted, "utf8") <= 1_280) return head;
+	const tail = sliceUtf8(redacted, Math.max(0, Buffer.byteLength(redacted, "utf8") - 512), 512);
+	return `${head}\n[... raw evidence omitted ...]\n${tail}`;
+}
+
+function evidenceResultFacts(preview: Record<string, unknown>): Record<string, unknown> | undefined {
+	const facts = Object.fromEntries(
+		Object.entries(preview).filter(([key]) => key !== "previewHead" && key !== "previewTail"),
+	);
+	return Object.keys(facts).length > 0 ? facts : undefined;
+}
+
+function redactEvidenceText(value: string): string {
+	return value
+		.replace(/\bBearer\s+[A-Za-z0-9._~+/=-]+/giu, "Bearer [redacted]")
+		.replace(
+			/\b(api[_-]?key|token|secret|password|cookie|authorization)\s*=\s*(?:"[^"]*"|'[^']*'|[^\s]+)/giu,
+			"$1=[redacted]",
+		)
+		.replace(/([?&](?:api[_-]?key|token|secret|password|authorization)=)[^&#\s]+/giu, "$1[redacted]");
+}
+
+function digestText(value: string): string {
+	return createHash("sha256").update(value, "utf8").digest("hex");
+}
+
+function boundedEvidenceText(value: string, maxBytes: number): string {
+	const encoded = Buffer.from(value, "utf8");
+	if (encoded.byteLength <= maxBytes) return value;
+	let end = maxBytes;
+	while (end > 0 && (encoded[end] & 0xc0) === 0x80) end -= 1;
+	return `${encoded.subarray(0, end).toString("utf8")}…`;
 }
 
 function sliceUtf8(value: string, startByte: number, maxBytes: number): string {

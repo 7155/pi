@@ -623,6 +623,7 @@ async function executeGatewayTool(
 							{ summary, reviewState: reviewed ? "reviewed" : "deferred", runId },
 							options.resultStore,
 							tool.name,
+							prepared.arguments,
 						),
 					),
 				},
@@ -682,6 +683,7 @@ async function executeGatewayTool(
 							},
 							options.resultStore,
 							tool.name,
+							prepared.arguments,
 						),
 					),
 				},
@@ -699,7 +701,9 @@ async function executeGatewayTool(
 		content: [
 			{
 				type: "text",
-				text: JSON.stringify(modelVisibleToolGatewayResult(result, options.resultStore, tool.name)),
+				text: JSON.stringify(
+					modelVisibleToolGatewayResult(result, options.resultStore, tool.name, prepared.arguments),
+				),
 			},
 		],
 		details: { ...result, toolName: tool.name, ...(agentBlocks.length > 0 ? { agentBlocks } : {}) },
@@ -759,7 +763,7 @@ export function createProjectedBackendToolDefinition(
 					? (executed.details as Record<string, unknown>)
 					: {};
 			const projected = projection.projectModelResult(details);
-			const visible = modelVisibleResult(projected, options.resultStore, projection.definition.name);
+			const visible = modelVisibleResult(projected, options.resultStore, projection.definition.name, args);
 			return {
 				...executed,
 				content: [
