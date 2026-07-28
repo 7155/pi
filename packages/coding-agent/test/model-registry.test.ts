@@ -12,6 +12,7 @@ import { getApiProvider, getSupportedThinkingLevels } from "@earendil-works/pi-a
 import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
 import { AuthStorage } from "../src/core/auth-storage.ts";
 import { clearApiKeyCache, type ModelRegistry, type ProviderConfigInput } from "../src/core/model-registry.ts";
+import { InMemoryCodingAgentModelsStore } from "../src/core/models-store.ts";
 
 import { createModelRegistry } from "./model-runtime-test-utils.ts";
 
@@ -272,6 +273,47 @@ describe("ModelRegistry", () => {
 				maxTokensField: "max_completion_tokens",
 			});
 			expect(model?.compat).not.toHaveProperty("supportsToolSearch");
+		});
+
+		test("does not let a persisted route catalog replace capabilities inherited by an alias", async () => {
+			writeRawModelsJson({
+				gpt: {
+					modelCatalogProvider: "openai",
+					baseUrl: "https://gateway.example.com/v1",
+					apiKey: "test-key",
+					api: "openai-completions",
+					models: [{ id: "gpt-5.6-luna" }],
+				},
+			});
+			const modelsStore = new InMemoryCodingAgentModelsStore();
+			await modelsStore.write("gpt", {
+				checkedAt: Date.now(),
+				models: [
+					{
+						id: "gpt-5.6-luna",
+						name: "Route-local Luna",
+						api: "openai-responses",
+						provider: "openai",
+						baseUrl: "https://route.example.com/v1",
+						reasoning: true,
+						input: ["text"],
+						cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+						contextWindow: 1_050_000,
+						maxTokens: 128_000,
+					},
+				],
+			});
+
+			const registry = await createModelRegistry(authStorage, modelsJsonPath, { modelsStore });
+			const model = registry.find("gpt", "gpt-5.6-luna");
+
+			expect(model).toMatchObject({
+				provider: "gpt",
+				id: "gpt-5.6-luna",
+				name: "GPT-5.6 Luna",
+				contextWindow: 272_000,
+				maxTokens: 128_000,
+			});
 		});
 
 		test("fails closed when an alias model is absent from the Pi catalog", async () => {

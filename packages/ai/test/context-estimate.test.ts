@@ -78,4 +78,14 @@ describe("context token estimation", () => {
 			lastUsageIndex: 3,
 		});
 	});
+
+	it("refuses input that already fills the model window before output clamping", () => {
+		const context: Context = {
+			messages: [{ role: "user", content: "x".repeat(model.contextWindow * 4), timestamp: 100 }],
+		};
+
+		expect(() => buildBaseOptions(model, context)).toThrow(
+			"Estimated input of 10000 tokens exceeds the context window of 10000 tokens",
+		);
+	});
 });

@@ -1,4 +1,4 @@
-import type { CredentialStore } from "@earendil-works/pi-ai";
+import type { CredentialStore, ModelsStore } from "@earendil-works/pi-ai";
 import { ModelRegistry } from "../src/core/model-registry.ts";
 import { ModelRuntime } from "../src/core/model-runtime.ts";
 
@@ -10,8 +10,19 @@ function wrap(runtime: ModelRuntime): ModelRegistry {
 	return registry;
 }
 
-export async function createModelRegistry(credentials: CredentialStore, modelsPath?: string): Promise<ModelRegistry> {
-	return wrap(await ModelRuntime.create({ credentials, modelsPath, allowModelNetwork: false }));
+export async function createModelRegistry(
+	credentials: CredentialStore,
+	modelsPath?: string,
+	options: { modelsStore?: ModelsStore } = {},
+): Promise<ModelRegistry> {
+	return wrap(
+		await ModelRuntime.create({
+			credentials,
+			modelsPath,
+			modelsStore: options.modelsStore,
+			allowModelNetwork: false,
+		}),
+	);
 }
 
 export async function createInMemoryModelRegistry(credentials: CredentialStore): Promise<ModelRegistry> {

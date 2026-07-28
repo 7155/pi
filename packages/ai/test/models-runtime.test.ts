@@ -669,6 +669,25 @@ describe("Models runtime", () => {
 		expect(result.errorMessage).toContain("Unknown provider: ghost");
 	});
 
+	it("refuses oversized input before auth or provider dispatch", async () => {
+		const calls: ProviderCall[] = [];
+		const models = createModels();
+		models.setProvider(testProvider({ id: "p1", calls }));
+		const model = testModel("p1", "model-a");
+		const oversizedContext: Context = {
+			messages: [{ role: "user", content: "x".repeat(model.contextWindow * 4), timestamp: Date.now() }],
+		};
+
+		const simpleResult = await models.completeSimple(model, oversizedContext);
+		const fullResult = await models.complete(model, oversizedContext);
+
+		expect(simpleResult.stopReason).toBe("error");
+		expect(simpleResult.errorMessage).toContain("exceeds the context window");
+		expect(fullResult.stopReason).toBe("error");
+		expect(fullResult.errorMessage).toContain("exceeds the context window");
+		expect(calls).toHaveLength(0);
+	});
+
 	it("streams through the provider", async () => {
 		const models = createModels();
 		models.setProvider(testProvider({ id: "p1" }));

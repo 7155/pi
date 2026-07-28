@@ -93,6 +93,7 @@ export class ModelRuntime implements Models {
 	private readonly models: MutableModels;
 	private readonly credentials: RuntimeCredentials;
 	private readonly defaultBuiltins: ReadonlyMap<string, Provider>;
+	private readonly catalogBuiltins: ReadonlyMap<string, Provider>;
 	private readonly builtins = new Map<string, Provider>();
 	private readonly extensionProviders = new Map<string, ProviderConfigInput>();
 	private readonly compositionErrors = new Map<string, string>();
@@ -115,6 +116,7 @@ export class ModelRuntime implements Models {
 		modelsPath: string | undefined,
 		modelsStore: ModelsStore,
 		providers: readonly Provider[],
+		catalogProviders: readonly Provider[],
 		allowModelNetwork: boolean,
 	) {
 		this.credentials = credentials;
@@ -122,6 +124,7 @@ export class ModelRuntime implements Models {
 		this.modelsPath = modelsPath;
 		this.allowModelNetwork = allowModelNetwork;
 		this.defaultBuiltins = new Map(providers.map((provider) => [provider.id, provider]));
+		this.catalogBuiltins = new Map(catalogProviders.map((provider) => [provider.id, provider]));
 		for (const [providerId, provider] of this.defaultBuiltins) this.builtins.set(providerId, provider);
 		this.models = createModels({ credentials, modelsStore });
 		this.rebuildProviders();
@@ -137,17 +140,17 @@ export class ModelRuntime implements Models {
 			(modelsPath
 				? new FileModelsStore(options.modelsStorePath ?? join(dirname(modelsPath), "models-store.json"))
 				: new InMemoryCodingAgentModelsStore());
-		const providers = builtinProviderCatalog
-			.builtinProviders()
-			.map((provider) =>
-				provider.id === "radius" ? provider : withRemoteCatalog(provider, options.catalogBaseUrl),
-			);
+		const catalogProviders = builtinProviderCatalog.builtinProviders();
+		const providers = catalogProviders.map((provider) =>
+			provider.id === "radius" ? provider : withRemoteCatalog(provider, options.catalogBaseUrl),
+		);
 		const runtime = new ModelRuntime(
 			credentials,
 			config,
 			modelsPath,
 			modelsStore,
 			providers,
+			catalogProviders,
 			options.allowModelNetwork ?? process.env.PI_OFFLINE === undefined,
 		);
 		runtime.configureRadiusProviders();
@@ -188,7 +191,10 @@ export class ModelRuntime implements Models {
 	private recomposeProvider(providerId: string): void {
 		const configuredProvider = this.config.getProvider(providerId);
 		const catalogProviderId = configuredProvider?.modelCatalogProvider;
-		const base = catalogProviderId ? this.defaultBuiltins.get(catalogProviderId) : this.builtins.get(providerId);
+		// A catalog alias describes a stable compatibility contract. It must
+		// inherit the generated built-in catalog, not a persisted/remote overlay
+		// whose route may advertise a different context window for the same ID.
+		const base = catalogProviderId ? this.catalogBuiltins.get(catalogProviderId) : this.builtins.get(providerId);
 		const extension = this.extensionProviders.get(providerId);
 		if (!base && !configuredProvider && !extension) {
 			this.models.deleteProvider(providerId);

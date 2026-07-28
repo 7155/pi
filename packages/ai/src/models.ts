@@ -28,6 +28,7 @@ import type {
 	StreamOptions,
 	Usage,
 } from "./types.ts";
+import { assertContextFitsModel } from "./utils/context-limit.ts";
 
 export { ModelsError, type ModelsErrorCode } from "./auth/resolve.ts";
 
@@ -482,6 +483,7 @@ class ModelsImpl implements MutableModels {
 		options?: ModelsApiStreamOptions<TApi>,
 	): AssistantMessageEventStream {
 		return lazyStream(model, async () => {
+			assertContextFitsModel(model, context);
 			const provider = this.requireProvider(model);
 			const { requestModel, requestOptions } = await this.applyAuth(
 				model,
@@ -501,6 +503,7 @@ class ModelsImpl implements MutableModels {
 
 	streamSimple(model: Model<Api>, context: Context, options?: ModelsSimpleStreamOptions): AssistantMessageEventStream {
 		return lazyStream(model, async () => {
+			assertContextFitsModel(model, context);
 			const provider = this.requireProvider(model);
 			const { requestModel, requestOptions } = await this.applyAuth(model, options);
 			return provider.streamSimple(requestModel, context, requestOptions as SimpleStreamOptions);
