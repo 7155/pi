@@ -132,8 +132,14 @@ describe("memory_capture runtime projection", () => {
 			} as never);
 			const tool = definitions.get(MEMORY_CAPTURE_TOOL_NAME);
 			if (!tool) throw new Error("memory_capture was not registered");
+			expect(tool.description).toContain("at most three candidates");
+			expect(tool.description).toContain("private Room process");
+			expect(tool.description).toContain("never durable memory");
 			expect(JSON.stringify(tool.parameters)).not.toContain("sourceId");
 			expect(JSON.stringify(tool.parameters)).not.toContain("maintenance_apply");
+			expect(JSON.stringify(tool.parameters)).toContain(
+				"at least two independent signals visible in the current context",
+			);
 
 			const result = await tool.execute(
 				"call-memory",
