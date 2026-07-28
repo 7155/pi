@@ -1,13 +1,18 @@
 const TOOL_FOCUS_BY_STAGE: Readonly<Record<string, readonly string[]>> = {
+	// `read`, `grep`, `find`, `ls`, `edit`, `write`, and `bash` are resident
+	// native coding tools. They are deliberately absent here: this projection
+	// is only for deferred product-tool discovery, and advertising native
+	// tools again makes the model search for or load capabilities it already
+	// has.
 	requirements: ["room_collaborate"],
-	solution: ["room_collaborate", "workspace_list", "workspace_search", "workspace_read"],
-	planning: ["room_collaborate", "workspace_list", "workspace_search", "workspace_read"],
-	implementation: ["room_collaborate", "workspace_read", "workspace_patch", "workspace_shell"],
-	debugging: ["room_collaborate", "workspace_search", "workspace_read", "workspace_shell"],
-	"self-check": ["room_collaborate", "workspace_search", "workspace_read", "workspace_shell"],
-	review: ["room_collaborate", "workspace_search", "workspace_read", "workspace_shell"],
-	"vision-review": ["room_collaborate", "workspace_search", "workspace_read", "workspace_shell"],
-	feedback: ["room_collaborate", "workspace_read", "workspace_patch", "workspace_shell"],
+	solution: ["room_collaborate"],
+	planning: ["room_collaborate"],
+	implementation: ["room_collaborate"],
+	debugging: ["room_collaborate"],
+	"self-check": ["room_collaborate"],
+	review: ["room_collaborate"],
+	"vision-review": ["room_collaborate"],
+	feedback: ["room_collaborate"],
 	handoff: ["room_collaborate"],
 	closure: ["room_collaborate"],
 };

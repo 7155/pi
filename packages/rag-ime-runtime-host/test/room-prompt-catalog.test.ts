@@ -3,15 +3,30 @@ import { roomSkillPromptFocus, roomToolPromptFocus } from "../src/room-prompt-ca
 
 describe("Room prompt catalog projection", () => {
 	it("selects no more than four exact Tool cards for the current stage", () => {
-		expect(roomToolPromptFocus({ stage: "implementation" })).toEqual([
-			"room_collaborate",
-			"workspace_read",
-			"workspace_patch",
-			"workspace_shell",
-		]);
+		expect(roomToolPromptFocus({ stage: "implementation" })).toEqual(["room_collaborate"]);
 		expect(roomToolPromptFocus({ stage: "closure" })).toEqual(["room_collaborate"]);
 		expect(roomToolPromptFocus({ stage: "unknown" })).toEqual([]);
 		expect(roomToolPromptFocus(undefined)).toBeUndefined();
+	});
+
+	it("never re-advertises resident native coding tools as deferred tools", () => {
+		for (const stage of [
+			"requirements",
+			"solution",
+			"planning",
+			"implementation",
+			"debugging",
+			"self-check",
+			"review",
+			"vision-review",
+			"feedback",
+			"handoff",
+			"closure",
+		]) {
+			const focus = roomToolPromptFocus({ stage }) ?? [];
+			expect(focus).toEqual(["room_collaborate"]);
+			expect(focus.some((name) => name.startsWith("workspace_"))).toBe(false);
+		}
 	});
 
 	it("prefers ordered next candidates and bounds exact Skill cards", () => {
