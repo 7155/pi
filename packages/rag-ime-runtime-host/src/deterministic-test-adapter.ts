@@ -108,10 +108,10 @@ function latestWorkspaceReadReceipt(context: Context, fileName: string): Record<
 				typeof record.endLine === "number" &&
 				(record.nextLineOffset === null || typeof record.nextLineOffset === "number") &&
 				typeof record.truncated === "boolean" &&
-				record.toolName === undefined
+				(record.toolName === undefined || record.toolName === "workspace_read")
 			);
 		})
-		.sort((left, right) => Number(left.startLine) - Number(right.startLine))
+		.sort((left, right) => Number(left.endLine) - Number(right.endLine))
 		.at(-1);
 }
 
@@ -702,7 +702,7 @@ export function agentSessionCanaryResponse(context: Context): AssistantMessage {
 	}
 	if (boundaryReceipt.truncated === true) {
 		const nextOffset = Number(boundaryReceipt.nextLineOffset);
-		if (!Number.isSafeInteger(nextOffset) || nextOffset <= boundaryEndLine) {
+		if (!Number.isSafeInteger(nextOffset) || nextOffset !== boundaryEndLine + 1) {
 			throw new Error("read did not advance its line continuation offset");
 		}
 		const callId = `agent-read-boundary-${nextOffset}`;

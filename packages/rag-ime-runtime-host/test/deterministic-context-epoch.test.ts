@@ -86,8 +86,12 @@ function agentReceiptContext(tools: string[], receipt: Record<string, unknown>, 
 				timestamp: 1,
 			},
 			{
-				role: "user",
-				content: JSON.stringify(receipt),
+				role: "toolResult",
+				toolCallId: "agent-read-boundary-result",
+				toolName: "read",
+				content: [{ type: "text", text: String(receipt.content ?? "") }],
+				details: { ...receipt, toolName: "workspace_read" },
+				isError: false,
 				timestamp: 2,
 			},
 		] as Context["messages"],
@@ -320,6 +324,32 @@ describe("deterministic context epoch Provider", () => {
 					offset: 1,
 					limit: 1_000,
 				}),
+			}),
+		]);
+		expect(
+			calls(
+				agentSessionCanaryResponse(
+					agentReceiptContext(
+						planTools,
+						{
+							history: planHistory,
+							path: "/workspace/read-boundary.txt",
+							content: "line\n".repeat(1_000),
+							startLine: 1,
+							endLine: 1_000,
+							nextLineOffset: 1_001,
+							size: 25_000,
+							truncated: true,
+						},
+						loadedSkill,
+					),
+				),
+			),
+		).toEqual([
+			expect.objectContaining({
+				name: "read",
+				id: "agent-read-boundary-1001",
+				arguments: { path: "read-boundary.txt", offset: 1_001, limit: 1_000 },
 			}),
 		]);
 		expect(
