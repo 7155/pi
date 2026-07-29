@@ -104,12 +104,14 @@ function latestWorkspaceReadReceipt(context: Context, fileName: string): Record<
 			const path = String(record.path ?? "");
 			return (
 				(path === fileName || path.endsWith(`/${fileName}`)) &&
-				typeof record.nextOffset === "number" &&
+				typeof record.startLine === "number" &&
+				typeof record.endLine === "number" &&
+				(record.nextLineOffset === null || typeof record.nextLineOffset === "number") &&
 				typeof record.truncated === "boolean" &&
 				record.toolName === undefined
 			);
 		})
-		.sort((left, right) => Number(left.nextOffset) - Number(right.nextOffset))
+		.sort((left, right) => Number(left.startLine) - Number(right.startLine))
 		.at(-1);
 }
 
@@ -678,38 +680,41 @@ export function agentSessionCanaryResponse(context: Context): AssistantMessage {
 	}
 	const boundaryReceipt = latestWorkspaceReadReceipt(context, "read-boundary.txt");
 	if (!boundaryReceipt) {
-		if (serialized.includes("agent-read-boundary-0")) {
+		if (serialized.includes("agent-read-boundary-1")) {
 			throw new Error("The Agent Session boundary read did not return a structured receipt");
 		}
 		return fauxAssistantMessage(
-			fauxToolCall("read", { path: "read-boundary.txt", offset: 0, limit: 65_536 }, { id: "agent-read-boundary-0" }),
+			fauxToolCall("read", { path: "read-boundary.txt", offset: 1, limit: 1_000 }, { id: "agent-read-boundary-1" }),
 			{ stopReason: "toolUse" },
 		);
 	}
+	const boundaryContent = String(boundaryReceipt.content ?? "");
+	const boundaryStartLine = Number(boundaryReceipt.startLine);
+	const boundaryEndLine = Number(boundaryReceipt.endLine);
 	if (
-		Number(boundaryReceipt.contentBytes) > 50 * 1024 ||
-		Number(boundaryReceipt.contentLines) > 2_000 ||
-		Number(boundaryReceipt.modelResultLimitBytes) !== 50 * 1024 ||
-		Buffer.byteLength(JSON.stringify(boundaryReceipt), "utf8") > 50 * 1024
+		Buffer.byteLength(boundaryContent, "utf8") > 50 * 1024 ||
+		boundaryEndLine - boundaryStartLine + 1 > 1_000 ||
+		!Number.isSafeInteger(boundaryStartLine) ||
+		!Number.isSafeInteger(boundaryEndLine) ||
+		boundaryEndLine < boundaryStartLine
 	) {
 		throw new Error("read exceeded the Pi model-visible result budget");
 	}
 	if (boundaryReceipt.truncated === true) {
-		const nextOffset = Number(boundaryReceipt.nextOffset);
-		const currentOffset = Number(boundaryReceipt.offset);
-		if (!Number.isSafeInteger(nextOffset) || nextOffset <= currentOffset) {
-			throw new Error("read did not advance its UTF-8 continuation offset");
+		const nextOffset = Number(boundaryReceipt.nextLineOffset);
+		if (!Number.isSafeInteger(nextOffset) || nextOffset <= boundaryEndLine) {
+			throw new Error("read did not advance its line continuation offset");
 		}
 		const callId = `agent-read-boundary-${nextOffset}`;
 		if (serialized.includes(`"id":"${callId}"`)) {
 			throw new Error("The Agent Session boundary continuation did not advance");
 		}
 		return fauxAssistantMessage(
-			fauxToolCall("read", { path: "read-boundary.txt", offset: nextOffset, limit: 65_536 }, { id: callId }),
+			fauxToolCall("read", { path: "read-boundary.txt", offset: nextOffset, limit: 1_000 }, { id: callId }),
 			{ stopReason: "toolUse" },
 		);
 	}
-	if (Number(boundaryReceipt.nextOffset) !== Number(boundaryReceipt.byteSize)) {
+	if (boundaryReceipt.nextLineOffset !== null) {
 		throw new Error("read ended before the boundary fixture was fully consumed");
 	}
 

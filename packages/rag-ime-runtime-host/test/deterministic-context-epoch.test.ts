@@ -99,12 +99,11 @@ function completeBoundaryReceipt(history: string): Record<string, unknown> {
 	return {
 		history,
 		path: "/workspace/read-boundary.txt",
-		offset: 1024,
-		nextOffset: 2048,
-		byteSize: 2048,
-		contentBytes: 1024,
-		contentLines: 20,
-		modelResultLimitBytes: 50 * 1024,
+		content: "final boundary segment\n",
+		startLine: 4001,
+		endLine: 4001,
+		nextLineOffset: null,
+		size: 2048,
 		truncated: false,
 	};
 }
@@ -315,11 +314,11 @@ describe("deterministic context epoch Provider", () => {
 		expect(calls(agentSessionCanaryResponse(agentContext(planTools, `${loadedSkill} ${planHistory}`)))).toEqual([
 			expect.objectContaining({
 				name: "read",
-				id: "agent-read-boundary-0",
+				id: "agent-read-boundary-1",
 				arguments: expect.objectContaining({
 					path: "read-boundary.txt",
-					offset: 0,
-					limit: 65_536,
+					offset: 1,
+					limit: 1_000,
 				}),
 			}),
 		]);
