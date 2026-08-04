@@ -194,7 +194,8 @@ describe("governed Pi-native workspace tools", () => {
 			cwd: "/workspace",
 			resultStore: temporaryStore(),
 		});
-		extension.factory({
+		const factory = typeof extension === "function" ? extension : extension.factory;
+		factory({
 			registerTool(definition: ToolDefinition<any, any, any>) {
 				definitions.set(definition.name, definition);
 			},
@@ -265,13 +266,15 @@ describe("governed Pi-native workspace tools", () => {
 		const store = temporaryStore();
 		const evidence = store.persist(`start\n${"evidence ".repeat(8_000)}\nend`, "bash");
 		const definitions = new Map<string, ToolDefinition<any, any, any>>();
-		createNativeWorkspaceToolsExtension({
+		const extension = createNativeWorkspaceToolsExtension({
 			sessionId: "session-evidence-read",
 			registry,
 			gatewayUrl: "http://127.0.0.1:8768/api/agent/tool/execute",
 			cwd: "/workspace",
 			resultStore: store,
-		}).factory({
+		});
+		const factory = typeof extension === "function" ? extension : extension.factory;
+		factory({
 			registerTool(definition: ToolDefinition<any, any, any>) {
 				definitions.set(definition.name, definition);
 			},

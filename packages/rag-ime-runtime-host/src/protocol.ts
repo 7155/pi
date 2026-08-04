@@ -45,6 +45,54 @@ export interface RuntimeRequest {
 	params?: Record<string, unknown>;
 }
 
+export interface RoomCancelParams {
+	cancelId: string;
+	sessionId: string;
+	rootId: string;
+	dispatchId: string;
+	generation: number;
+	turnId: string;
+	capabilityEpoch: number;
+}
+
+export function parseRoomCancelParams(params: Record<string, unknown>): RoomCancelParams {
+	const requiredString = (key: keyof RoomCancelParams): string => {
+		const value = params[key];
+		if (typeof value !== "string" || value.trim().length === 0 || value.length > 240) {
+			throw new RuntimeProtocolError("INVALID_PARAMS", `${key} must be a non-empty string`);
+		}
+		return value.trim();
+	};
+	const requiredInteger = (key: "generation" | "capabilityEpoch"): number => {
+		const value = params[key];
+		if (typeof value !== "number" || !Number.isSafeInteger(value) || value < 0) {
+			throw new RuntimeProtocolError("INVALID_PARAMS", `${key} must be a non-negative safe integer`);
+		}
+		return value;
+	};
+	return {
+		cancelId: requiredString("cancelId"),
+		sessionId: requiredString("sessionId"),
+		rootId: requiredString("rootId"),
+		dispatchId: requiredString("dispatchId"),
+		generation: requiredInteger("generation"),
+		turnId: requiredString("turnId"),
+		capabilityEpoch: requiredInteger("capabilityEpoch"),
+	};
+}
+
+export function sameRoomCancelLineage(left: RoomCancelParams, right: RoomCancelParams): boolean {
+	return (
+		left.cancelId === right.cancelId &&
+		left.sessionId === right.sessionId &&
+		left.rootId === right.rootId &&
+		left.dispatchId === right.dispatchId &&
+		left.generation === right.generation &&
+		left.turnId === right.turnId &&
+		left.capabilityEpoch === right.capabilityEpoch
+	);
+}
+
 export interface RuntimeError {
 	code: string;
 	message: string;

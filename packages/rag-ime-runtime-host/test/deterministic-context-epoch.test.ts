@@ -469,150 +469,603 @@ describe("deterministic context epoch Provider", () => {
 		]);
 	});
 
-	it("routes the deterministic three-member task through collaboration and formal handoff", () => {
-		const aTask = [
+	it("drives clarification, definition, bounded collaboration, review, and reporter delivery", () => {
+		const participants = [
+			{ participantRef: "P-A", capabilitySummary: "coordinator" },
+			{ participantRef: "P-B", capabilitySummary: "implementer" },
+			{ participantRef: "P-C", capabilitySummary: "reviewer" },
+		];
+		const alignmentTask = [
 			"原始需求（不可改写）：",
-			"COLLAB-B-REVIEWED",
-			"COLLAB-C-ACCEPTED",
+			"- 写 TUI",
 			"当前任务：",
-			"目标：THREE-MEMBER-ROOM-CANARY",
+			"- 目标：写 TUI",
 			"验收条件（提交证据时使用 AC 编号）：",
-			"- AC-1 | 待验收 | A 完成实现并交给 C 验收",
-			"- AC-2 | 待验收 | A 完成基线测试",
-			"- AC-3 | 待验收 | A 发布实现证据",
-			"- AC-4 | 待验收 | B 完成只读复核",
-			"- AC-5 | 待验收 | C 完成独立验收",
-			"- AC-6 | 待验收 | C 关闭 Root",
+			"- AC-1 | 待验收 | 完成需求对齐",
 		].join("\n");
-		const roomState = {
-			history: '"id":"collab-a-state"',
-			participants: [
-				{ participantRef: "P2", capabilitySummary: "reviewer" },
-				{ participantRef: "P3", capabilitySummary: "coordinator" },
-			],
-		};
-		const collaborate = calls(
+		const stateHistory = '"id":"room-full-auto-alignment-state"';
+		const firstWait = calls(
 			projectCollaborationCanaryResponse(
-				collaborationContext(aTask, ["tool_load", "room_state", "room_collaborate"], roomState),
+				collaborationContext(alignmentTask, ["room_state", "room_commit"], {
+					history: stateHistory,
+					participants,
+				}),
 			),
 		)[0];
-		expect(collaborate).toMatchObject({
-			name: "room_collaborate",
-			id: "collab-a-collaborate",
+		expect(firstWait).toMatchObject({
+			name: "room_commit",
+			id: "room-full-auto-alignment-wait-1",
 			arguments: {
-				targetParticipantRef: "P2",
-				intent: "review",
-				acceptance: ["AC-4"],
+				decision: "wait",
+				waitingFor: "user",
+				question: expect.stringContaining("最小版本"),
+				resumeCondition: expect.any(String),
+				publicSummary: expect.any(String),
 			},
 		});
 
-		const aCommit = calls(
+		const answers = [
+			"先做一个最小可运行的终端界面：有清晰的标题、输入区和结果区；不用安装新依赖，启动后能直接使用。",
+			"优先保证键盘操作、状态反馈和基本错误提示，先不加入网络同步或复杂主题。",
+			"交付时保留现有项目约定，只改实现所需内容，并给出可复现的验证结果。",
+		].join(" ");
+		const alignedHistory = `${stateHistory} ${answers}`;
+		expect(
+			calls(
+				projectCollaborationCanaryResponse(
+					collaborationContext(alignmentTask, ["room_state", "tool_search", "tool_load"], {
+						history: alignedHistory,
+						participants,
+					}),
+				),
+			)[0],
+		).toMatchObject({
+			name: "tool_search",
+			id: "room-full-auto-alignment-search-define",
+			arguments: { query: "room_define" },
+		});
+		expect(
+			calls(
+				projectCollaborationCanaryResponse(
+					collaborationContext(alignmentTask, ["room_state", "tool_search", "tool_load"], {
+						history: `${alignedHistory} "id":"room-full-auto-alignment-search-define"`,
+						participants,
+					}),
+				),
+			)[0],
+		).toMatchObject({
+			name: "tool_load",
+			id: "room-full-auto-alignment-load-define",
+			arguments: { name: "room_define" },
+		});
+		const definition = calls(
+			projectCollaborationCanaryResponse(
+				collaborationContext(alignmentTask, ["room_state", "room_define"], {
+					history:
+						`${alignedHistory} "id":"room-full-auto-alignment-search-define" ` +
+						'"id":"room-full-auto-alignment-load-define"',
+					participants,
+				}),
+			),
+		)[0];
+		expect(definition).toMatchObject({
+			name: "room_define",
+			id: "room-full-auto-alignment-define",
+			arguments: {
+				implementationParticipantRef: "P-B",
+				requirements: expect.arrayContaining([expect.stringContaining("键盘操作")]),
+				acceptanceCriteria: expect.arrayContaining([
+					expect.objectContaining({ fullNameZh: "启动后显示并可使用最小界面" }),
+				]),
+			},
+		});
+		const alignmentDefinedHistory = `${alignedHistory} "id":"room-full-auto-alignment-define" "id":"room-full-auto-alignment-defined-state"`;
+		const alignmentEvidenceReads = calls(
 			projectCollaborationCanaryResponse(
 				collaborationContext(
-					aTask,
-					["tool_load", "room_state", "room_collaborate", ...nativeCodingTools, "room_post", "room_commit"],
+					alignmentTask,
+					["room_state", "room_define", "room_collaborate", ...nativeCodingTools],
 					{
-						history: [
-							'"id":"collab-a-state"',
-							'"id":"collab-a-collaborate"',
-							'"id":"collab-a-missing-read"',
-							'"id":"collab-a-list"',
-							'"id":"collab-a-search"',
-							'"id":"collab-a-read-app"',
-							'"id":"collab-a-baseline-shell"',
-							'"id":"collab-a-patch"',
-							'"id":"collab-a-regression-shell"',
-							'"id":"collab-a-post"',
-						].join(" "),
-						participants: roomState.participants,
-						mutationApplied: true,
-						evidenceRef: "execution:a",
+						history: alignmentDefinedHistory,
+						participants,
+						acceptanceAliases: ["AC-1", "AC-2", "AC-3", "AC-4"],
+						evidenceRef: "definition:receipt",
+					},
+				),
+			),
+		);
+		expect(alignmentEvidenceReads.map((call) => call.id)).toEqual([
+			"room-full-auto-alignment-evidence-read-a",
+			"room-full-auto-alignment-evidence-read-b",
+			"room-full-auto-alignment-evidence-read-c",
+			"room-full-auto-alignment-evidence-read-d",
+		]);
+		const alignmentEvidenceHistory = `${alignmentDefinedHistory} ${alignmentEvidenceReads.map((call) => `"id":"${call.id}"`).join(" ")}`;
+		const alignmentCollaborate = calls(
+			projectCollaborationCanaryResponse(
+				collaborationContext(
+					alignmentTask,
+					["room_state", "room_define", "room_collaborate", ...nativeCodingTools],
+					{
+						history: alignmentEvidenceHistory,
+						participants,
+						acceptanceAliases: ["AC-1", "AC-2", "AC-3", "AC-4"],
+						evidenceRef: "definition:receipt",
 					},
 				),
 			),
 		)[0];
-		expect(aCommit).toMatchObject({
+		expect(alignmentCollaborate).toMatchObject({
+			name: "room_collaborate",
+			id: "room-full-auto-alignment-collaborate",
+			arguments: {
+				targetParticipantRef: "P-B",
+				intent: "execute",
+				workspacePolicy: "isolated_writable",
+				acceptance: ["AC-1"],
+			},
+		});
+		const alignmentWait = calls(
+			projectCollaborationCanaryResponse(
+				collaborationContext(
+					alignmentTask,
+					["room_state", "room_define", "room_collaborate", "room_commit", ...nativeCodingTools],
+					{
+						history: `${alignmentEvidenceHistory} "id":"room-full-auto-alignment-collaborate"`,
+						participants,
+						acceptanceAliases: ["AC-1", "AC-2", "AC-3", "AC-4"],
+						evidenceRef: "definition:receipt",
+					},
+				),
+			),
+		)[0];
+		expect(alignmentWait).toMatchObject({
 			name: "room_commit",
-			id: "collab-a-commit",
+			id: "room-full-auto-alignment-wait-child",
+			arguments: {
+				decision: "wait",
+				waitingFor: "participant",
+				waitingForParticipantRef: "P-B",
+				resumeCondition: expect.any(String),
+				evidence: [
+					{
+						acceptance: "AC-1",
+						refs: ["execution:invoke:room-full-auto-alignment-evidence-read-a"],
+					},
+					{
+						acceptance: "AC-2",
+						refs: ["execution:invoke:room-full-auto-alignment-evidence-read-b"],
+					},
+					{
+						acceptance: "AC-3",
+						refs: ["execution:invoke:room-full-auto-alignment-evidence-read-c"],
+					},
+					{
+						acceptance: "AC-4",
+						refs: ["execution:invoke:room-full-auto-alignment-evidence-read-d"],
+					},
+				],
+			},
+		});
+		const alignmentStopsForChild = calls(
+			projectCollaborationCanaryResponse(
+				collaborationContext(
+					alignmentTask,
+					["room_state", "room_define", "room_collaborate", "room_commit", ...nativeCodingTools],
+					{
+						history:
+							`${alignmentEvidenceHistory} ` +
+							'"id":"room-full-auto-alignment-collaborate" ' +
+							'"id":"room-full-auto-alignment-wait-child"',
+						participants,
+						acceptanceAliases: ["AC-1", "AC-2", "AC-3", "AC-4"],
+						pendingIntegrations: [],
+					},
+				),
+			),
+		);
+		expect(alignmentStopsForChild).toEqual([]);
+		const resumedIntegrationState = calls(
+			projectCollaborationCanaryResponse(
+				collaborationContext(alignmentTask, ["room_state", "room_integrate"], {
+					history:
+						`${alignmentEvidenceHistory} ` +
+						'"id":"room-full-auto-alignment-collaborate" ' +
+						'"id":"room-full-auto-alignment-wait-child" 这是恢复轮次',
+					participants,
+					acceptanceAliases: ["AC-1", "AC-2", "AC-3", "AC-4"],
+					childTaskId: "task:room-full-auto-child",
+					pendingIntegrations: [],
+				}),
+			),
+		)[0];
+		expect(resumedIntegrationState).toMatchObject({
+			name: "room_state",
+			id: "room-full-auto-integration-state",
+		});
+
+		const childTask = [
+			"当前任务：",
+			"- 目标：ROOM-FULL-AUTO-CHILD",
+			"验收条件（提交证据时使用 AC 编号）：",
+			"- AC-1 | 待验收 | 有界实现",
+		].join("\n");
+		const childTools = ["room_state", "read", "edit", "bash", "room_commit"];
+		const childStateHistory = '"id":"room-full-auto-child-state"';
+		const childRead = calls(
+			projectCollaborationCanaryResponse(
+				collaborationContext(childTask, childTools, {
+					history: childStateHistory,
+					participants,
+					acceptanceAliases: ["AC-1"],
+					evidenceRef: "child:state",
+				}),
+			),
+		)[0];
+		expect(childRead).toMatchObject({
+			name: "read",
+			id: "room-full-auto-child-read",
+			arguments: { path: "calculator.py" },
+		});
+
+		const childPatch = calls(
+			projectCollaborationCanaryResponse(
+				collaborationContext(childTask, childTools, {
+					history: `${childStateHistory} "id":"room-full-auto-child-read"`,
+					participants,
+					acceptanceAliases: ["AC-1"],
+					evidenceRef: "child:read",
+				}),
+			),
+		)[0];
+		expect(childPatch).toMatchObject({
+			name: "edit",
+			id: "room-full-auto-child-patch",
+			arguments: { path: "calculator.py" },
+		});
+
+		const childTest = calls(
+			projectCollaborationCanaryResponse(
+				collaborationContext(childTask, childTools, {
+					history: `${childStateHistory} "id":"room-full-auto-child-read" "id":"room-full-auto-child-patch"`,
+					participants,
+					acceptanceAliases: ["AC-1"],
+					mutationApplied: true,
+					evidenceRef: "child:patch",
+				}),
+			),
+		)[0];
+		expect(childTest).toMatchObject({
+			name: "bash",
+			id: "room-full-auto-child-test",
+			arguments: { command: "/usr/bin/python3 -m unittest -v" },
+		});
+
+		const childCommit = calls(
+			projectCollaborationCanaryResponse(
+				collaborationContext(childTask, childTools, {
+					history: [
+						childStateHistory,
+						'"id":"room-full-auto-child-read"',
+						'"id":"room-full-auto-child-patch"',
+						'"id":"room-full-auto-child-test"',
+					].join(" "),
+					participants,
+					acceptanceAliases: ["AC-1"],
+					mutationApplied: true,
+					exitCode: 0,
+					evidenceRef: "execution:invoke:room-full-auto-child-test",
+				}),
+			),
+		)[0];
+		expect(childCommit).toMatchObject({
+			name: "room_commit",
+			id: "room-full-auto-child-commit",
+			arguments: {
+				decision: "deliver",
+				evidence: [
+					{
+						acceptance: "AC-1",
+						refs: ["execution:invoke:room-full-auto-child-test"],
+					},
+				],
+			},
+		});
+
+		const integrationTask = [
+			"当前任务：",
+			"- 目标：ROOM-FULL-AUTO-INTEGRATION",
+			"验收条件（提交证据时使用 AC 编号）：",
+			"- AC-1 | 待验收 | 有界实现",
+			"- AC-2 | 待验收 | 集成验证",
+		].join("\n");
+		const integrationTools = ["room_state", "room_integrate", "read", "bash", "room_commit"];
+		const integrationBase = {
+			participants,
+			acceptanceAliases: ["AC-1", "AC-2"],
+			childTaskId: "task:room-full-auto-child",
+			pendingIntegrations: [{ childTaskId: "task:room-full-auto-child" }],
+		};
+		const integrationState = calls(
+			projectCollaborationCanaryResponse(
+				collaborationContext(integrationTask, integrationTools, {
+					...integrationBase,
+					history: '"id":"room-full-auto-alignment-wait-child"',
+				}),
+			),
+		)[0];
+		expect(integrationState).toMatchObject({
+			name: "room_state",
+			id: "room-full-auto-integration-state",
+		});
+
+		const integrate = calls(
+			projectCollaborationCanaryResponse(
+				collaborationContext(integrationTask, integrationTools, {
+					...integrationBase,
+					history: '"id":"room-full-auto-alignment-wait-child" ' + '"id":"room-full-auto-integration-state"',
+				}),
+			),
+		)[0];
+		expect(integrate).toMatchObject({
+			name: "room_integrate",
+			id: "room-full-auto-integration-integrate",
+			arguments: { childTaskId: "task:room-full-auto-child" },
+		});
+
+		const integratedState = calls(
+			projectCollaborationCanaryResponse(
+				collaborationContext(integrationTask, integrationTools, {
+					...integrationBase,
+					history: [
+						'"id":"room-full-auto-alignment-wait-child"',
+						'"id":"room-full-auto-integration-state"',
+						'"id":"room-full-auto-integration-integrate"',
+					].join(" "),
+				}),
+			),
+		)[0];
+		expect(integratedState).toMatchObject({
+			name: "room_state",
+			id: "room-full-auto-integration-integrated-state",
+		});
+
+		const integratedRead = calls(
+			projectCollaborationCanaryResponse(
+				collaborationContext(integrationTask, [...integrationTools, ...nativeCodingTools], {
+					...integrationBase,
+					history: [
+						'"id":"room-full-auto-alignment-wait-child"',
+						'"id":"room-full-auto-integration-state"',
+						'"id":"room-full-auto-integration-integrate"',
+						'"id":"room-full-auto-integration-integrated-state"',
+					].join(" "),
+				}),
+			),
+		);
+		expect(integratedRead).toEqual([
+			expect.objectContaining({ name: "read", id: "room-full-auto-integration-read-integrated-a" }),
+			expect.objectContaining({ name: "read", id: "room-full-auto-integration-read-integrated-b" }),
+			expect.objectContaining({ name: "read", id: "room-full-auto-integration-read-integrated-c" }),
+		]);
+
+		const integratedTest = calls(
+			projectCollaborationCanaryResponse(
+				collaborationContext(integrationTask, [...integrationTools, ...nativeCodingTools], {
+					...integrationBase,
+					history: [
+						'"id":"room-full-auto-alignment-wait-child"',
+						'"id":"room-full-auto-integration-state"',
+						'"id":"room-full-auto-integration-integrate"',
+						'"id":"room-full-auto-integration-integrated-state"',
+						'"id":"room-full-auto-integration-read-integrated-a"',
+						'"id":"room-full-auto-integration-read-integrated-b"',
+						'"id":"room-full-auto-integration-read-integrated-c"',
+					].join(" "),
+				}),
+			),
+		)[0];
+		expect(integratedTest).toMatchObject({
+			name: "bash",
+			id: "room-full-auto-integration-integrated-shell",
+		});
+
+		const integrationHandoffReview = calls(
+			projectCollaborationCanaryResponse(
+				collaborationContext(integrationTask, integrationTools, {
+					...integrationBase,
+					history: [
+						'"id":"room-full-auto-alignment-wait-child"',
+						'"id":"room-full-auto-integration-state"',
+						'"id":"room-full-auto-integration-integrate"',
+						'"id":"room-full-auto-integration-integrated-state"',
+						'"id":"room-full-auto-integration-read-integrated-a"',
+						'"id":"room-full-auto-integration-read-integrated-b"',
+						'"id":"room-full-auto-integration-read-integrated-c"',
+						'"id":"room-full-auto-integration-integrated-shell"',
+					].join(" "),
+					exitCode: 0,
+					evidenceRef: "execution:invoke:room-full-auto-integration-integrated-shell",
+				}),
+			),
+		)[0];
+		expect(integrationHandoffReview).toMatchObject({
+			name: "room_commit",
+			id: "room-full-auto-integration-handoff-review",
 			arguments: {
 				decision: "handoff",
-				summary: "COLLAB-A-COMMIT-RESULT",
-				evidence: [
-					{ acceptance: "AC-1", refs: ["execution:a"] },
-					{ acceptance: "AC-2", refs: ["execution:a"] },
-					{ acceptance: "AC-3", refs: ["execution:a"] },
-				],
-				residualRisks: ["最终独立验收仍由 C 完成。"],
-				targetParticipantRef: "P3",
-				intent: "close",
-				acceptanceAliases: ["AC-1", "AC-2", "AC-3", "AC-4", "AC-5", "AC-6"],
+				targetParticipantRef: "P-C",
+				intent: "review",
+				evidence: expect.arrayContaining([
+					{
+						acceptance: "AC-1",
+						refs: ["execution:invoke:room-full-auto-integration-read-integrated-a"],
+					},
+				]),
 			},
 		});
+		const integrationStopsAfterHandoff = calls(
+			projectCollaborationCanaryResponse(
+				collaborationContext(integrationTask, integrationTools, {
+					...integrationBase,
+					history: [
+						'"id":"room-full-auto-alignment-wait-child"',
+						'"id":"room-full-auto-integration-state"',
+						'"id":"room-full-auto-integration-integrate"',
+						'"id":"room-full-auto-integration-integrated-state"',
+						'"id":"room-full-auto-integration-read-integrated-a"',
+						'"id":"room-full-auto-integration-read-integrated-b"',
+						'"id":"room-full-auto-integration-read-integrated-c"',
+						'"id":"room-full-auto-integration-integrated-shell"',
+						'"id":"room-full-auto-integration-handoff-review"',
+					].join(" "),
+				}),
+			),
+		);
+		expect(integrationStopsAfterHandoff).toEqual([]);
+		const resumedAfterReviewHandoff = calls(
+			projectCollaborationCanaryResponse(
+				collaborationContext(integrationTask, integrationTools, {
+					...integrationBase,
+					history: [
+						'"id":"room-full-auto-alignment-wait-child"',
+						'"id":"room-full-auto-integration-handoff-review"',
+						"这是恢复轮次",
+					].join(" "),
+				}),
+			),
+		)[0];
+		expect(resumedAfterReviewHandoff).toMatchObject({
+			name: "room_state",
+			id: "room-full-auto-await-review-state",
+		});
 
-		const bTask = [
-			"原始需求（不可改写）：THREE-MEMBER-ROOM-CANARY，包含 AC-1 到 AC-6",
+		const reviewTask = [
 			"当前任务：",
-			"目标：COLLAB-B-REVIEWED",
+			"- 目标：ROOM-FULL-AUTO-REVIEW",
 			"验收条件（提交证据时使用 AC 编号）：",
-			"- AC-1 | 待验收 | B 完成只读复核",
+			"- AC-1 | 待验收 | 独立检查实现",
+			"- AC-2 | 待验收 | 复跑验证",
 		].join("\n");
-		const bCommit = calls(
+		const reviewTools = ["room_state", "read", "room_commit"];
+		const reviewBase = {
+			participants,
+			records: [
+				{
+					schemaVersion: "wisdom-weasel.room-state-tool.v1",
+					acceptanceAliases: [
+						{ acceptance: "AC-1", evidenceRefs: ["implementation:verified"] },
+						{ acceptance: "AC-2", evidenceRefs: ["implementation:verified"] },
+					],
+				},
+			],
+		};
+		const reviewReadApp = calls(
 			projectCollaborationCanaryResponse(
-				collaborationContext(bTask, ["tool_load", "room_state", ...nativeCodingTools, "room_post", "room_commit"], {
+				collaborationContext(reviewTask, reviewTools, {
+					...reviewBase,
+					history: '"id":"room-full-auto-review-state"',
+				}),
+			),
+		);
+		expect(reviewReadApp).toEqual([
+			expect.objectContaining({ name: "read", id: "room-full-auto-review-read-app" }),
+			expect.objectContaining({ name: "read", id: "room-full-auto-review-read-test" }),
+			expect.objectContaining({ name: "read", id: "room-full-auto-review-read-contract" }),
+		]);
+
+		const reviewRead = calls(
+			projectCollaborationCanaryResponse(
+				collaborationContext(reviewTask, reviewTools, {
+					...reviewBase,
 					history: [
-						'"id":"collab-b-state"',
-						'"id":"collab-b-read-app"',
-						'"id":"collab-b-read-test"',
-						'"id":"collab-b-post"',
+						'"id":"room-full-auto-review-state"',
+						'"id":"room-full-auto-review-read-app"',
+						'"id":"room-full-auto-review-read-test"',
+						'"id":"room-full-auto-review-read-contract"',
 					].join(" "),
-					acceptanceAliases: [{ acceptance: "AC-1" }],
-					evidenceRef: "execution:b",
 				}),
 			),
 		)[0];
-		expect(bCommit).toMatchObject({
-			name: "room_commit",
-			id: "collab-b-commit",
-			arguments: {
-				decision: "deliver",
-				summary: "COLLAB-B-COMMIT-RESULT",
-				evidence: [{ acceptance: "AC-1", refs: ["execution:b"] }],
-				residualRisks: [],
-			},
+		expect(reviewRead).toMatchObject({
+			name: "read",
+			id: "room-full-auto-review-review-read",
 		});
 
-		const cTask = [
-			"原始需求（不可改写）：THREE-MEMBER-ROOM-CANARY",
-			"当前任务：",
-			"目标：COLLAB-C-ACCEPTED",
-			"验收条件 acceptance.criteria",
-			"- AC-1 | 待验收 | 独立读取实现",
-			"- AC-2 | 待验收 | 独立运行测试",
-		].join("\n");
-		const commit = calls(
+		const reviewCommit = calls(
 			projectCollaborationCanaryResponse(
-				collaborationContext(cTask, ["tool_load", "room_state", ...nativeCodingTools, "room_post", "room_commit"], {
+				collaborationContext(reviewTask, reviewTools, {
+					...reviewBase,
 					history: [
-						'"id":"collab-c-state"',
-						'"id":"collab-c-read-app"',
-						'"id":"collab-c-acceptance-shell"',
-						'"id":"collab-c-post"',
+						'"id":"room-full-auto-review-state"',
+						'"id":"room-full-auto-review-read-app"',
+						'"id":"room-full-auto-review-read-test"',
+						'"id":"room-full-auto-review-read-contract"',
+						'"id":"room-full-auto-review-review-read"',
 					].join(" "),
-					evidenceRef: "execution:c",
+					records: [...reviewBase.records, { evidenceRef: "execution:invoke:room-full-auto-review-review-read" }],
 				}),
 			),
 		)[0];
-		expect(commit).toMatchObject({
+		expect(reviewCommit).toMatchObject({
 			name: "room_commit",
-			id: "collab-c-commit",
+			id: "room-full-auto-review-commit",
 			arguments: {
 				decision: "deliver",
-				summary: "COLLAB-C-COMMIT-RESULT",
-				evidence: [
-					{ acceptance: "AC-1", refs: ["execution:c"] },
-					{ acceptance: "AC-2", refs: ["execution:c"] },
-				],
-				residualRisks: [],
+				evidence: expect.arrayContaining([
+					{ acceptance: "AC-1", refs: ["execution:invoke:room-full-auto-review-read-app"] },
+				]),
+				reviewFindings: [],
+			},
+		});
+		const reviewStopsAfterCommit = calls(
+			projectCollaborationCanaryResponse(
+				collaborationContext(reviewTask, reviewTools, {
+					...reviewBase,
+					history: [
+						'"id":"room-full-auto-review-state"',
+						'"id":"room-full-auto-review-read-app"',
+						'"id":"room-full-auto-review-read-test"',
+						'"id":"room-full-auto-review-read-contract"',
+						'"id":"room-full-auto-review-review-read"',
+						'"id":"room-full-auto-review-commit"',
+					].join(" "),
+				}),
+			),
+		);
+		expect(reviewStopsAfterCommit).toEqual([]);
+
+		const finalTask = [
+			"当前任务：",
+			"- 目标：ROOM-FULL-AUTO-DELIVERY",
+			"验收条件（提交证据时使用 AC 编号）：",
+			"- AC-1 | 待验收 | Reporter 最终交付",
+		].join("\n");
+		const finalDelivery = calls(
+			projectCollaborationCanaryResponse(
+				collaborationContext(finalTask, ["room_state", "room_commit"], {
+					history: [
+						'"id":"room-full-auto-integration-handoff-review"',
+						'"id":"room-full-auto-review-commit"',
+						'"id":"room-full-auto-await-review-state"',
+					].join(" "),
+					records: [
+						{
+							schemaVersion: "wisdom-weasel.room-state-tool.v1",
+							acceptanceAliases: [{ acceptance: "AC-1", evidenceRefs: ["review:test"] }],
+						},
+						{ evidenceRef: "review:test" },
+					],
+				}),
+			),
+		)[0];
+		expect(finalDelivery).toMatchObject({
+			name: "room_commit",
+			id: "room-full-auto-await-review-deliver",
+			arguments: {
+				decision: "deliver",
+				publicSummary: expect.stringContaining("独立复核"),
+				evidence: [{ acceptance: "AC-1", refs: ["review:test"] }],
 			},
 		});
 	});

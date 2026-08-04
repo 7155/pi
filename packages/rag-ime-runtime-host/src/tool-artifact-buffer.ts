@@ -6,8 +6,14 @@ export const MAX_MODEL_VISIBLE_TOOL_RESULT_BYTES = 50 * 1024;
 const MEDIA_ID_PATTERN = /^media_[A-Za-z0-9_-]{12,80}$/u;
 const SESSION_ID_PATTERN = /^[A-Za-z0-9._:-]{1,240}$/u;
 const SHA256_PATTERN = /^[0-9a-f]{64}$/u;
-const ROOM_DELIVERY_TOOLS = new Set(["room_post", "room_commit"]);
-const ROOM_LIFECYCLE_TOOLS = new Set(["room_state", "room_post", "room_collaborate", "room_commit"]);
+const ROOM_DELIVERY_TOOLS: Record<string, true> = { room_post: true, room_commit: true };
+const ROOM_LIFECYCLE_TOOLS: Record<string, true> = {
+	room_state: true,
+	room_define: true,
+	room_post: true,
+	room_collaborate: true,
+	room_commit: true,
+};
 const INTERNAL_ROOM_RECEIPT_KEYS = new Set([
 	"invocationReceipt",
 	"executionReceipt",
@@ -48,7 +54,7 @@ export class ToolArtifactBuffer {
 	}
 
 	prepare(toolName: string, args: unknown): PreparedToolArguments {
-		if (!ROOM_DELIVERY_TOOLS.has(toolName) || this.pending.size === 0 || !isRecord(args)) {
+		if (ROOM_DELIVERY_TOOLS[toolName] !== true || this.pending.size === 0 || !isRecord(args)) {
 			return { arguments: args, deliveryKeys: [] };
 		}
 		if (args.blocks !== undefined && (!Array.isArray(args.blocks) || args.blocks.some((block) => !isRecord(block)))) {
@@ -443,7 +449,7 @@ export function successfulProductEvidenceRef(value: unknown, depth = 0): string 
 		if (!isRecord(receipt)) continue;
 		const toolName = text(receipt.toolName);
 		const receiptId = text(receipt.executionReceiptId);
-		if (receipt.status === "applied" && receiptId && toolName && !ROOM_LIFECYCLE_TOOLS.has(toolName)) {
+		if (receipt.status === "applied" && receiptId && toolName && ROOM_LIFECYCLE_TOOLS[toolName] !== true) {
 			return receiptId;
 		}
 	}

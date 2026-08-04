@@ -571,6 +571,28 @@ describe("runtime discovery tools", () => {
 		});
 	});
 
+	it("excludes always-available tools from the progressive route catalog", () => {
+		const prompt = formatBackendToolRouteCatalog(
+			[
+				{
+					name: "room_state",
+					description: "Read Room state directly.",
+					parameters: { type: "object", properties: {} },
+					alwaysAvailable: true,
+				},
+				{
+					name: "workspace_read",
+					description: "Read a workspace file.",
+					parameters: { type: "object", properties: {} },
+				},
+			],
+			"revision",
+		);
+
+		expect(prompt).toContain('"name":"workspace_read"');
+		expect(prompt).not.toContain('"name":"room_state"');
+	});
+
 	it("classifies product-prefixed tools by capability instead of treating every ime tool as input", () => {
 		const tools = [
 			"ime_agents",

@@ -12,6 +12,7 @@ import type { ToolResultStore } from "./tool-result-store.ts";
 
 const TOOL_NAME_PATTERN = /^[a-zA-Z][a-zA-Z0-9_.-]{0,127}$/;
 const MAX_TOOLS = 256;
+const MAX_CONCURRENT_GATEWAY_REQUESTS = 8;
 
 export interface BackendToolManifest {
 	name: string;
@@ -30,6 +31,7 @@ export interface BackendToolManifest {
 	does?: string;
 	profile?: string;
 	risk?: string;
+	alwaysAvailable?: boolean;
 	runtimeProjections?: Array<{
 		name: string;
 		operation: string;
@@ -63,9 +65,97 @@ interface GatewayFetchResponse {
 	json(): Promise<unknown>;
 }
 
+type GatewayWaiter = {
+	resolve(release: () => void): void;
+	reject(error: unknown): void;
+	signal?: AbortSignal;
+	onAbort?: () => void;
+};
+
+class GatewayRequestLimiter {
+	private active = 0;
+	private readonly waiting: GatewayWaiter[] = [];
+	private readonly limit: number;
+
+	constructor(limit: number) {
+		this.limit = limit;
+	}
+
+	async run<T>(signal: AbortSignal | undefined, task: () => Promise<T>): Promise<T> {
+		const release = await this.acquire(signal);
+		try {
+			return await task();
+		} finally {
+			release();
+		}
+	}
+
+	private acquire(signal: AbortSignal | undefined): Promise<() => void> {
+		if (signal?.aborted) return Promise.reject(abortReason(signal));
+		if (this.active < this.limit) {
+			this.active += 1;
+			return Promise.resolve(this.releaseOnce());
+		}
+		return new Promise((resolve, reject) => {
+			const waiter: GatewayWaiter = { resolve, reject, signal };
+			if (signal) {
+				waiter.onAbort = () => {
+					const index = this.waiting.indexOf(waiter);
+					if (index >= 0) this.waiting.splice(index, 1);
+					reject(abortReason(signal));
+				};
+				signal.addEventListener("abort", waiter.onAbort, { once: true });
+			}
+			this.waiting.push(waiter);
+		});
+	}
+
+	private releaseOnce(): () => void {
+		let released = false;
+		return () => {
+			if (released) return;
+			released = true;
+			this.active -= 1;
+			this.startNext();
+		};
+	}
+
+	private startNext(): void {
+		while (this.waiting.length > 0 && this.active < this.limit) {
+			const waiter = this.waiting.shift();
+			if (!waiter) return;
+			if (waiter.onAbort && waiter.signal) {
+				waiter.signal.removeEventListener("abort", waiter.onAbort);
+			}
+			if (waiter.signal?.aborted) {
+				waiter.reject(abortReason(waiter.signal));
+				continue;
+			}
+			this.active += 1;
+			waiter.resolve(this.releaseOnce());
+		}
+	}
+}
+
+const gatewayRequestLimiters = new WeakMap<BackendToolBridgeOptions, GatewayRequestLimiter>();
+
+function gatewayRequestLimiter(options: BackendToolBridgeOptions): GatewayRequestLimiter {
+	let limiter = gatewayRequestLimiters.get(options);
+	if (!limiter) {
+		limiter = new GatewayRequestLimiter(MAX_CONCURRENT_GATEWAY_REQUESTS);
+		gatewayRequestLimiters.set(options, limiter);
+	}
+	return limiter;
+}
+
+function abortReason(signal: AbortSignal): unknown {
+	return signal.reason ?? new Error("Tool gateway request aborted");
+}
+
 export class BackendToolRegistry {
 	private manifest: BackendToolManifest[] = [];
-	private disclosedNames = new Set<string>();
+	private automaticDisclosedNames = new Set<string>();
+	private explicitDisclosedNames = new Set<string>();
 	private loadReceiptIds = new Map<string, string>();
 
 	list(): BackendToolManifest[] {
@@ -77,7 +167,18 @@ export class BackendToolRegistry {
 	}
 
 	disclosed(): BackendToolManifest[] {
-		return [...this.disclosedNames]
+		const names = [...new Set([...this.automaticDisclosedNames, ...this.explicitDisclosedNames])];
+		return names.map((name) => this.get(name)).filter((tool): tool is BackendToolManifest => tool !== undefined);
+	}
+
+	automaticallyDisclosed(): BackendToolManifest[] {
+		return this.manifest
+			.filter((tool) => this.automaticDisclosedNames.has(tool.name))
+			.map((tool) => structuredClone(tool));
+	}
+
+	explicitlyDisclosed(): BackendToolManifest[] {
+		return [...this.explicitDisclosedNames]
 			.map((name) => this.get(name))
 			.filter((tool): tool is BackendToolManifest => tool !== undefined);
 	}
@@ -95,12 +196,20 @@ export class BackendToolRegistry {
 	disclose(name: string): BackendToolManifest {
 		const tool = this.getDiscoverable(name);
 		if (!tool) throw new RuntimeProtocolError("TOOL_NOT_FOUND", `Unknown or unavailable product tool: ${name}`);
-		this.disclosedNames.add(name);
+		this.explicitDisclosedNames.add(name);
 		return tool;
 	}
 
 	isDisclosed(name: string): boolean {
-		return this.disclosedNames.has(name);
+		return this.automaticDisclosedNames.has(name) || this.explicitDisclosedNames.has(name);
+	}
+
+	isAutomaticallyDisclosed(name: string): boolean {
+		return this.automaticDisclosedNames.has(name);
+	}
+
+	isExplicitlyDisclosed(name: string): boolean {
+		return this.explicitDisclosedNames.has(name);
 	}
 
 	recordLoadReceipt(name: string, receiptId: string): void {
@@ -179,6 +288,12 @@ export class BackendToolRegistry {
 				if (record.risk !== undefined && typeof record.risk !== "string") {
 					throw new RuntimeProtocolError("INVALID_TOOL_MANIFEST", `Tool ${record.name} risk must be a string`);
 				}
+				if (record.alwaysAvailable !== undefined && typeof record.alwaysAvailable !== "boolean") {
+					throw new RuntimeProtocolError(
+						"INVALID_TOOL_MANIFEST",
+						`Tool ${record.name} alwaysAvailable must be a boolean`,
+					);
+				}
 				if (record.modelVisible !== undefined && typeof record.modelVisible !== "boolean") {
 					throw new RuntimeProtocolError(
 						"INVALID_TOOL_MANIFEST",
@@ -229,6 +344,7 @@ export class BackendToolRegistry {
 					when: record.when as string[] | undefined,
 					notFor: record.notFor as string[] | undefined,
 					input: record.input as string | undefined,
+					...(typeof record.alwaysAvailable === "boolean" ? { alwaysAvailable: record.alwaysAvailable } : {}),
 					output: record.output as string | undefined,
 					does: record.does as string | undefined,
 					profile: record.profile,
@@ -237,8 +353,12 @@ export class BackendToolRegistry {
 				};
 			})
 			.sort((left, right) => left.name.localeCompare(right.name));
-		this.disclosedNames = new Set([...this.disclosedNames].filter((name) => names.has(name)));
-		this.loadReceiptIds = new Map([...this.loadReceiptIds].filter(([name]) => names.has(name)));
+		this.automaticDisclosedNames = new Set(
+			manifest
+				.filter((tool) => tool.alwaysAvailable === true && tool.modelVisible !== false)
+				.map((tool) => tool.name),
+		);
+		this.explicitDisclosedNames = new Set([...this.explicitDisclosedNames].filter((name) => names.has(name)));
 		this.manifest = manifest;
 		return this.list();
 	}
@@ -468,21 +588,26 @@ export async function requestProductGateway(
 	signal: AbortSignal | undefined,
 ): Promise<ToolGatewayResponse> {
 	if (!options.gatewayUrl) throw new Error("RAG_IME_TOOL_GATEWAY_URL is not configured");
-	const headers: Record<string, string> = { "Content-Type": "application/json" };
-	if (options.gatewayToken) headers["X-RAG-IME-Agent-Token"] = options.gatewayToken;
-	const executeSuffix = "/tool/execute";
-	const base = options.gatewayUrl.endsWith(executeSuffix)
-		? options.gatewayUrl.slice(0, -executeSuffix.length)
-		: options.gatewayUrl.replace(/\/$/u, "");
-	const response = (await fetch(path === "execute" ? options.gatewayUrl : `${base}/tool/${path}`, {
-		method: "POST",
-		headers,
-		body: JSON.stringify(body),
-		signal,
-	})) as GatewayFetchResponse;
-	const payload = (await response.json()) as ToolGatewayResponse;
-	if (!response.ok || !payload.ok) throw new Error(payload.error || `Tool gateway returned HTTP ${response.status}`);
-	return payload;
+	const gatewayUrl = options.gatewayUrl;
+	return gatewayRequestLimiter(options).run(signal, async () => {
+		const headers: Record<string, string> = { "Content-Type": "application/json" };
+		if (options.gatewayToken) headers["X-RAG-IME-Agent-Token"] = options.gatewayToken;
+		const executeSuffix = "/tool/execute";
+		const base = gatewayUrl.endsWith(executeSuffix)
+			? gatewayUrl.slice(0, -executeSuffix.length)
+			: gatewayUrl.replace(/\/$/u, "");
+		const response = (await fetch(path === "execute" ? gatewayUrl : `${base}/tool/${path}`, {
+			method: "POST",
+			headers,
+			body: JSON.stringify(body),
+			signal,
+		})) as GatewayFetchResponse;
+		const payload = (await response.json()) as ToolGatewayResponse;
+		if (!response.ok || !payload.ok) {
+			throw new Error(payload.error || `Tool gateway returned HTTP ${response.status}`);
+		}
+		return payload;
+	});
 }
 
 export async function requestGovernedToolLoad(

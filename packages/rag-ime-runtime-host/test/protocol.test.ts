@@ -1,7 +1,39 @@
 import { describe, expect, it } from "vitest";
-import { PROTOCOL_VERSION, parseRuntimeRequest, RuntimeProtocolError } from "../src/protocol.ts";
+import { PROTOCOL_VERSION, parseRoomCancelParams, parseRuntimeRequest, RuntimeProtocolError } from "../src/protocol.ts";
 
 describe("runtime protocol", () => {
+	it("requires the complete Room cancellation lineage", () => {
+		expect(
+			parseRoomCancelParams({
+				cancelId: "cancel:1",
+				sessionId: "session:target",
+				rootId: "root:1",
+				dispatchId: "dispatch:1",
+				generation: 4,
+				turnId: "turn:1",
+				capabilityEpoch: 7,
+			}),
+		).toEqual({
+			cancelId: "cancel:1",
+			sessionId: "session:target",
+			rootId: "root:1",
+			dispatchId: "dispatch:1",
+			generation: 4,
+			turnId: "turn:1",
+			capabilityEpoch: 7,
+		});
+		expect(() =>
+			parseRoomCancelParams({
+				cancelId: "cancel:1",
+				sessionId: "session:target",
+				rootId: "root:1",
+				dispatchId: "dispatch:1",
+				generation: 4,
+				capabilityEpoch: 7,
+			}),
+		).toThrow("turnId must be a non-empty string");
+	});
+
 	it("accepts versioned plugin and session methods", () => {
 		expect(
 			parseRuntimeRequest({

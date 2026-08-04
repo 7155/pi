@@ -103,7 +103,7 @@ describe("native Pi conversation fork", () => {
 			const source = SessionManager.create(root, root);
 			const userId = source.appendMessage({ role: "user", content: "plain question", timestamp: 10 });
 			const assistantId = source.appendMessage(assistant("plain answer", 20));
-			source.appendMessage(
+			const mixedAssistantId = source.appendMessage(
 				assistantWith(
 					[
 						{ type: "text", text: "calling a tool" },
@@ -154,6 +154,12 @@ describe("native Pi conversation fork", () => {
 			expect(candidates).toEqual([
 				{ entryId: userId, text: "plain question", role: "user", createdAtMs: 10 },
 				{ entryId: assistantId, text: "plain answer", role: "assistant", createdAtMs: 20 },
+				{
+					entryId: mixedAssistantId,
+					text: "calling a tool",
+					role: "assistant",
+					createdAtMs: 30,
+				},
 				{
 					entryId: failedId,
 					text: '404 Model "missing" is unavailable',
@@ -559,6 +565,7 @@ describe("ordinary Session memory context epochs", () => {
 				rootId: "root:1",
 				generation: 0,
 				capabilityEpoch: 1,
+				dispatchAttempt: 0,
 			},
 			activeTurn: undefined,
 			roomContext: "Room task",
@@ -606,6 +613,7 @@ describe("managed Room retry budget", () => {
 			rootId: "root:retry",
 			generation: 0,
 			capabilityEpoch: 1,
+			dispatchAttempt: 1,
 			roomResourceLimits: { retryRemaining: 1 },
 		});
 		mutable.onSessionEvent({
@@ -717,6 +725,7 @@ describe("managed Room context epochs", () => {
 				rootId: "root:new",
 				generation: 0,
 				capabilityEpoch: 9,
+				dispatchAttempt: 0,
 				sessionContext: "new session context",
 				roomContext: "new full room context",
 				roomRecoveryContext: "new recovery context",
@@ -739,5 +748,196 @@ describe("managed Room context epochs", () => {
 			rootId: "root:new",
 			contextEpoch: 3,
 		});
+	});
+});
+
+describe("managed Room runtime turn identity", () => {
+	it("binds the initial accepted turn before the native prompt can settle", async () => {
+		const productSession = Object.create(PiProductSession.prototype) as PiProductSession;
+		const mutable = productSession as unknown as Record<string, any>;
+		let turnIdObservedByPrompt = "";
+		const prompt = vi.fn(async (_message, options) => {
+			turnIdObservedByPrompt = String(mutable.activeRoom?.runtimeTurnId ?? "");
+			expect(turnIdObservedByPrompt).toBe(String(mutable.activeTurn?.turnId ?? ""));
+			options.preflightResult(true);
+		});
+		Object.assign(mutable, {
+			activeRoom: undefined,
+			activeTurn: undefined,
+			roomContext: "",
+			roomRecoveryContext: "",
+			sessionContext: "",
+			transientContext: "",
+			providerContextJournal: new ProviderContextJournal(),
+			backendBridge: { gatewayUrl: undefined },
+			roomProviderContext: undefined,
+			roomResourceLimits: undefined,
+			roomSkillLoad: undefined,
+			session: {
+				isIdle: true,
+				systemPrompt: "stable system prompt",
+				getSessionStats: () => ({ tokens: { input: 0, output: 0 } }),
+				setRetryLimitOverride: vi.fn(),
+				prompt,
+			},
+		});
+
+		const receipt = await productSession.dispatchRoom({
+			message: "start bounded Room work",
+			dispatchId: "dispatch:initial",
+			rootId: "root:initial",
+			generation: 0,
+			dispatchAttempt: 0,
+			capabilityEpoch: 1,
+		});
+
+		expect(receipt).toMatchObject({ delivery: "prompt", turnId: turnIdObservedByPrompt });
+		expect(mutable.activeRoom).toMatchObject({
+			dispatchId: "dispatch:initial",
+			dispatchAttempt: 0,
+			runtimeTurnId: receipt.turnId,
+		});
+	});
+
+	it("binds a queued continuation to its accepted active turn and explicit retry attempt", async () => {
+		const productSession = Object.create(PiProductSession.prototype) as PiProductSession;
+		const mutable = productSession as unknown as Record<string, any>;
+		let turnIdObservedByFollowUp = "";
+		const followUp = vi.fn(async () => {
+			turnIdObservedByFollowUp = String(mutable.activeRoom?.runtimeTurnId ?? "");
+			return { id: "continuation:retry" };
+		});
+		Object.assign(mutable, {
+			activeRoom: undefined,
+			activeTurn: { turnId: "turn:accepted-continuation" },
+			roomContext: "",
+			roomRecoveryContext: "",
+			sessionContext: "",
+			transientContext: "",
+			backendBridge: { gatewayUrl: undefined },
+			roomProviderContext: undefined,
+			roomResourceLimits: undefined,
+			session: {
+				isIdle: false,
+				getSessionStats: () => ({ tokens: { input: 8, output: 3 } }),
+				setRetryLimitOverride: vi.fn(),
+				followUp,
+			},
+		});
+
+		const receipt = await productSession.dispatchRoom({
+			message: "retry bounded Room work",
+			dispatchId: "dispatch:continuation-retry",
+			rootId: "root:continuation",
+			generation: 2,
+			dispatchAttempt: 3,
+			capabilityEpoch: 4,
+		});
+
+		expect(receipt).toMatchObject({
+			delivery: "followUp",
+			turnId: "turn:accepted-continuation",
+			continuationId: "continuation:retry",
+		});
+		expect(turnIdObservedByFollowUp).toBe(receipt.turnId);
+		expect(mutable.activeRoom).toMatchObject({
+			dispatchId: "dispatch:continuation-retry",
+			dispatchAttempt: 3,
+			runtimeTurnId: receipt.turnId,
+		});
+	});
+});
+
+describe("managed Room cancellation lineage", () => {
+	it("cancels only the exact active dispatch and preserves its turn across retries", async () => {
+		const productSession = Object.create(PiProductSession.prototype) as PiProductSession;
+		const mutable = productSession as unknown as Record<string, any>;
+		const cancelContinuation = vi.fn(() => ({ cancelledIds: ["continuation:1"] }));
+		const abort = vi.fn(async () => ({
+			schemaVersion: "pi.agent-abort-receipt.v1" as const,
+			scopeId: "scope:1",
+			generation: 1,
+			reason: "user_abort",
+			cancelledContinuationIds: [],
+			cancelledOperationIds: [],
+			failedOperationIds: [],
+			operations: [],
+			pendingOperations: [],
+			drained: true,
+			idle: true,
+		}));
+		Object.assign(mutable, {
+			externalSessionId: "session:target",
+			appliedRoomCancels: new Map(),
+			pendingUIRequests: new Map(),
+			pendingDecisions: new Map(),
+			activeTurn: { turnId: "turn:1" },
+			activeRoom: {
+				dispatchId: "dispatch:1",
+				rootId: "root:1",
+				generation: 3,
+				dispatchAttempt: 1,
+				runtimeTurnId: "turn:1",
+				capabilityEpoch: 7,
+			},
+			session: { abort, cancelContinuation },
+		});
+		const lineage = {
+			cancelId: "cancel:1",
+			sessionId: "session:target",
+			rootId: "root:1",
+			dispatchId: "dispatch:1",
+			generation: 4,
+			turnId: "turn:1",
+			capabilityEpoch: 7,
+		};
+
+		expect(productSession.cancelRoom(lineage)).toEqual({
+			cancelledIds: ["continuation:1"],
+			abortRequired: true,
+		});
+		expect(() => productSession.cancelRoom({ ...lineage, dispatchId: "dispatch:stale" })).toThrow(
+			"Room cancellation does not match the active Room runtime lineage",
+		);
+		expect(cancelContinuation).toHaveBeenCalledOnce();
+		expect(cancelContinuation).toHaveBeenCalledWith({ correlationId: "root:1" }, "room_cancel");
+
+		mutable.activeTurn = undefined;
+		mutable.activeRoom = undefined;
+		await expect(productSession.abortRoom(lineage)).resolves.toMatchObject({
+			sessionId: "session:target",
+			turnId: "turn:1",
+			lifecycle: { drained: true, idle: true },
+		});
+		expect(abort).toHaveBeenCalledOnce();
+		productSession.finishRoomCancel(lineage.rootId, lineage.generation, lineage.cancelId);
+		expect(mutable.appliedRoomCancels.size).toBe(0);
+	});
+});
+
+describe("managed Room optional per-dispatch limits", () => {
+	it("does not impose fixed input-token or tool-call caps when they are omitted", () => {
+		const productSession = Object.create(PiProductSession.prototype) as PiProductSession;
+		const mutable = productSession as unknown as Record<string, any>;
+		Object.assign(mutable, {
+			roomResourceLimits: {
+				deadlineAtMs: Date.now() + 60_000,
+				maxOutputTokens: 16_000,
+				maxToolCost: 10_000,
+				retryRemaining: 0,
+				repairRemaining: 0,
+			},
+			roomToolCalls: 0,
+			roomToolCost: 0,
+			session: {
+				getContextUsage: () => ({ tokens: 128_000 }),
+			},
+		});
+
+		expect(() => mutable.assertRoomDispatchResources()).not.toThrow();
+		for (let index = 0; index < 65; index += 1) {
+			expect(productSession.authorizeRoomToolCall()).toEqual({ allowed: true });
+		}
+		expect(mutable.roomToolCalls).toBe(65);
 	});
 });

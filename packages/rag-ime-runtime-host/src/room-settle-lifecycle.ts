@@ -5,6 +5,8 @@ export interface ActiveRoomDispatch {
 	dispatchId: string;
 	rootId: string;
 	generation: number;
+	dispatchAttempt: number;
+	runtimeTurnId?: string;
 	capabilityEpoch: number;
 }
 
@@ -36,6 +38,10 @@ export function createRoomSettleLifecycleExtension(options: RoomSettleLifecycleO
 			if (event.message.stopReason === "error" || event.message.stopReason === "aborted") {
 				return;
 			}
+			const runtimeTurnId = text(active.runtimeTurnId);
+			if (!runtimeTurnId) {
+				throw new Error("Active Room Dispatch has no accepted runtime turn identity");
+			}
 			const response = await requestProductGateway(
 				options.bridge,
 				"room-settle",
@@ -46,6 +52,8 @@ export function createRoomSettleLifecycleExtension(options: RoomSettleLifecycleO
 					rootId: active.rootId,
 					generation: active.generation,
 					capabilityEpoch: active.capabilityEpoch,
+					runtimeTurnId,
+					dispatchAttempt: active.dispatchAttempt,
 					settleScopeId: event.cancelScope.scopeId,
 					settleAttempt: event.settleAttempt,
 					resourceUsage: {

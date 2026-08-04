@@ -4,6 +4,7 @@ import { homedir } from "node:os";
 import { delimiter, join, isAbsolute as pathIsAbsolute, relative, resolve, sep } from "node:path";
 import {
 	type Api,
+	type AssistantMessage,
 	type Context,
 	getSupportedThinkingLevels,
 	type Model,
@@ -16,9 +17,12 @@ import { ManagedPluginManager } from "./plugin-manager.ts";
 import {
 	PROTOCOL_NAME,
 	PROTOCOL_VERSION,
+	parseRoomCancelParams,
+	type RoomCancelParams,
 	type RuntimeEventEnvelope,
 	RuntimeProtocolError,
 	type RuntimeRequest,
+	sameRoomCancelLineage,
 } from "./protocol.ts";
 import type { RoomResourceLimits } from "./room-resource-limits.ts";
 import { BoundedSessionPool } from "./session-pool.ts";
@@ -68,6 +72,17 @@ export interface RuntimeHostOptions {
 	allowedWorkspaceRoots?: string[];
 	modelRuntime?: ModelRuntime;
 	emitEvent(event: RuntimeEventEnvelope): void;
+}
+
+interface RoomCancelOperation {
+	lineage: RoomCancelParams;
+	cancelled?: { cancelledIds: string[]; abortRequired: boolean };
+	receipt?: Record<string, unknown>;
+	inFlight?: Promise<Record<string, unknown>>;
+}
+
+function roomCancelFenceKey(lineage: Pick<RoomCancelParams, "sessionId" | "rootId" | "dispatchId">): string {
+	return `${lineage.sessionId}\u001f${lineage.rootId}\u001f${lineage.dispatchId}`;
 }
 
 function requiredString(params: Record<string, unknown>, key: string, maximum = 4096): string {
@@ -222,22 +237,22 @@ function optionalRoomResourceLimits(params: Record<string, unknown>): RoomResour
 	}
 	const record = value as Record<string, unknown>;
 	const result = {} as RoomResourceLimits;
-	for (const key of [
-		"deadlineAtMs",
-		"maxInputTokens",
-		"maxOutputTokens",
-		"maxToolCalls",
-		"maxToolCost",
-		"retryRemaining",
-		"repairRemaining",
-	] as const) {
+	for (const key of ["deadlineAtMs", "maxOutputTokens", "maxToolCost", "retryRemaining", "repairRemaining"] as const) {
 		const entry = record[key];
 		if (typeof entry !== "number" || !Number.isSafeInteger(entry) || entry < 0) {
 			throw new RuntimeProtocolError("INVALID_PARAMS", `roomResourceLimits.${key} is invalid`);
 		}
 		result[key] = entry;
 	}
-	if (result.deadlineAtMs <= Date.now() || result.maxInputTokens < 1 || result.maxOutputTokens < 1) {
+	for (const key of ["maxInputTokens", "maxToolCalls"] as const) {
+		const entry = record[key];
+		if (entry === undefined) continue;
+		if (typeof entry !== "number" || !Number.isSafeInteger(entry) || entry < 1) {
+			throw new RuntimeProtocolError("INVALID_PARAMS", `roomResourceLimits.${key} is invalid`);
+		}
+		result[key] = entry;
+	}
+	if (result.deadlineAtMs <= Date.now() || result.maxOutputTokens < 1) {
 		throw new RuntimeProtocolError("ROOM_RESOURCE_LIMIT_EXHAUSTED", "Room resource limit is already exhausted");
 	}
 	return result;
@@ -270,6 +285,9 @@ export class RagImeRuntimeHost {
 	private readonly allowedWorkspaceRoots: string[];
 	private readonly completions = new Map<string, AbortController>();
 	private readonly roomReceipts = new Map<string, Record<string, unknown>>();
+	private readonly roomCancelOperations = new Map<string, RoomCancelOperation>();
+	private readonly roomCancelFences = new Map<string, RoomCancelParams>();
+	private completionSequence = 0;
 
 	private constructor(options: RuntimeHostOptions, modelRuntime: ModelRuntime) {
 		this.options = options;
@@ -312,11 +330,37 @@ export class RagImeRuntimeHost {
 	async dispose(): Promise<void> {
 		for (const controller of this.completions.values()) controller.abort();
 		this.completions.clear();
+		this.roomReceipts.clear();
+		this.roomCancelOperations.clear();
+		this.roomCancelFences.clear();
 		await this.sessions.dispose();
+	}
+
+	private clearRoomStateForSession(sessionId: string): void {
+		for (const [key, receipt] of this.roomReceipts) {
+			if (receipt.sessionId === sessionId) this.roomReceipts.delete(key);
+		}
+		for (const [cancelId, operation] of this.roomCancelOperations) {
+			if (operation.lineage.sessionId === sessionId) this.roomCancelOperations.delete(cancelId);
+		}
+		for (const [key, lineage] of this.roomCancelFences) {
+			if (lineage.sessionId === sessionId) this.roomCancelFences.delete(key);
+		}
 	}
 
 	private params(request: RuntimeRequest): Record<string, unknown> {
 		return request.params ?? {};
+	}
+
+	private emitCompletionNotice(requestId: string, payload: Record<string, unknown>): void {
+		this.completionSequence += 1;
+		this.options.emitEvent({
+			protocolVersion: PROTOCOL_VERSION,
+			event: "runtime.notice",
+			sessionId: requestId,
+			sequence: this.completionSequence,
+			payload: { requestId, ...payload },
+		});
 	}
 
 	private session(params: Record<string, unknown>): PiProductSession {
@@ -324,6 +368,47 @@ export class RagImeRuntimeHost {
 		const session = this.sessions.get(sessionId);
 		if (!session) throw new RuntimeProtocolError("SESSION_NOT_FOUND", `Session is not open: ${sessionId}`);
 		return session;
+	}
+
+	private async applyRoomCancel(
+		lineage: RoomCancelParams,
+		operation: RoomCancelOperation,
+		target: PiProductSession,
+	): Promise<Record<string, unknown>> {
+		operation.cancelled ??= target.cancelRoom(lineage);
+		const abortReceipt = operation.cancelled.abortRequired ? await target.abortRoom(lineage) : undefined;
+		if (abortReceipt && abortReceipt.turnId !== lineage.turnId) {
+			throw new RuntimeProtocolError(
+				"ROOM_CANCEL_LINEAGE_MISMATCH",
+				"Room abort receipt does not match the requested active turn",
+			);
+		}
+		const cancellationSurfaces = roomCancellationSurfaces(
+			lineage.sessionId,
+			operation.cancelled.cancelledIds,
+			abortReceipt,
+		);
+		const pendingTargets = pendingRoomCancellationSurfaces(cancellationSurfaces);
+		const receipt = {
+			schemaVersion: "wisdom-weasel.room-runtime-receipt.v1",
+			receiptKind: "cancel_applied",
+			status: "applied",
+			cancelId: lineage.cancelId,
+			rootId: lineage.rootId,
+			dispatchId: lineage.dispatchId,
+			generation: lineage.generation,
+			sessionId: lineage.sessionId,
+			turnId: lineage.turnId,
+			capabilityEpoch: lineage.capabilityEpoch,
+			cancelledContinuationIds: [...operation.cancelled.cancelledIds],
+			activeRunAborted: operation.cancelled.abortRequired,
+			pendingTargets,
+			cancellationSurfaces,
+			sessionAbortReceipt: abortReceipt,
+		};
+		operation.receipt = receipt;
+		if (pendingTargets.length === 0) target.finishRoomCancel(lineage.rootId, lineage.generation, lineage.cancelId);
+		return receipt;
 	}
 
 	private async workspace(value: unknown): Promise<string> {
@@ -472,7 +557,7 @@ export class RagImeRuntimeHost {
 						],
 					};
 					const reasoning = thinkingLevel === "off" ? undefined : thinkingLevel;
-					const response = await this.modelRuntime.completeSimple(model, context, {
+					const stream = this.modelRuntime.streamSimple(model, context, {
 						...(reasoning ? { reasoning } : {}),
 						cacheRetention: "none",
 						maxRetries: 0,
@@ -480,6 +565,77 @@ export class RagImeRuntimeHost {
 						signal: controller.signal,
 						timeoutMs,
 					});
+					let response: AssistantMessage | undefined;
+					let firstTokenMs = 0;
+					let reasoningStartedAtMs = 0;
+					let reasoningEndedAtMs = 0;
+					let reasoningChars = 0;
+					let lastReasoningProgressChars = 0;
+					for await (const event of stream) {
+						if (controller.signal.aborted) break;
+						if (event.type === "thinking_start") {
+							if (reasoningStartedAtMs <= 0) {
+								reasoningStartedAtMs = Math.max(1, Math.round(performance.now() - started));
+								this.emitCompletionNotice(requestId, {
+									type: "completion_reasoning_progress",
+									phase: "started",
+									totalChars: 0,
+									elapsedMs: reasoningStartedAtMs,
+								});
+							}
+							continue;
+						}
+						if (event.type === "thinking_delta") {
+							reasoningChars += event.delta.length;
+							if (reasoningStartedAtMs <= 0) {
+								reasoningStartedAtMs = Math.max(1, Math.round(performance.now() - started));
+								this.emitCompletionNotice(requestId, {
+									type: "completion_reasoning_progress",
+									phase: "started",
+									totalChars: 0,
+									elapsedMs: reasoningStartedAtMs,
+								});
+							}
+							if (reasoningChars - lastReasoningProgressChars >= 128) {
+								lastReasoningProgressChars = reasoningChars;
+								this.emitCompletionNotice(requestId, {
+									type: "completion_reasoning_progress",
+									phase: "streaming",
+									totalChars: reasoningChars,
+									elapsedMs: Math.max(1, Math.round(performance.now() - started)),
+								});
+							}
+							continue;
+						}
+						if (event.type === "thinking_end") {
+							reasoningChars = Math.max(reasoningChars, event.content.length);
+							reasoningEndedAtMs = Math.max(1, Math.round(performance.now() - started));
+							this.emitCompletionNotice(requestId, {
+								type: "completion_reasoning_progress",
+								phase: "completed",
+								totalChars: reasoningChars,
+								elapsedMs: reasoningEndedAtMs,
+							});
+							continue;
+						}
+						if (event.type === "text_delta" && event.delta) {
+							if (firstTokenMs <= 0) {
+								firstTokenMs = Math.max(1, Math.round(performance.now() - started));
+							}
+							this.emitCompletionNotice(requestId, {
+								type: "completion_text_delta",
+								delta: event.delta,
+								elapsedMs: Math.max(1, Math.round(performance.now() - started)),
+							});
+							continue;
+						}
+						if (event.type === "done") {
+							response = event.message;
+						} else if (event.type === "error") {
+							response = event.error;
+						}
+					}
+					response ??= await stream.result();
 					if (response.stopReason === "error" || response.stopReason === "aborted") {
 						throw new RuntimeProtocolError(
 							response.stopReason === "aborted" ? "REQUEST_ABORTED" : "COMPLETION_FAILED",
@@ -505,6 +661,15 @@ export class RagImeRuntimeHost {
 						thinkingLevel,
 						usage: response.usage,
 						stopReason: response.stopReason,
+						firstTokenMs,
+						reasoningChars,
+						reasoningElapsedMs:
+							reasoningStartedAtMs > 0
+								? Math.max(
+										0,
+										(reasoningEndedAtMs || Math.round(performance.now() - started)) - reasoningStartedAtMs,
+									)
+								: 0,
 						elapsedMs: Math.max(0, Math.round(performance.now() - started)),
 					};
 				} finally {
@@ -566,8 +731,12 @@ export class RagImeRuntimeHost {
 						emitEvent: this.options.emitEvent,
 					}),
 				);
+				if (opened.evictedSessionId) this.clearRoomStateForSession(opened.evictedSessionId);
 				return {
-					snapshot: opened.session.snapshot(),
+					// Opening a long-lived Session must never serialize its full
+					// transcript onto the shared JSONL control lane. Explicit
+					// session.snapshot remains available to history consumers.
+					snapshot: opened.session.openSnapshot(),
 					evictedSessionId: opened.evictedSessionId,
 					roomSkillLoad: opened.session.roomSkillLoadReceipt(),
 				};
@@ -623,6 +792,7 @@ export class RagImeRuntimeHost {
 							emitEvent: this.options.emitEvent,
 						}),
 					);
+					if (opened.evictedSessionId) this.clearRoomStateForSession(opened.evictedSessionId);
 					if (!opened.created) {
 						throw new RuntimeProtocolError("SESSION_ALREADY_OPEN", `Session is already open: ${targetSessionId}`);
 					}
@@ -684,24 +854,39 @@ export class RagImeRuntimeHost {
 				}
 				return this.session(params).setThinkingLevel(level as ModelThinkingLevel);
 			}
-			case "session.close":
-				return { closed: await this.sessions.close(requiredSessionId(params)) };
+			case "session.close": {
+				const sessionId = requiredSessionId(params);
+				const closed = await this.sessions.close(sessionId);
+				if (closed) this.clearRoomStateForSession(sessionId);
+				return { closed };
+			}
 			case "room.dispatch": {
 				const sessionId = requiredSessionId(params);
 				const dispatchId = requiredString(params, "dispatchId", 240);
 				const rootId = requiredString(params, "rootId", 240);
 				const generation = requiredGeneration(params);
 				const capabilityEpoch = requiredNonNegativeInteger(params, "capabilityEpoch");
+				const dispatchAttempt = requiredNonNegativeInteger(params, "dispatchAttempt");
 				const idempotencyKey = requiredString(params, "idempotencyKey", 512);
 				const receiptKey = `${rootId}\u001f${idempotencyKey}`;
 				const existing = this.roomReceipts.get(receiptKey);
 				if (existing) return { ...existing, duplicate: true };
+				const cancelFence = this.roomCancelFences.get(roomCancelFenceKey({ sessionId, rootId, dispatchId }));
+				if (cancelFence) {
+					throw new RuntimeProtocolError(
+						"ROOM_DISPATCH_CANCELLED",
+						generation <= cancelFence.generation
+							? "Room Dispatch is cancelling or already cancelled at this generation"
+							: "A cancelled Room Dispatch cannot be resumed; create a new Dispatch identity",
+					);
+				}
 				const accepted = await this.session(params).dispatchRoom({
 					message: requiredString(params, "message", 1_000_000),
 					dispatchId,
 					rootId,
 					generation,
 					capabilityEpoch,
+					dispatchAttempt,
 					sessionContext: optionalString(params, "sessionContext", 256_000),
 					roomContext: optionalString(params, "roomContext", 256_000),
 					roomRecoveryContext: optionalString(params, "roomRecoveryContext", 256_000),
@@ -724,27 +909,62 @@ export class RagImeRuntimeHost {
 				return receipt;
 			}
 			case "room.cancel": {
-				const sessionId = requiredSessionId(params);
-				const rootId = requiredString(params, "rootId", 240);
-				const generation = requiredGeneration(params);
+				const lineage = parseRoomCancelParams(params);
+				const existingOperation = this.roomCancelOperations.get(lineage.cancelId);
+				if (existingOperation && !sameRoomCancelLineage(existingOperation.lineage, lineage)) {
+					throw new RuntimeProtocolError(
+						"ROOM_CANCEL_LINEAGE_MISMATCH",
+						"Room cancellation reuses cancelId with different runtime lineage",
+					);
+				}
+				if (
+					existingOperation?.receipt &&
+					Array.isArray(existingOperation.receipt.pendingTargets) &&
+					existingOperation.receipt.pendingTargets.length === 0
+				) {
+					return structuredClone(existingOperation.receipt);
+				}
+				const acceptedLineage = [...this.roomReceipts.values()].some(
+					(receipt) =>
+						receipt.receiptKind === "dispatch_accepted" &&
+						receipt.status === "accepted" &&
+						receipt.sessionId === lineage.sessionId &&
+						receipt.rootId === lineage.rootId &&
+						receipt.dispatchId === lineage.dispatchId &&
+						receipt.turnId === lineage.turnId &&
+						receipt.capabilityEpoch === lineage.capabilityEpoch &&
+						typeof receipt.generation === "number" &&
+						receipt.generation <= lineage.generation,
+				);
+				if (!acceptedLineage) {
+					throw new RuntimeProtocolError(
+						"ROOM_CANCEL_LINEAGE_MISMATCH",
+						"Room cancellation does not match an active Room dispatch receipt",
+					);
+				}
 				const target = this.session(params);
-				const cancelled = target.cancelRoom(rootId, generation);
-				const abortReceipt = cancelled.abortRequired ? await target.abort() : undefined;
-				target.finishRoomCancel(rootId, generation);
-				const cancellationSurfaces = roomCancellationSurfaces(sessionId, cancelled.cancelledIds, abortReceipt);
-				return {
-					schemaVersion: "wisdom-weasel.room-runtime-receipt.v1",
-					receiptKind: "cancel_applied",
-					status: "applied",
-					rootId,
-					generation,
-					sessionId,
-					cancelledContinuationIds: cancelled.cancelledIds,
-					activeRunAborted: cancelled.abortRequired,
-					pendingTargets: pendingRoomCancellationSurfaces(cancellationSurfaces),
-					cancellationSurfaces,
-					sessionAbortReceipt: abortReceipt,
-				};
+				const operation = existingOperation ?? { lineage: structuredClone(lineage) };
+				if (!existingOperation) {
+					this.roomCancelOperations.set(lineage.cancelId, operation);
+					this.roomCancelFences.set(roomCancelFenceKey(lineage), structuredClone(lineage));
+				}
+				if (operation.inFlight) return structuredClone(await operation.inFlight);
+				const run = this.applyRoomCancel(lineage, operation, target);
+				operation.inFlight = run;
+				try {
+					return structuredClone(await run);
+				} catch (error) {
+					if (!operation.cancelled) {
+						this.roomCancelOperations.delete(lineage.cancelId);
+						const fenceKey = roomCancelFenceKey(lineage);
+						if (this.roomCancelFences.get(fenceKey)?.cancelId === lineage.cancelId) {
+							this.roomCancelFences.delete(fenceKey);
+						}
+					}
+					throw error;
+				} finally {
+					if (operation.inFlight === run) operation.inFlight = undefined;
+				}
 			}
 			case "approval.resolve":
 				return {

@@ -7,6 +7,8 @@ const activeRoom: ActiveRoomDispatch = {
 	dispatchId: "dispatch:1",
 	rootId: "root:1",
 	generation: 2,
+	dispatchAttempt: 3,
+	runtimeTurnId: "turn:accepted:1",
 	capabilityEpoch: 7,
 };
 
@@ -119,6 +121,8 @@ describe("Room settle lifecycle", () => {
 			rootId: "root:1",
 			generation: 2,
 			capabilityEpoch: 7,
+			runtimeTurnId: "turn:accepted:1",
+			dispatchAttempt: 3,
 			settleScopeId: "scope:1",
 			settleAttempt: 2,
 			resourceUsage: { repairCount: 1 },
@@ -135,6 +139,15 @@ describe("Room settle lifecycle", () => {
 			await expect(handler(event)).resolves.toBeUndefined();
 			vi.unstubAllGlobals();
 		}
+	});
+
+	it("fails closed before gateway I/O when the active Dispatch has no accepted turn identity", async () => {
+		const fetchMock = vi.fn();
+		vi.stubGlobal("fetch", fetchMock);
+		const handler = captureHandler(() => ({ ...activeRoom, runtimeTurnId: undefined }));
+
+		await expect(handler(event)).rejects.toThrow("no accepted runtime turn identity");
+		expect(fetchMock).not.toHaveBeenCalled();
 	});
 
 	it("fails closed when the product cannot settle the Dispatch", async () => {

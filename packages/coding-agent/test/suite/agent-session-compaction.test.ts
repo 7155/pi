@@ -480,6 +480,61 @@ describe("AgentSession compaction characterization", () => {
 		await expect(sessionInternals._runAutoCompaction("threshold", false)).resolves.toBe(true);
 	});
 
+	it("delivers one configured continuation after in-run threshold compaction", async () => {
+		const harness = await createHarness({
+			settings: { compaction: { enabled: true, keepRecentTokens: 1 } },
+			models: [{ id: "faux-1", contextWindow: 200_000, maxTokens: 8_000 }],
+			extensionFactories: [
+				(pi) => {
+					pi.on("session_before_compact", async (event) => ({
+						compaction: {
+							summary: "threshold continuation summary",
+							firstKeptEntryId: event.preparation.firstKeptEntryId,
+							tokensBefore: event.preparation.tokensBefore,
+							details: {},
+						},
+					}));
+				},
+			],
+		});
+		harnesses.push(harness);
+		seedCompactableSession(harness);
+		harness.session.setThresholdCompactionContinuation("continue the original task without repeating tools", 1);
+		const responses = [
+			createAssistant(harness, { stopReason: "stop", totalTokens: 190_000 }),
+			createAssistant(harness, { stopReason: "stop", totalTokens: 10 }),
+		];
+		let providerCalls = 0;
+		harness.session.agent.streamFn = () => {
+			const stream = createAssistantMessageEventStream();
+			const message = responses[providerCalls++];
+			if (!message) throw new Error("unexpected extra provider call");
+			queueMicrotask(() => stream.push({ type: "done", reason: "stop", message }));
+			return stream;
+		};
+
+		await expect(harness.session.prompt("finish the long task")).resolves.toBeUndefined();
+
+		expect(harness.eventsOfType("compaction_end").at(-1)).toMatchObject({
+			reason: "threshold",
+			aborted: false,
+			willRetry: true,
+		});
+		expect(providerCalls).toBe(2);
+		const continuations = harness.session.messages.filter(
+			(message) => message.role === "custom" && message.customType === "threshold-compaction-continuation",
+		);
+		expect(continuations).toHaveLength(1);
+		expect(continuations[0]).toMatchObject({
+			display: false,
+			details: {
+				reason: "threshold",
+				continuationNumber: 1,
+				continuationLimit: 1,
+			},
+		});
+	});
+
 	it("does not retry overflow recovery more than once", async () => {
 		const harness = await createHarness();
 		harnesses.push(harness);

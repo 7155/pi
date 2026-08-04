@@ -17,6 +17,7 @@ import {
 	SettingsManager,
 	type Theme,
 } from "@earendil-works/pi-coding-agent";
+import { type AskWireRequest, createAskExtension } from "./ask.ts";
 import { PiDebugContextRecorder } from "./debug-context.ts";
 import {
 	createDiscoveryToolsExtension,
@@ -27,13 +28,19 @@ import {
 import { createLifecycleHookController } from "./lifecycle-hooks.ts";
 import { createMemoryCaptureExtension, prepareGovernedMemoryCapture } from "./memory-capture-tool.ts";
 import { bootstrapNativeWorkspaceToolTargets, createNativeWorkspaceToolsExtension } from "./native-workspace-tools.ts";
-import { PROTOCOL_VERSION, type RuntimeEventEnvelope, RuntimeProtocolError } from "./protocol.ts";
+import {
+	PROTOCOL_VERSION,
+	type RoomCancelParams,
+	type RuntimeEventEnvelope,
+	RuntimeProtocolError,
+	sameRoomCancelLineage,
+} from "./protocol.ts";
 import { createProviderContextJournalExtension, ProviderContextJournal } from "./provider-context-journal.ts";
 import { roomSkillPromptFocus, roomToolPromptFocus } from "./room-prompt-catalog.ts";
 import { createRoomResourceLimitExtension, type RoomResourceLimits } from "./room-resource-limits.ts";
 import { type ActiveRoomDispatch, createRoomSettleLifecycleExtension } from "./room-settle-lifecycle.ts";
 import { bootstrapRoomTools } from "./room-tool-bootstrap.ts";
-import { TOOL_LOAD_TOOL_NAME } from "./runtime-tool-names.ts";
+import { ASK_TOOL_NAME, TOOL_LOAD_TOOL_NAME } from "./runtime-tool-names.ts";
 import { createSessionContextRefreshExtension } from "./session-context-refresh.ts";
 import type { PooledSession } from "./session-pool.ts";
 import { applySkillRoutingCardCatalog, type SkillRoutingCardCatalog } from "./skill-routing-cards.ts";
@@ -46,6 +53,7 @@ import {
 	diffBackendToolCatalog,
 	rebindGovernedToolReceipts,
 } from "./tool-bridge.ts";
+import { ToolLoopProgressGuard } from "./tool-loop-progress-guard.ts";
 import { ToolResultStore } from "./tool-result-store.ts";
 import { createWorkflowControlExtension } from "./workflow-control.ts";
 
@@ -150,9 +158,6 @@ function publicUserText(content: unknown): string | undefined {
 
 function publicAssistantText(message: Record<string, unknown>): string | undefined {
 	const blocks = messageBlocks(message.content);
-	if (blocks.some((item) => item.type === "toolCall" || item.type === "tool_call")) {
-		return undefined;
-	}
 	const text = textFromContent(message.content);
 	if (text) return text;
 	if (typeof message.errorMessage === "string" && message.errorMessage.trim()) {
@@ -222,9 +227,13 @@ export function restoreBackendToolDisclosures(registry: BackendToolRegistry, ses
 	return restored;
 }
 
-function applyBackendToolDisclosure(session: AgentSession, registry: BackendToolRegistry): string[] {
+function applyBackendToolDisclosure(session: AgentSession, registry: BackendToolRegistry, roomBound = false): string[] {
 	const backendNames = new Set(registry.list().map((tool) => tool.name));
-	const visibleNames = session.getActiveToolNames().filter((name) => !backendNames.has(name));
+	const visibleNames = session
+		.getActiveToolNames()
+		.filter((name) => !backendNames.has(name) && (!roomBound || name !== ASK_TOOL_NAME));
+	if (!roomBound && session.getAllTools().some((tool) => tool.name === ASK_TOOL_NAME))
+		visibleNames.push(ASK_TOOL_NAME);
 	visibleNames.push(...registry.disclosed().map((tool) => tool.name));
 	const uniqueNames = [...new Set(visibleNames)];
 	session.setActiveToolsByName(uniqueNames);
@@ -306,6 +315,11 @@ export interface PiSessionAbortReceipt {
 	cancelledDecisionIds: string[];
 	cancelledUIRequestIds: string[];
 	lifecycle: AgentAbortReceipt;
+}
+
+interface AppliedRoomCancel {
+	lineage: RoomCancelParams;
+	cancelledIds: string[];
 }
 
 interface PublicCompactionState {
@@ -422,6 +436,7 @@ export class PiProductSession implements PooledSession {
 	private roomToolCost = 0;
 	private roomRetryCount = 0;
 	private latestCompaction: PublicCompactionState | undefined;
+	private toolLoopProgressGuard?: ToolLoopProgressGuard;
 	private readonly pendingDecisions = new Map<
 		string,
 		{ requestId: string; resolve(value: boolean): void; cleanup(): void }
@@ -435,6 +450,7 @@ export class PiProductSession implements PooledSession {
 			cancel(): void;
 		}
 	>();
+	private readonly appliedRoomCancels = new Map<string, AppliedRoomCancel>();
 
 	private constructor(
 		options: PiSessionOpenOptions,
@@ -463,10 +479,53 @@ export class PiProductSession implements PooledSession {
 		this.providerContextJournal = providerContextJournal;
 		this.backendBridge = backendBridge;
 		this.emitEvent = options.emitEvent;
+		const inheritedStopPolicy = session.agent.shouldStopAfterTurn;
+		session.agent.shouldStopAfterTurn = async (context) => {
+			if ((await inheritedStopPolicy?.(context)) === true) return true;
+			const shouldStop = this.progressGuard().shouldStop(context);
+			if (shouldStop) {
+				const receipt = this.progressGuard().stopReceipt();
+				this.emitEvent({
+					protocolVersion: PROTOCOL_VERSION,
+					event: "agent.event",
+					sessionId: this.externalSessionId,
+					turnId: this.activeTurn?.turnId,
+					clientMessageId: this.activeTurn?.clientMessageId,
+					sequence: ++this.sequence,
+					payload: {
+						type: "tool_loop_no_progress",
+						message: "Tool Loop 连续未产生成功结果，已按受管无进展策略停止。请检查最后一项未完成原因后再重试。",
+						...receipt,
+					},
+				});
+			}
+			return shouldStop;
+		};
 		this.unsubscribe = session.subscribe((event) => this.onSessionEvent(event));
 	}
 
+	private progressGuard(): ToolLoopProgressGuard {
+		this.toolLoopProgressGuard ??= new ToolLoopProgressGuard();
+		return this.toolLoopProgressGuard;
+	}
+
+	private refreshBackendToolDisclosure(roomBound = this.roomCapability !== undefined): void {
+		const registry = this.toolRegistry;
+		const session = this.session;
+		if (
+			!registry ||
+			!session ||
+			typeof session.getActiveToolNames !== "function" ||
+			typeof session.getAllTools !== "function" ||
+			typeof session.setActiveToolsByName !== "function"
+		) {
+			return;
+		}
+		applyBackendToolDisclosure(session, registry, roomBound);
+	}
+
 	static async create(options: PiSessionOpenOptions): Promise<PiProductSession> {
+		const roomBound = options.roomCapability !== undefined;
 		const registry = new BackendToolRegistry();
 		if (options.toolManifest !== undefined) registry.sync(options.toolManifest);
 		const sessionManager =
@@ -554,6 +613,16 @@ export class PiProductSession implements PooledSession {
 					loadedNames: [...loadedSkillNames],
 				}),
 			extensionFactories: [
+				...(roomBound
+					? []
+					: [
+							createAskExtension({
+								requestQuestions: (toolCallId, request, signal) => {
+									if (!productSession) throw new Error("Product session Ask bridge is not ready");
+									return productSession.requestAskQuestions(toolCallId, request, signal);
+								},
+							}),
+						]),
 				createDiscoveryToolsExtension({
 					getResourceLoader,
 					registry,
@@ -688,7 +757,17 @@ export class PiProductSession implements PooledSession {
 		// The manifest is already filtered by the Session permission policy. Keep
 		// every authorized tool routable while Provider schemas stay progressive.
 		created.session.setRegisteredToolExecutionEnabled(true);
-		applyBackendToolDisclosure(created.session, registry);
+		created.session.setThresholdCompactionContinuation(
+			[
+				'<managed-compaction-continuation origin="threshold-compaction" continuation-limit="1">',
+				"Pi 原生阈值压缩已经完成。立即从压缩摘要与现有 Tool 证据继续原始用户任务。",
+				"不要重复已经完成的写入、Shell、桌面动作或提交；先复用现有回执。",
+				"如果原任务实际上已经完成，只给出一次简洁最终结果并停止，不要启动新任务。",
+				"</managed-compaction-continuation>",
+			].join("\n"),
+			1,
+		);
+		applyBackendToolDisclosure(created.session, registry, roomBound);
 		productSession = new PiProductSession(
 			options,
 			created.session,
@@ -719,6 +798,27 @@ export class PiProductSession implements PooledSession {
 			},
 		});
 		return productSession;
+	}
+
+	requestAskQuestions(toolCallId: string, request: AskWireRequest, signal?: AbortSignal): Promise<string | undefined> {
+		if (this.roomCapability !== undefined) {
+			return Promise.reject(
+				new Error("Room-bound Sessions route user questions through the facilitator Room wait path"),
+			);
+		}
+		const payload = JSON.stringify(request);
+		return this.requestUI(
+			"editor",
+			{
+				title: `RAG-IME-QUESTIONS:${toolCallId}`,
+				prefill: payload,
+				defaultValue: payload,
+			},
+			(response) =>
+				response.cancelled === true ? undefined : typeof response.value === "string" ? response.value : undefined,
+			undefined,
+			{ signal },
+		);
 	}
 
 	private extensionUIContext(): ExtensionUIContext {
@@ -1075,6 +1175,7 @@ export class PiProductSession implements PooledSession {
 			isCompacting: compactionOverride ?? this.session.isCompacting,
 			compactionCount: entries.filter((entry) => entry.type === "compaction").length,
 			latestCompaction: this.latestCompaction,
+			toolLoopProgressStop: this.progressGuard().stopReceipt(),
 			updatedAtMs: Date.now(),
 		};
 	}
@@ -1122,7 +1223,7 @@ export class PiProductSession implements PooledSession {
 		};
 	}
 
-	snapshot(): Record<string, unknown> {
+	openSnapshot(): Record<string, unknown> {
 		return {
 			sessionId: this.externalSessionId,
 			piSessionId: this.session.sessionId,
@@ -1142,6 +1243,7 @@ export class PiProductSession implements PooledSession {
 			toolManifest: this.toolRegistry.list(),
 			roomCapability: this.roomCapability ? structuredClone(this.roomCapability) : undefined,
 			activeRoom: this.activeRoom ? structuredClone(this.activeRoom) : undefined,
+			toolLoopProgressStop: this.progressGuard().stopReceipt(),
 			roomProviderContext: this.roomProviderContext ? structuredClone(this.roomProviderContext) : undefined,
 			disclosedBackendTools: this.toolRegistry.disclosed().map((tool) => tool.name),
 			// Compatibility field for older control-center clients.
@@ -1150,9 +1252,16 @@ export class PiProductSession implements PooledSession {
 			roomSkillLoad: this.roomSkillLoadReceipt(),
 			piSkillsEnabled: this.piSkillsEnabled,
 			codexSkillsEnabled: this.codexSkillsEnabled,
+			messageCount: this.session.messages.length,
+			leafId: this.session.sessionManager.getLeafId(),
+		};
+	}
+
+	snapshot(): Record<string, unknown> {
+		return {
+			...this.openSnapshot(),
 			messages: this.session.messages,
 			entries: this.session.sessionManager.getEntries(),
-			leafId: this.session.sessionManager.getLeafId(),
 		};
 	}
 
@@ -1390,7 +1499,7 @@ export class PiProductSession implements PooledSession {
 		// still sees only the explicitly disclosed subset after the reload.
 		if (registryReloaded) {
 			await this.session.reload();
-			applyBackendToolDisclosure(this.session, this.toolRegistry);
+			applyBackendToolDisclosure(this.session, this.toolRegistry, this.roomCapability !== undefined);
 		}
 		await this.appendCatalogChange("tool_catalog_changed", {
 			...diff,
@@ -1411,8 +1520,12 @@ export class PiProductSession implements PooledSession {
 		if (!this.session.isIdle || this.activeTurn) {
 			throw new RuntimeProtocolError("SESSION_BUSY", "Session already has an active turn");
 		}
+		this.progressGuard().reset();
 		const turn = { turnId: randomUUID(), clientMessageId: options.clientMessageId };
 		this.activeTurn = turn;
+		// The native prompt may reach before_agent_settle before dispatchRoom()
+		// resumes from preflight, so publish the receipt identity synchronously.
+		if (this.activeRoom) this.activeRoom.runtimeTurnId = turn.turnId;
 		const previousSessionContext = this.sessionContext;
 		const nextSessionContext =
 			options.sessionContext !== undefined ? options.sessionContext.trim() : previousSessionContext;
@@ -1505,6 +1618,7 @@ export class PiProductSession implements PooledSession {
 		dispatchId: string;
 		rootId: string;
 		generation: number;
+		dispatchAttempt: number;
 		capabilityEpoch: number;
 		sessionContext?: string;
 		roomContext?: string;
@@ -1561,6 +1675,7 @@ export class PiProductSession implements PooledSession {
 		if (options.roomCapability !== undefined) {
 			this.roomCapability = structuredClone(options.roomCapability);
 			this.backendBridge.roomCapability = structuredClone(options.roomCapability);
+			this.refreshBackendToolDisclosure(true);
 		}
 		if (options.roomResourceLimits !== undefined) {
 			this.roomResourceLimits = structuredClone(options.roomResourceLimits);
@@ -1578,6 +1693,9 @@ export class PiProductSession implements PooledSession {
 		if (!this.activeTurn) {
 			try {
 				const turn = await this.prompt({ message: options.message });
+				if (this.activeRoom?.dispatchId === options.dispatchId) {
+					this.activeRoom.runtimeTurnId = turn.turnId;
+				}
 				return {
 					delivery: "prompt",
 					turnId: turn.turnId,
@@ -1639,6 +1757,8 @@ export class PiProductSession implements PooledSession {
 			dispatchId: options.dispatchId,
 			rootId: options.rootId,
 			generation: options.generation,
+			dispatchAttempt: options.dispatchAttempt,
+			runtimeTurnId: this.activeTurn?.turnId,
 			capabilityEpoch: options.capabilityEpoch,
 		};
 		this.roomUsageBaseline = {
@@ -1670,7 +1790,10 @@ export class PiProductSession implements PooledSession {
 		if (Date.now() >= this.roomResourceLimits.deadlineAtMs) {
 			return { allowed: false, reason: "Room wall-clock deadline exceeded" };
 		}
-		if (this.roomToolCalls >= this.roomResourceLimits.maxToolCalls) {
+		if (
+			this.roomResourceLimits.maxToolCalls !== undefined &&
+			this.roomToolCalls >= this.roomResourceLimits.maxToolCalls
+		) {
 			return { allowed: false, reason: "Room tool-call limit exhausted" };
 		}
 		if (this.roomToolCost + 1 > this.roomResourceLimits.maxToolCost) {
@@ -1687,21 +1810,55 @@ export class PiProductSession implements PooledSession {
 		if (Date.now() >= limits.deadlineAtMs) {
 			throw new RuntimeProtocolError("ROOM_DEADLINE_EXCEEDED", "Room wall-clock deadline exceeded");
 		}
-		const contextTokens = this.session.getContextUsage()?.tokens ?? 0;
-		if (contextTokens > limits.maxInputTokens) {
-			throw new RuntimeProtocolError("ROOM_INPUT_LIMIT_EXCEEDED", "Room input-token limit exceeded");
+		const maxInputTokens = limits.maxInputTokens;
+		if (maxInputTokens !== undefined) {
+			const contextTokens = this.session.getContextUsage()?.tokens ?? 0;
+			if (contextTokens > maxInputTokens) {
+				throw new RuntimeProtocolError("ROOM_INPUT_LIMIT_EXCEEDED", "Room input-token limit exceeded");
+			}
 		}
 	}
 
-	cancelRoom(rootId: string, generation: number): { cancelledIds: string[]; abortRequired: boolean } {
-		const byCorrelation = this.session.cancelContinuation({ correlationId: rootId }, "room_cancel");
+	cancelRoom(lineage: RoomCancelParams): { cancelledIds: string[]; abortRequired: boolean } {
+		const replay = this.appliedRoomCancels.get(lineage.cancelId);
+		if (replay) {
+			if (!sameRoomCancelLineage(replay.lineage, lineage)) {
+				throw new RuntimeProtocolError(
+					"ROOM_CANCEL_LINEAGE_MISMATCH",
+					"Room cancellation does not match the active Room runtime lineage",
+				);
+			}
+			return { cancelledIds: [...replay.cancelledIds], abortRequired: true };
+		}
+		const active = this.activeRoom;
+		if (
+			!active ||
+			lineage.sessionId !== this.externalSessionId ||
+			lineage.rootId !== active.rootId ||
+			lineage.dispatchId !== active.dispatchId ||
+			lineage.turnId !== active.runtimeTurnId ||
+			lineage.turnId !== this.activeTurn?.turnId ||
+			lineage.capabilityEpoch !== active.capabilityEpoch ||
+			lineage.generation < active.generation
+		) {
+			throw new RuntimeProtocolError(
+				"ROOM_CANCEL_LINEAGE_MISMATCH",
+				"Room cancellation does not match the active Room runtime lineage",
+			);
+		}
+		const byCorrelation = this.session.cancelContinuation({ correlationId: lineage.rootId }, "room_cancel");
+		this.appliedRoomCancels.set(lineage.cancelId, {
+			lineage: structuredClone(lineage),
+			cancelledIds: [...byCorrelation.cancelledIds],
+		});
 		return {
-			cancelledIds: byCorrelation.cancelledIds,
-			abortRequired: this.activeRoom?.rootId === rootId && this.activeRoom.generation <= generation,
+			cancelledIds: [...byCorrelation.cancelledIds],
+			abortRequired: true,
 		};
 	}
 
-	finishRoomCancel(rootId: string, generation: number): void {
+	finishRoomCancel(rootId: string, generation: number, cancelId?: string): void {
+		if (cancelId) this.appliedRoomCancels.delete(cancelId);
 		if (this.activeRoom?.rootId !== rootId || this.activeRoom.generation > generation) return;
 		this.activeTurn = undefined;
 		this.activeRoom = undefined;
@@ -1719,8 +1876,7 @@ export class PiProductSession implements PooledSession {
 		};
 	}
 
-	async abort(): Promise<PiSessionAbortReceipt> {
-		const turnId = this.activeTurn?.turnId ?? "";
+	private async abortWithTurnId(turnId: string): Promise<PiSessionAbortReceipt> {
 		const cancelledUIRequestIds = [...this.pendingUIRequests.keys()];
 		for (const pending of [...this.pendingUIRequests.values()]) pending.cancel();
 
@@ -1736,6 +1892,21 @@ export class PiProductSession implements PooledSession {
 			cancelledUIRequestIds,
 			lifecycle,
 		};
+	}
+
+	abort(): Promise<PiSessionAbortReceipt> {
+		return this.abortWithTurnId(this.activeTurn?.turnId ?? "");
+	}
+
+	abortRoom(lineage: RoomCancelParams): Promise<PiSessionAbortReceipt> {
+		const applied = this.appliedRoomCancels.get(lineage.cancelId);
+		if (!applied || !sameRoomCancelLineage(applied.lineage, lineage)) {
+			throw new RuntimeProtocolError(
+				"ROOM_CANCEL_LINEAGE_MISMATCH",
+				"Room cancellation does not match the active Room runtime lineage",
+			);
+		}
+		return this.abortWithTurnId(lineage.turnId);
 	}
 
 	async compact(customInstructions?: string): Promise<unknown> {
@@ -1793,7 +1964,7 @@ export class PiProductSession implements PooledSession {
 		const skillsBefore = this.resourceLoader.getSkills().skills;
 		const toolsBefore = this.registeredToolSchemas();
 		await this.session.reload();
-		applyBackendToolDisclosure(this.session, this.toolRegistry);
+		applyBackendToolDisclosure(this.session, this.toolRegistry, this.roomCapability !== undefined);
 		const skillDiff = diffSkillCatalog(skillsBefore, this.resourceLoader.getSkills().skills);
 		const toolDiff = diffBackendToolCatalog(toolsBefore, this.registeredToolSchemas());
 		if (

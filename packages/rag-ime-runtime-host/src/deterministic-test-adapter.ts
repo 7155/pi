@@ -14,6 +14,8 @@ const PROJECT_TASK_SCENARIO = "project-task";
 const PROJECT_TOOL_RECOVERY_SCENARIO = "project-tool-recovery";
 const PROJECT_COLLABORATION_SCENARIO = "project-collaboration";
 const AGENT_SESSION_SCENARIO = "agent-session";
+const NO_PROGRESS_SCENARIO = "no-progress";
+const THRESHOLD_CONTINUATION_SCENARIO = "threshold-continuation";
 const AGENT_SESSION_TASK_MARKER = "AGENT-SESSION-RESILIENCE";
 const AGENT_SESSION_FINAL_MARKER = "AGENT-SESSION-CANARY-OK";
 const AGENT_SESSION_RECOVERY_MARKER = "AGENT-SESSION-RECOVERY-OK";
@@ -396,41 +398,246 @@ export function projectTaskCanaryResponse(context: Context): AssistantMessage {
 	return fauxAssistantMessage("PROJECT-CANARY-OK");
 }
 
-/** Drive one A -> (B collaboration, C handoff) Room task through the real Kernel. */
+/** Drive the canonical three-member full-auto Room lifecycle through the real Kernel. */
 export function projectCollaborationCanaryResponse(context: Context): AssistantMessage {
 	const serialized = contextText(context);
-	if (serialized.includes("structured context checkpoint summary")) {
-		return fauxAssistantMessage(
-			"Preserve exactly one recovery packet with the immutable THREE-MEMBER-ROOM-CANARY requirement, " +
-				"current task, all acceptance criteria, blockers, formal handoff, and exact Skill and Tool receipts.",
-		);
-	}
+	const tools = activeToolNames(context);
 	const task = currentRoomTask(context);
-	if (!task) return fauxAssistantMessage("A managed three-member Room dispatch is required.");
+	if (!task) {
+		return fauxAssistantMessage("A managed full-auto Room dispatch is required.");
+	}
 	const currentTask =
 		(task.split("当前任务：").at(-1) ?? task).split(/验收条件(?:\s+acceptance\.criteria|（|:|：)/u)[0] ?? task;
-	const member = currentTask.includes("COLLAB-B-REVIEWED")
-		? "B"
-		: currentTask.includes("COLLAB-C-ACCEPTED")
-			? "C"
-			: currentTask.includes("THREE-MEMBER-ROOM-CANARY")
-				? "A"
-				: "";
-	if (!member) return fauxAssistantMessage("The current Room task is outside the collaboration canary.");
-	const prefix = `collab-${member.toLowerCase()}`;
-	const tools = activeToolNames(context);
+	if (!serialized.includes("写 TUI") && !currentTask.includes("ROOM-FULL-AUTO-")) {
+		return fauxAssistantMessage("A managed full-auto Room dispatch for 写 TUI is required.");
+	}
+	const reviewerAccepted = contextHasJsonField(context, "reviewState", "accepted");
+	const reviewerResult = reviewerAccepted || serialized.includes("room-full-auto-review-commit");
+	const pendingIntegrationReady = parsedContextRecords(context).some((record) => {
+		const pending = record.pendingIntegrations;
+		return Array.isArray(pending) && pending.length > 0;
+	});
+	const waitChildIndex = serialized.lastIndexOf("room-full-auto-alignment-wait-child");
+	const resumedAfterWait =
+		waitChildIndex >= 0 &&
+		["这是恢复轮次", '<room-work-follow-up source="system"'].some(
+			(marker) => serialized.lastIndexOf(marker) > waitChildIndex,
+		);
+	const reviewHandoffIndex = serialized.lastIndexOf("room-full-auto-integration-handoff-review");
+	const resumedAfterReviewHandoff =
+		reviewHandoffIndex >= 0 &&
+		["这是恢复轮次", '<room-work-follow-up source="system"'].some(
+			(marker) => serialized.lastIndexOf(marker) > reviewHandoffIndex,
+		);
+	const taskPhase = currentTask.includes("ROOM-FULL-AUTO-REVIEW")
+		? "review"
+		: currentTask.includes("ROOM-FULL-AUTO-CHILD")
+			? "child"
+			: "";
+	const phase =
+		taskPhase ||
+		(reviewerResult || resumedAfterReviewHandoff
+			? "await-review"
+			: serialized.includes("room-full-auto-alignment-wait-child") && (pendingIntegrationReady || resumedAfterWait)
+				? "integration"
+				: "alignment");
+	const prefix = `room-full-auto-${phase}`;
 	const callId = (suffix: string): string => `${prefix}-${suffix}`;
+	const aliases = (): string[] => {
+		const current = currentAcceptanceAliases(context, task);
+		return current.length > 0 ? current : ["AC-1", "AC-2", "AC-3", "AC-4"];
+	};
+	const settlementEvidence = (
+		currentAliases: string[],
+		currentToolCallId: string,
+		includeCurrent = true,
+	): Array<Record<string, unknown>> => {
+		const referenceSet = new Set(runtimeEvidenceRefs(context, 64));
+		for (const record of parsedContextRecords(context)) {
+			for (const key of ["contextEvidenceRefs", "evidenceRefs", "acceptedEvidenceRefs"]) {
+				const values = record[key];
+				if (!Array.isArray(values)) continue;
+				for (const value of values) {
+					const reference = String(value ?? "").trim();
+					if (reference) referenceSet.add(reference);
+				}
+			}
+		}
+		const references = [...referenceSet];
+		const fallback = `execution:invoke:${currentToolCallId}`;
+		return currentAliases.map((acceptance) => ({
+			acceptance,
+			refs: includeCurrent ? references : references.length > 0 ? references : [fallback],
+		}));
+	};
+	const distinctRuntimeEvidence = (
+		currentAliases: string[],
+		toolCallIds: string[],
+	): Array<Record<string, unknown>> => {
+		if (currentAliases.length > toolCallIds.length) {
+			throw new Error("The deterministic Room phase has fewer tool receipts than acceptance items");
+		}
+		return currentAliases.map((acceptance, index) => ({
+			acceptance,
+			refs: [`execution:invoke:${toolCallIds[index]}`],
+		}));
+	};
+	const acceptedEvidence = (currentAliases: string[]): Array<Record<string, unknown>> => {
+		const refsByAlias = new Map<string, string[]>();
+		for (const record of parsedContextRecords(context)) {
+			const items = record.acceptanceAliases;
+			if (!Array.isArray(items)) continue;
+			for (const rawItem of items) {
+				if (typeof rawItem !== "object" || rawItem === null || Array.isArray(rawItem)) continue;
+				const item = rawItem as Record<string, unknown>;
+				const acceptance = String(item.acceptance ?? "").trim();
+				const refs = Array.isArray(item.evidenceRefs)
+					? item.evidenceRefs.map((value) => String(value ?? "").trim()).filter(Boolean)
+					: [];
+				if (acceptance && refs.length > 0) refsByAlias.set(acceptance, refs);
+			}
+		}
+		const missing = currentAliases.filter((acceptance) => !refsByAlias.has(acceptance));
+		if (missing.length > 0) {
+			throw new Error(`Final Room delivery has no accepted evidence for ${missing.join(", ")}`);
+		}
+		return currentAliases.map((acceptance) => ({
+			acceptance,
+			refs: refsByAlias.get(acceptance) ?? [],
+		}));
+	};
+	const commit = (argumentsValue: Record<string, unknown>, id: string): AssistantMessage =>
+		fauxAssistantMessage(fauxToolCall("room_commit", argumentsValue, { id }), { stopReason: "toolUse" });
+	const state = (id: string): AssistantMessage =>
+		fauxAssistantMessage(fauxToolCall("room_state", {}, { id }), { stopReason: "toolUse" });
 
-	if (!tools.has("room_state")) {
-		return fauxAssistantMessage(fauxToolCall("tool_load", { name: "room_state" }, { id: callId("load-state") }), {
-			stopReason: "toolUse",
-		});
-	}
-	if (!serialized.includes(callId("state"))) {
-		return fauxAssistantMessage(fauxToolCall("room_state", {}, { id: callId("state") }), { stopReason: "toolUse" });
-	}
+	if (phase === "alignment") {
+		if (!tools.has("room_state")) {
+			return fauxAssistantMessage(fauxToolCall("tool_load", { name: "room_state" }, { id: callId("load-state") }), {
+				stopReason: "toolUse",
+			});
+		}
+		if (!serialized.includes(callId("state"))) return state(callId("state"));
 
-	if (member === "A") {
+		const answers = [
+			"先做一个最小可运行的终端界面：有清晰的标题、输入区和结果区；不用安装新依赖，启动后能直接使用。",
+			"优先保证键盘操作、状态反馈和基本错误提示，先不加入网络同步或复杂主题。",
+			"交付时保留现有项目约定，只改实现所需内容，并给出可复现的验证结果。",
+		];
+		const answerIndex = answers.findIndex((answer) => !serialized.includes(answer));
+		const waitIndex = answerIndex < 0 ? answers.length : answerIndex;
+		if (waitIndex < answers.length) {
+			const waitId = callId(`wait-${waitIndex + 1}`);
+			if (!serialized.includes(waitId)) {
+				if (waitIndex > 0 && !serialized.includes(answers[waitIndex - 1])) {
+					return fauxAssistantMessage("等待用户对当前问题作答。");
+				}
+				return commit(
+					{
+						decision: "wait",
+						summary: "需要用户逐项确认终端界面的目标、交互边界和验证方式。",
+						publicSummary: "开始需求确认，请先回答当前问题。",
+						evidence: [],
+						residualRisks: [],
+						waitingFor: "user",
+						question:
+							waitIndex === 0
+								? "终端界面的最小版本需要包含哪些可见区域和启动行为？"
+								: waitIndex === 1
+									? "交互、状态反馈和错误提示中，哪一项需要优先保证？"
+									: "交付边界和验证方式有哪些必须遵守的限制？",
+						questionOptions: [
+							{ value: "minimum", label: "先完成最小可用界面", recommended: true },
+							{ value: "polish", label: "先做完整视觉和主题" },
+						],
+						resumeCondition: "收到用户对当前问题的一条普通自然语言回答后继续需求对齐。",
+					},
+					waitId,
+				);
+			}
+			return fauxAssistantMessage("等待用户对当前问题作答。");
+		}
+		if (!tools.has("room_define")) {
+			if (!serialized.includes(callId("search-define"))) {
+				return fauxAssistantMessage(
+					fauxToolCall("tool_search", { query: "room_define", limit: 4 }, { id: callId("search-define") }),
+					{ stopReason: "toolUse" },
+				);
+			}
+			if (!serialized.includes(callId("load-define"))) {
+				return fauxAssistantMessage(
+					fauxToolCall("tool_load", { name: "room_define" }, { id: callId("load-define") }),
+					{ stopReason: "toolUse" },
+				);
+			}
+		}
+		if (!serialized.includes(callId("define"))) {
+			return fauxAssistantMessage(
+				fauxToolCall(
+					"room_define",
+					{
+						objective: "交付一个最小可运行的终端界面，满足已确认的输入、结果展示和反馈边界。",
+						expectedOutput: "可直接启动、可键盘操作、带状态反馈和基本错误提示的可验证实现。",
+						requirements: [
+							"启动后显示清晰标题、输入区和结果区，并能直接进入可用状态。",
+							"键盘操作、状态反馈和基本错误提示保持明确且可复现。",
+							"保留现有项目约定，只修改实现所需内容，不加入网络同步或复杂主题。",
+							"交付包含可重复执行的验证结果，说明已验证范围与未验证边界。",
+						],
+						acceptanceCriteria: [
+							{
+								statement: "启动后出现清晰标题、输入区和结果区，并可直接使用。",
+								kind: "user_journey",
+								expectedReceiptTypes: ["evidence"],
+								fullNameZh: "启动后显示并可使用最小界面",
+							},
+							{
+								statement: "键盘操作、状态反馈和基本错误提示可观察且行为一致。",
+								kind: "requirement",
+								expectedReceiptTypes: ["evidence"],
+								fullNameZh: "交互与错误反馈可观察",
+							},
+							{
+								statement: "实现遵守现有项目约定，不引入网络同步或复杂主题。",
+								kind: "requirement",
+								expectedReceiptTypes: ["evidence"],
+								fullNameZh: "实现边界保持最小",
+							},
+							{
+								statement: "交付提供可重复执行的验证结果和清楚的边界说明。",
+								kind: "requirement",
+								expectedReceiptTypes: ["evidence"],
+								fullNameZh: "验证结果可复现",
+							},
+						],
+						implementationParticipantRef: participantRefForRole(context, "implementer"),
+					},
+					{ id: callId("define") },
+				),
+				{ stopReason: "toolUse" },
+			);
+		}
+		if (!serialized.includes(callId("defined-state"))) return state(callId("defined-state"));
+		requireResidentNativeCodingTools(tools, ["read"]);
+		if (!serialized.includes(callId("evidence-read"))) {
+			return fauxAssistantMessage(
+				[
+					fauxToolCall("read", { path: "README.md", offset: 0, limit: 16_384 }, { id: callId("evidence-read-a") }),
+					fauxToolCall(
+						"read",
+						{ path: "calculator.py", offset: 0, limit: 16_384 },
+						{ id: callId("evidence-read-b") },
+					),
+					fauxToolCall(
+						"read",
+						{ path: "test_calculator.py", offset: 0, limit: 16_384 },
+						{ id: callId("evidence-read-c") },
+					),
+					fauxToolCall("read", { path: "README.md", offset: 0, limit: 16_384 }, { id: callId("evidence-read-d") }),
+				],
+				{ stopReason: "toolUse" },
+			);
+		}
 		if (!tools.has("room_collaborate")) {
 			return fauxAssistantMessage(
 				fauxToolCall("tool_load", { name: "room_collaborate" }, { id: callId("load-collaborate") }),
@@ -438,75 +645,179 @@ export function projectCollaborationCanaryResponse(context: Context): AssistantM
 			);
 		}
 		if (!serialized.includes(callId("collaborate"))) {
+			const currentAliases = aliases();
 			return fauxAssistantMessage(
 				fauxToolCall(
 					"room_collaborate",
 					{
-						targetParticipantRef: participantRefForRole(context, "reviewer"),
-						intent: "review",
+						targetParticipantRef: participantRefForRole(context, "implementer"),
+						intent: "execute",
+						workspacePolicy: "isolated_writable",
 						objective:
-							"B 先调用 room_state，再独立读取 calculator.py 与 test_calculator.py；" +
-							"不得调用 edit 或 bash；room_post 以 COLLAB-B-REVIEWED 开头，" +
-							"最后用 room_commit 交付 COLLAB-B-COMMIT-RESULT 和 AC 证据。",
-						expectedOutput: "B 交付只读测试意图复核与两份文件证据。",
-						acceptance: currentAcceptanceAliases(context, task).filter((alias) => alias === "AC-4"),
+							"ROOM-FULL-AUTO-CHILD：在隔离工作区完成已确认终端界面的最小实现，" +
+							"只修改 calculator.py，不修改测试文件或其他路径。",
+						expectedOutput: "隔离工作区中的最小实现和可复现回归验证结果。",
+						acceptance: currentAliases.slice(0, 1),
+						evidenceRefs: runtimeEvidenceRefs(context, 8),
 					},
 					{ id: callId("collaborate") },
 				),
 				{ stopReason: "toolUse" },
 			);
 		}
+		if (!serialized.includes(callId("wait-child"))) {
+			const currentAliases = aliases();
+			return commit(
+				{
+					decision: "wait",
+					summary: "已邀请实施伙伴在隔离工作区完成有界实现，等待其返回结果后由协调者集成。",
+					publicSummary: "实施伙伴正在独立工作区完成有界实现，完成后由协调者合入并验证。",
+					evidence: distinctRuntimeEvidence(currentAliases, [
+						callId("evidence-read-a"),
+						callId("evidence-read-b"),
+						callId("evidence-read-c"),
+						callId("evidence-read-d"),
+					]),
+					residualRisks: ["隔离工作区结果尚未合入权威工作区。"],
+					waitingFor: "participant",
+					waitingForParticipantRef: participantRefForRole(context, "implementer"),
+					resumeCondition: "实施伙伴已返回隔离工作区结果，Facilitator 可以继续集成。",
+				},
+				callId("wait-child"),
+			);
+		}
+		return fauxAssistantMessage("等待实施伙伴返回隔离工作区结果。");
 	}
 
-	requireResidentNativeCodingTools(tools, member === "A" || member === "C" ? NATIVE_CODING_TOOL_NAMES : ["read"]);
-	if (member === "A" && !serialized.includes(callId("missing-read"))) {
-		return fauxAssistantMessage(
-			fauxToolCall(
-				"read",
-				{ path: "missing_requirements.md", offset: 0, limit: 16_384 },
-				{ id: callId("missing-read") },
-			),
-			{ stopReason: "toolUse" },
-		);
-	}
-	if (member === "A") {
-		if (!serialized.includes(callId("list"))) {
-			return fauxAssistantMessage(fauxToolCall("ls", { path: ".", limit: 50 }, { id: callId("list") }), {
+	if (phase === "integration") {
+		if (!tools.has("room_state")) {
+			return fauxAssistantMessage(fauxToolCall("tool_load", { name: "room_state" }, { id: callId("load-state") }), {
 				stopReason: "toolUse",
 			});
 		}
-		if (!serialized.includes(callId("search"))) {
+		if (!serialized.includes(callId("state"))) return state(callId("state"));
+		const childTaskId = parsedContextRecords(context)
+			.map((record) => String(record.childTaskId ?? "").trim())
+			.filter(Boolean)
+			.at(-1);
+		if (!childTaskId) throw new Error("Facilitator integration requires the bounded child Task id");
+		if (!tools.has("room_integrate")) {
+			return fauxAssistantMessage(
+				fauxToolCall("tool_load", { name: "room_integrate" }, { id: callId("load-integrate") }),
+				{ stopReason: "toolUse" },
+			);
+		}
+		if (!serialized.includes(callId("integrate"))) {
+			return fauxAssistantMessage(fauxToolCall("room_integrate", { childTaskId }, { id: callId("integrate") }), {
+				stopReason: "toolUse",
+			});
+		}
+		if (!serialized.includes(callId("integrated-state"))) return state(callId("integrated-state"));
+		requireResidentNativeCodingTools(tools, ["read", "bash"]);
+		if (!serialized.includes(callId("read-integrated"))) {
+			return fauxAssistantMessage(
+				[
+					fauxToolCall(
+						"read",
+						{ path: "calculator.py", offset: 0, limit: 16_384 },
+						{ id: callId("read-integrated-a") },
+					),
+					fauxToolCall(
+						"read",
+						{ path: "test_calculator.py", offset: 0, limit: 16_384 },
+						{ id: callId("read-integrated-b") },
+					),
+					fauxToolCall(
+						"read",
+						{ path: "README.md", offset: 0, limit: 16_384 },
+						{ id: callId("read-integrated-c") },
+					),
+				],
+				{ stopReason: "toolUse" },
+			);
+		}
+		if (!serialized.includes(callId("integrated-shell"))) {
 			return fauxAssistantMessage(
 				fauxToolCall(
-					"grep",
-					{ pattern: "ROOM_PROJECT_TASK", path: ".", literal: true, limit: 20 },
-					{ id: callId("search") },
+					"bash",
+					{ command: "/usr/bin/python3 -m unittest -v", timeout: 30 },
+					{ id: callId("integrated-shell") },
 				),
 				{ stopReason: "toolUse" },
 			);
 		}
-	}
-	if (!serialized.includes(callId("read-app"))) {
-		return fauxAssistantMessage(
-			[
-				fauxToolCall("read", { path: "calculator.py", offset: 0, limit: 16_384 }, { id: callId("read-app") }),
-				fauxToolCall("read", { path: "test_calculator.py", offset: 0, limit: 16_384 }, { id: callId("read-test") }),
-			],
-			{ stopReason: "toolUse" },
-		);
-	}
-
-	if (member === "A" || member === "C") {
-		const shellId = member === "A" ? callId("baseline-shell") : callId("acceptance-shell");
-		if (!serialized.includes(shellId)) {
+		if (contextHasNonzeroExitCode(context)) throw new Error("Facilitator integrated-workspace verification failed");
+		if (!tools.has("room_commit")) {
 			return fauxAssistantMessage(
-				fauxToolCall("bash", { command: "/usr/bin/python3 -m unittest -v", timeout: 30 }, { id: shellId }),
+				fauxToolCall("tool_load", { name: "room_commit" }, { id: callId("load-review-handoff") }),
 				{ stopReason: "toolUse" },
 			);
 		}
+		if (!serialized.includes(callId("handoff-review"))) {
+			const currentAliases = aliases();
+			return commit(
+				{
+					decision: "handoff",
+					summary: "集成工作区已完成验证，交由独立 Reviewer 按全部验收条件复核。",
+					publicSummary: "集成结果已验证，下一步交由独立 Reviewer 复核后由协调者收口。",
+					evidence: distinctRuntimeEvidence(currentAliases, [
+						callId("read-integrated-a"),
+						callId("integrated-shell"),
+						callId("read-integrated-b"),
+						callId("read-integrated-c"),
+					]),
+					residualRisks: ["独立复核尚未返回。"],
+					targetParticipantRef: participantRefForRole(context, "reviewer"),
+					intent: "review",
+					nextTask:
+						"ROOM-FULL-AUTO-REVIEW：只读复核 Facilitator 集成后的完整结果和全部验收条件，" +
+						"不得修改任何文件，也不得替实施者修复问题。",
+					expectedOutput: "独立 Reviewer 的验收覆盖、证据和可交付建议。",
+					acceptanceAliases: currentAliases,
+				},
+				callId("handoff-review"),
+			);
+		}
+		return fauxAssistantMessage("等待独立 Reviewer 返回复核结果。");
 	}
 
-	if (member === "A") {
+	if (phase === "await-review") {
+		if (!tools.has("room_state")) {
+			return fauxAssistantMessage(fauxToolCall("tool_load", { name: "room_state" }, { id: callId("load-state") }), {
+				stopReason: "toolUse",
+			});
+		}
+		if (!serialized.includes(callId("state"))) return state(callId("state"));
+		if (!serialized.includes(callId("deliver"))) {
+			const currentAliases = aliases();
+			return commit(
+				{
+					decision: "deliver",
+					summary: "独立 Reviewer 已完成复核并返回证据，Facilitator 依据审查结果完成最终收口。",
+					publicSummary: "已完成最小可运行终端界面，独立复核通过；交付保留现有项目约定并说明验证边界。",
+					evidence: acceptedEvidence(currentAliases),
+					residualRisks: [],
+				},
+				callId("deliver"),
+			);
+		}
+		return fauxAssistantMessage("Room 最终结果已提交。");
+	}
+
+	if (phase === "child") {
+		if (!tools.has("room_state")) {
+			return fauxAssistantMessage(fauxToolCall("tool_load", { name: "room_state" }, { id: callId("load-state") }), {
+				stopReason: "toolUse",
+			});
+		}
+		if (!serialized.includes(callId("state"))) return state(callId("state"));
+		requireResidentNativeCodingTools(tools, ["read", "edit", "bash"]);
+		if (!serialized.includes(callId("read"))) {
+			return fauxAssistantMessage(
+				fauxToolCall("read", { path: "calculator.py", offset: 0, limit: 16_384 }, { id: callId("read") }),
+				{ stopReason: "toolUse" },
+			);
+		}
 		if (!serialized.includes(callId("patch"))) {
 			return fauxAssistantMessage(
 				fauxToolCall(
@@ -527,91 +838,82 @@ export function projectCollaborationCanaryResponse(context: Context): AssistantM
 			);
 		}
 		if (!contextHasJsonField(context, "mutationApplied", true)) {
-			throw new Error("The managed collaboration patch did not produce an applied receipt");
+			throw new Error("The bounded implementation child did not produce an applied edit receipt");
 		}
-		if (!serialized.includes(callId("regression-shell"))) {
+		if (!serialized.includes(callId("test"))) {
 			return fauxAssistantMessage(
-				fauxToolCall(
-					"bash",
-					{ command: "/usr/bin/python3 -m unittest -v", timeout: 30 },
-					{ id: callId("regression-shell") },
-				),
+				fauxToolCall("bash", { command: "/usr/bin/python3 -m unittest -v", timeout: 30 }, { id: callId("test") }),
 				{ stopReason: "toolUse" },
 			);
 		}
-	}
-
-	if (!tools.has("room_post")) {
-		return fauxAssistantMessage(fauxToolCall("tool_load", { name: "room_post" }, { id: callId("load-post") }), {
-			stopReason: "toolUse",
-		});
-	}
-	if (!serialized.includes(callId("post"))) {
-		const marker =
-			member === "A" ? "COLLAB-A-IMPLEMENTED" : member === "B" ? "COLLAB-B-REVIEWED" : "COLLAB-C-ACCEPTED";
-		return fauxAssistantMessage(
-			fauxToolCall(
-				"room_post",
-				{ kind: "evidence", content: `${marker}；隔离项目证据已核对。` },
-				{ id: callId("post") },
-			),
-			{ stopReason: "toolUse" },
-		);
-	}
-	if (!tools.has("room_commit")) {
-		return fauxAssistantMessage(fauxToolCall("tool_load", { name: "room_commit" }, { id: callId("load-commit") }), {
-			stopReason: "toolUse",
-		});
-	}
-	if (!serialized.includes(callId("commit"))) {
-		const evidenceRefs = runtimeEvidenceRefs(context, 8);
-		const committedEvidenceRefs =
-			evidenceRefs.length > 0 ? evidenceRefs : [member === "A" ? callId("regression-shell") : callId("read-app")];
-		if (member === "A") {
-			const aliases = currentAcceptanceAliases(context, task);
-			const ownedAliases = aliases.filter((alias) => ["AC-1", "AC-2", "AC-3"].includes(alias));
-			return fauxAssistantMessage(
-				fauxToolCall(
-					"room_commit",
-					{
-						decision: "handoff",
-						summary: "COLLAB-A-COMMIT-RESULT",
-						evidence: evidenceProposal(ownedAliases, committedEvidenceRefs),
-						residualRisks: ["最终独立验收仍由 C 完成。"],
-						targetParticipantRef: participantRefForRole(context, "coordinator"),
-						intent: "close",
-						nextTask:
-							"C 先调用 room_state，独立读取 calculator.py 与 test_calculator.py；" +
-							"运行 /usr/bin/python3 -m unittest -v，不得调用 edit；" +
-							"room_post 以 COLLAB-C-ACCEPTED 开头；最后用 room_commit 交付 " +
-							"COLLAB-C-COMMIT-RESULT，并覆盖全部 AC 验收别名。",
-						expectedOutput: "C 交付独立测试验收证据并最终关闭 Root。",
-						acceptanceAliases: aliases,
-					},
-					{ id: callId("commit") },
-				),
-				{ stopReason: "toolUse" },
-			);
-		}
-		const aliases = currentAcceptanceAliases(context, task);
-		if (aliases.length === 0) {
-			throw new Error("Every collaboration delivery requires explicit AC aliases");
-		}
-		return fauxAssistantMessage(
-			fauxToolCall(
-				"room_commit",
+		if (contextHasNonzeroExitCode(context)) throw new Error("The bounded implementation child verification failed");
+		if (!serialized.includes(callId("commit"))) {
+			const childAliases = aliases();
+			return commit(
 				{
 					decision: "deliver",
-					summary: member === "B" ? "COLLAB-B-COMMIT-RESULT" : "COLLAB-C-COMMIT-RESULT",
-					evidence: evidenceProposal(aliases, committedEvidenceRefs),
+					summary: "隔离工作区中的有界实现和回归验证已完成，未修改测试文件。",
+					publicSummary: "实施伙伴已返回隔离工作区结果和可复现验证证据，等待协调者合入。",
+					evidence: settlementEvidence(childAliases.length > 0 ? childAliases : ["AC-1"], callId("test")),
 					residualRisks: [],
 				},
-				{ id: callId("commit") },
-			),
-			{ stopReason: "toolUse" },
-		);
+				callId("commit"),
+			);
+		}
+		return fauxAssistantMessage("隔离实现结果已返回协调者。");
 	}
-	return fauxAssistantMessage(`${prefix.toUpperCase()}-SETTLED`);
+
+	if (phase === "review") {
+		if (!tools.has("room_state")) {
+			return fauxAssistantMessage(fauxToolCall("tool_load", { name: "room_state" }, { id: callId("load-state") }), {
+				stopReason: "toolUse",
+			});
+		}
+		if (!serialized.includes(callId("state"))) return state(callId("state"));
+		requireResidentNativeCodingTools(tools, ["read"]);
+		if (!serialized.includes(callId("read-app"))) {
+			return fauxAssistantMessage(
+				[
+					fauxToolCall("read", { path: "calculator.py", offset: 0, limit: 16_384 }, { id: callId("read-app") }),
+					fauxToolCall(
+						"read",
+						{ path: "test_calculator.py", offset: 0, limit: 16_384 },
+						{ id: callId("read-test") },
+					),
+					fauxToolCall("read", { path: "README.md", offset: 0, limit: 16_384 }, { id: callId("read-contract") }),
+				],
+				{ stopReason: "toolUse" },
+			);
+		}
+		if (!serialized.includes(callId("review-read"))) {
+			return fauxAssistantMessage(
+				fauxToolCall("read", { path: "calculator.py", offset: 0, limit: 16_384 }, { id: callId("review-read") }),
+				{ stopReason: "toolUse" },
+			);
+		}
+		if (!serialized.includes(callId("commit"))) {
+			const currentAliases = aliases();
+			return commit(
+				{
+					decision: "deliver",
+					summary: "独立 Reviewer 已按全部验收条件复核集成结果，未修改被审文件。",
+					publicSummary: "独立复核通过并返回证据；Reviewer 未修改被审交付物，协调者可依据结果收口。",
+					evidence: distinctRuntimeEvidence(currentAliases, [
+						callId("read-app"),
+						callId("read-test"),
+						callId("read-contract"),
+						callId("review-read"),
+					]),
+					residualRisks: [],
+					reviewFindings: [],
+				},
+				callId("commit"),
+			);
+		}
+		return fauxAssistantMessage("独立复核结果已返回协调者。");
+	}
+
+	return fauxAssistantMessage("当前 Room 阶段已提交规范的生命周期出口。");
 }
 
 /** Drive an ordinary Agent Session through failure, planning, approvals, repair and recovery. */
@@ -843,23 +1145,48 @@ export async function createDeterministicTestModelRuntime(): Promise<ModelRuntim
 		throw new Error("The deterministic Room Provider is available only under the explicit test gate");
 	}
 	const runtime = await ModelRuntime.create({ modelsPath: null, allowModelNetwork: false });
+	const scenario = process.env.RAG_IME_PI_DETERMINISTIC_SCENARIO;
 	const faux = createFauxCore({
 		api: "faux:room-v2",
 		provider: DETERMINISTIC_TEST_PROVIDER,
-		models: [{ id: DETERMINISTIC_TEST_MODEL, name: "Room V2 deterministic test model", input: ["text"] }],
+		models: [
+			{
+				id: DETERMINISTIC_TEST_MODEL,
+				name: "Room V2 deterministic test model",
+				input: ["text"],
+				...(scenario === THRESHOLD_CONTINUATION_SCENARIO ? { contextWindow: 64_000 } : {}),
+			},
+		],
 		tokensPerSecond: process.env.RAG_IME_PI_DETERMINISTIC_SLOW === "1" ? 10 : undefined,
 	});
-	if (process.env.RAG_IME_PI_DETERMINISTIC_SCENARIO === CONTEXT_EPOCH_SCENARIO) {
+	if (scenario === CONTEXT_EPOCH_SCENARIO) {
 		faux.setResponses(Array.from({ length: 96 }, () => contextEpochCanaryResponse));
-	} else if (
-		process.env.RAG_IME_PI_DETERMINISTIC_SCENARIO === PROJECT_TASK_SCENARIO ||
-		process.env.RAG_IME_PI_DETERMINISTIC_SCENARIO === PROJECT_TOOL_RECOVERY_SCENARIO
-	) {
+	} else if (scenario === PROJECT_TASK_SCENARIO || scenario === PROJECT_TOOL_RECOVERY_SCENARIO) {
 		faux.setResponses(Array.from({ length: 96 }, () => projectTaskCanaryResponse));
-	} else if (process.env.RAG_IME_PI_DETERMINISTIC_SCENARIO === PROJECT_COLLABORATION_SCENARIO) {
+	} else if (scenario === PROJECT_COLLABORATION_SCENARIO) {
 		faux.setResponses(Array.from({ length: 128 }, () => projectCollaborationCanaryResponse));
-	} else if (process.env.RAG_IME_PI_DETERMINISTIC_SCENARIO === AGENT_SESSION_SCENARIO) {
+	} else if (scenario === AGENT_SESSION_SCENARIO) {
 		faux.setResponses(Array.from({ length: 96 }, () => agentSessionCanaryResponse));
+	} else if (scenario === NO_PROGRESS_SCENARIO) {
+		faux.setResponses(
+			Array.from({ length: 16 }, (_, index) =>
+				fauxAssistantMessage(
+					fauxToolCall(
+						"read",
+						{ path: ".paw-progress-guard-missing-proof", limit: 4 },
+						{ id: `no-progress-read-${index + 1}` },
+					),
+					{ stopReason: "toolUse" },
+				),
+			),
+		);
+	} else if (scenario === THRESHOLD_CONTINUATION_SCENARIO) {
+		faux.setResponses([
+			fauxAssistantMessage("THRESHOLD-COMPACTION-HISTORY-ANSWER"),
+			fauxAssistantMessage("THRESHOLD-COMPACTION-SEED-ANSWER"),
+			fauxAssistantMessage("THRESHOLD-COMPACTION-FIRST-ANSWER"),
+			fauxAssistantMessage("THRESHOLD-COMPACTION-CONTINUED-OK"),
+		]);
 	} else {
 		faux.setResponses([
 			fauxAssistantMessage(fauxToolCall("read", { path: "package.json", limit: 4 }, { id: "deterministic-read" }), {

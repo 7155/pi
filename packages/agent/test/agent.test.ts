@@ -101,6 +101,48 @@ describe("Agent", () => {
 		expect(agent.state.thinkingLevel).toBe("low");
 	});
 
+	it("forwards the mutable shouldStopAfterTurn policy to the low-level loop", async () => {
+		const toolSchema = Type.Object({});
+		const tool: AgentTool<typeof toolSchema, Record<string, never>> = {
+			name: "always_fails",
+			label: "Always fails",
+			description: "Returns a governed error",
+			parameters: toolSchema,
+			async execute() {
+				throw new Error("governed failure");
+			},
+		};
+		let providerCalls = 0;
+		let observedErrorResults = 0;
+		const agent = new Agent({
+			initialState: { tools: [tool] },
+			streamFn: () => {
+				providerCalls++;
+				const stream = new MockAssistantStream();
+				queueMicrotask(() => {
+					stream.push({
+						type: "done",
+						reason: "toolUse",
+						message: createAssistantToolUseMessage([
+							{ type: "toolCall", id: `call-${providerCalls}`, name: tool.name, arguments: {} },
+						]),
+					});
+				});
+				return stream;
+			},
+		});
+		agent.shouldStopAfterTurn = ({ toolResults }) => {
+			observedErrorResults = toolResults.filter((result) => result.isError === true).length;
+			return true;
+		};
+
+		await agent.prompt("run the failing tool");
+
+		expect(providerCalls).toBe(1);
+		expect(observedErrorResults).toBe(1);
+		expect(agent.state.isStreaming).toBe(false);
+	});
+
 	it("should subscribe to events", () => {
 		const agent = new Agent();
 

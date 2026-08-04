@@ -98,9 +98,10 @@ export async function bootstrapNativeWorkspaceToolTargets(options: BackendToolBr
 }
 
 function resultReceipt(details: Record<string, unknown>): Record<string, unknown> {
-	const approval = record(details.approval);
-	const receipt = record(approval.receipt);
-	return Object.keys(receipt).length > 0 ? receipt : details;
+	const receipt = record(details.receipt);
+	if (Object.keys(receipt).length > 0) return receipt;
+	const approvalReceipt = record(record(details.approval).receipt);
+	return Object.keys(approvalReceipt).length > 0 ? approvalReceipt : details;
 }
 
 function text(value: unknown): string {
@@ -214,6 +215,42 @@ function projected(
 	);
 }
 
+function withReadRevisionTracking(
+	definition: ToolDefinition<any, any, any>,
+	revisions: Map<string, string>,
+): ToolDefinition<any, any, any> {
+	const execute = definition.execute.bind(definition);
+	return {
+		...definition,
+		execute: async (toolCallId, params, signal, onUpdate, context) => {
+			const result = await execute(toolCallId, params, signal, onUpdate, context);
+			const details = record(result.details);
+			const revision = text(details.resourceRevision);
+			if (/^sha256:[0-9a-f]{64}$/u.test(revision)) {
+				const input = inputRecord(params);
+				for (const path of [text(input.path), text(details.relativePath), text(details.path)]) {
+					if (path) revisions.set(path, revision);
+				}
+			}
+			return result;
+		},
+	};
+}
+
+function requiredResourceRevision(
+	input: Record<string, unknown>,
+	revisions: Map<string, string>,
+	allowMissing = false,
+): string {
+	const path = text(input.path);
+	const revision = revisions.get(path);
+	if (!revision) {
+		if (allowMissing) return "missing";
+		throw new Error(`Native workspace mutation requires a successful read receipt for ${path || "the target path"}`);
+	}
+	return revision;
+}
+
 function withEvidenceRead(
 	options: BackendToolBridgeOptions,
 	definition: ToolDefinition<any, any, any>,
@@ -277,25 +314,29 @@ export function createNativeWorkspaceToolsExtension(
 ): Extract<InlineExtension, { name: string }> {
 	const artifacts = new ToolArtifactBuffer();
 	const definitions: ToolDefinition<any, any, any>[] = [];
+	const resourceRevisions = new Map<string, string>();
 	const read = projectionTarget(options.registry, READ_TOOL_NAME);
 	if (read) {
 		definitions.push(
 			withEvidenceRead(
 				options,
-				projected(
-					options,
-					createReadToolDefinition(options.cwd),
-					read,
-					(input) => ({
-						path: input.path,
-						// Pi's native read contract is line-based and 1-indexed.
-						// Normalize malformed model input at the adapter boundary,
-						// then preserve Pi's own 2,000-line truncation ceiling.
-						lineOffset: boundedLimit(input.offset, 1, Number.MAX_SAFE_INTEGER),
-						lineLimit: boundedLimit(input.limit, 2_000, 2_000),
-					}),
-					formatReadResult,
-					artifacts,
+				withReadRevisionTracking(
+					projected(
+						options,
+						createReadToolDefinition(options.cwd),
+						read,
+						(input) => ({
+							path: input.path,
+							// Pi's native read contract is line-based and 1-indexed.
+							// Normalize malformed model input at the adapter boundary,
+							// then preserve Pi's own 2,000-line truncation ceiling.
+							lineOffset: boundedLimit(input.offset, 1, Number.MAX_SAFE_INTEGER),
+							lineLimit: boundedLimit(input.limit, 2_000, 2_000),
+						}),
+						formatReadResult,
+						artifacts,
+					),
+					resourceRevisions,
 				),
 			),
 		);
@@ -366,7 +407,11 @@ export function createNativeWorkspaceToolsExtension(
 				options,
 				createEditToolDefinition(options.cwd),
 				edit,
-				(input) => ({ path: input.path, edits: input.edits }),
+				(input) => ({
+					path: input.path,
+					resourceRevision: requiredResourceRevision(input, resourceRevisions),
+					edits: input.edits,
+				}),
 				formatMutationResult,
 				artifacts,
 			),
@@ -379,7 +424,11 @@ export function createNativeWorkspaceToolsExtension(
 				options,
 				createWriteToolDefinition(options.cwd),
 				write,
-				(input) => ({ path: input.path, content: input.content }),
+				(input) => ({
+					path: input.path,
+					resourceRevision: requiredResourceRevision(input, resourceRevisions, true),
+					content: input.content,
+				}),
 				formatMutationResult,
 				artifacts,
 			),

@@ -242,4 +242,232 @@ describe("Room bootstrap tools", () => {
 		expect(registry.governedLoadReceipts()).toEqual([]);
 		expect(registry.disclosed()).toEqual([]);
 	});
+
+	it("binds native edits and writes to governed resource revisions and projects canonical mutation receipts", async () => {
+		type ExecutableTool = {
+			execute(
+				toolCallId: string,
+				args: unknown,
+				signal?: AbortSignal,
+			): Promise<{ content: Array<{ type: "text"; text: string }>; details: unknown }>;
+		};
+		const registry = ordinaryRegistryWithNativeTargets();
+		const definitions = new Map<string, ExecutableTool>();
+		const extension = createNativeWorkspaceToolsExtension({
+			sessionId: "session-room-edit",
+			registry,
+			gatewayUrl: "http://127.0.0.1:8766/api/agent/tool/execute",
+			cwd: "/workspace",
+		}) as unknown as { factory(pi: unknown): void };
+		extension.factory({
+			registerTool(definition: { name: string }) {
+				definitions.set(definition.name, definition as unknown as ExecutableTool);
+			},
+		} as never);
+		const read = definitions.get(READ_TOOL_NAME);
+		const edit = definitions.get(EDIT_TOOL_NAME);
+		const write = definitions.get(WRITE_TOOL_NAME);
+		expect(read).toBeDefined();
+		expect(edit).toBeDefined();
+		expect(write).toBeDefined();
+		if (!read || !edit || !write) throw new Error("native read/edit/write projections were not registered");
+
+		const resourceRevision = `sha256:${"a".repeat(64)}`;
+		const appliedReceipt = {
+			schemaVersion: "rag-ime.workspace-edit-receipt.v1",
+			mutationApplied: true,
+			summary: "Applied calculator.py edit",
+			path: "/workspace/calculator.py",
+			preimageSha256: "a".repeat(64),
+			postimageSha256: "b".repeat(64),
+		};
+		const writeReceipt = {
+			schemaVersion: "rag-ime.workspace-write-receipt.v1",
+			mutationApplied: true,
+			summary: "Created new.py",
+			path: "/workspace/new.py",
+			preimageSha256: "0".repeat(64),
+			postimageSha256: "c".repeat(64),
+			created: true,
+		};
+		const staleReceipt = {
+			schemaVersion: "rag-ime.workspace-edit-failure-receipt.v1",
+			mutationApplied: false,
+			summary: "Workspace file changed after preview",
+			reason: "stale_preimage",
+		};
+		const fetchMock = vi
+			.fn<typeof fetch>()
+			.mockResolvedValueOnce(
+				new Response(
+					JSON.stringify({
+						ok: true,
+						result: {
+							approvalRequired: false,
+							autoApproved: true,
+							approval: {
+								state: "applied",
+								receipt: { auditId: "audit:write-applied" },
+							},
+							receipt: writeReceipt,
+						},
+						roomExecutionReceipt: {
+							executionReceiptId: "execution:collab-a-write",
+							toolName: "workspace_write",
+							status: "applied",
+						},
+					}),
+					{ status: 200, headers: { "Content-Type": "application/json" } },
+				),
+			)
+			.mockResolvedValueOnce(
+				new Response(
+					JSON.stringify({
+						ok: true,
+						result: {
+							summary: "Read calculator.py",
+							path: "/workspace/calculator.py",
+							relativePath: "calculator.py",
+							content: "before",
+							startLine: 1,
+							endLine: 1,
+							resourceRevision,
+						},
+						roomExecutionReceipt: {
+							executionReceiptId: "execution:collab-a-read-app",
+							toolName: "workspace_read",
+							status: "applied",
+						},
+					}),
+					{ status: 200, headers: { "Content-Type": "application/json" } },
+				),
+			)
+			.mockResolvedValueOnce(
+				new Response(
+					JSON.stringify({
+						ok: true,
+						result: {
+							approvalRequired: false,
+							autoApproved: true,
+							approval: {
+								state: "applied",
+								receipt: { auditId: "audit:applied" },
+							},
+							receipt: appliedReceipt,
+						},
+						roomExecutionReceipt: {
+							executionReceiptId: "execution:collab-a-patch",
+							toolName: "workspace_edit",
+							status: "applied",
+						},
+					}),
+					{ status: 200, headers: { "Content-Type": "application/json" } },
+				),
+			)
+			.mockResolvedValueOnce(
+				new Response(
+					JSON.stringify({
+						ok: true,
+						result: {
+							approvalRequired: false,
+							autoApproved: true,
+							approval: {
+								state: "failed",
+								receipt: {
+									mutationApplied: true,
+									auditId: "non-authoritative-nested-receipt",
+								},
+							},
+							receipt: staleReceipt,
+						},
+						roomExecutionReceipt: {
+							executionReceiptId: "execution:collab-a-stale-patch",
+							toolName: "workspace_edit",
+							status: "failed",
+						},
+					}),
+					{ status: 200, headers: { "Content-Type": "application/json" } },
+				),
+			);
+		vi.stubGlobal("fetch", fetchMock);
+		try {
+			await expect(
+				edit.execute("collab-a-unread-patch", {
+					path: "calculator.py",
+					edits: [{ oldText: "before", newText: "after" }],
+				}),
+			).rejects.toThrow("requires a successful read receipt");
+			expect(fetchMock).not.toHaveBeenCalled();
+
+			const writeArgs = {
+				path: "new.py",
+				content: "unbound",
+			};
+			const created = await write.execute("collab-a-write", writeArgs);
+			const createdText = created.content[0]?.text ?? "";
+			expect(JSON.parse(createdText)).toMatchObject({
+				evidenceRef: "execution:collab-a-write",
+				mutationApplied: true,
+				summary: "Created new.py",
+				path: "/workspace/new.py",
+				preimageSha256: "0".repeat(64),
+				postimageSha256: "c".repeat(64),
+			});
+			expect(createdText.match(/"mutationApplied":/gu)).toHaveLength(1);
+
+			await read.execute("collab-a-read-app", { path: "calculator.py", offset: 1, limit: 2_000 });
+			const args = {
+				path: "calculator.py",
+				edits: [{ oldText: "before", newText: "after" }],
+			};
+			const applied = await edit.execute("collab-a-patch", args);
+			const appliedText = applied.content[0]?.text ?? "";
+			expect(JSON.parse(appliedText)).toMatchObject({
+				evidenceRef: "execution:collab-a-patch",
+				mutationApplied: true,
+				path: "/workspace/calculator.py",
+			});
+			expect(appliedText.match(/"mutationApplied":/gu)).toHaveLength(1);
+
+			const stale = await edit.execute("collab-a-stale-patch", args);
+			const staleText = stale.content[0]?.text ?? "";
+			expect(JSON.parse(staleText)).toMatchObject({
+				mutationApplied: false,
+				summary: "Workspace file changed after preview",
+			});
+			expect(staleText.match(/"mutationApplied":/gu)).toHaveLength(1);
+
+			const requests = fetchMock.mock.calls.map(([, init]) => JSON.parse(String(init?.body))) as Array<
+				Record<string, unknown>
+			>;
+			expect(requests).toHaveLength(4);
+			expect(requests[0]).toEqual(
+				expect.objectContaining({
+					schemaVersion: "rag-ime.agent-tool-call.v1",
+					sessionId: "session-room-edit",
+					tool: "workspace_write",
+					toolCallId: "collab-a-write",
+				}),
+			);
+			expect(requests[0]?.args).toEqual({
+				op: "apply",
+				resourceRevision: "missing",
+				...writeArgs,
+			});
+			expect(requests.slice(2)).toEqual([
+				expect.objectContaining({
+					tool: "workspace_edit",
+					toolCallId: "collab-a-patch",
+					args: { op: "apply", resourceRevision, ...args },
+				}),
+				expect.objectContaining({
+					tool: "workspace_edit",
+					toolCallId: "collab-a-stale-patch",
+					args: { op: "apply", resourceRevision, ...args },
+				}),
+			]);
+		} finally {
+			vi.unstubAllGlobals();
+		}
+	});
 });

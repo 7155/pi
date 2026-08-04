@@ -43,6 +43,7 @@ function tool(options: {
 	description?: string;
 	profile?: string;
 	risk?: string;
+	alwaysAvailable?: boolean;
 	parameters?: Record<string, unknown>;
 	modelVisible?: boolean;
 	runtimeProjections?: Array<{ name: string; operation: string }>;
@@ -60,6 +61,7 @@ function tool(options: {
 			} as Record<string, unknown>),
 		profile: options.profile,
 		risk: options.risk,
+		alwaysAvailable: options.alwaysAvailable,
 		modelVisible: options.modelVisible,
 		runtimeProjections: options.runtimeProjections,
 	};
@@ -95,6 +97,23 @@ describe("BackendToolRegistry", () => {
 		expect(second.map((item) => item.name)).toEqual(["alpha.query", "zeta.run"]);
 		expect(registry.revision()).toBe(firstRevision);
 		expect(backendToolSchemaRevision(second)).toBe(firstSchemaRevision);
+	});
+
+	it("automatically discloses always-available tools without treating them as explicit loads", () => {
+		const registry = new BackendToolRegistry();
+		registry.sync([tool({ name: "todo", alwaysAvailable: true }), tool({ name: "memory.query" })]);
+		expect(registry.automaticallyDisclosed().map((item) => item.name)).toEqual(["todo"]);
+		expect(registry.explicitlyDisclosed()).toEqual([]);
+		expect(registry.disclosed().map((item) => item.name)).toEqual(["todo"]);
+		expect(registry.isDisclosed("todo")).toBe(true);
+		expect(registry.isAutomaticallyDisclosed("todo")).toBe(true);
+
+		registry.disclose("memory.query");
+		registry.sync([tool({ name: "todo", alwaysAvailable: false }), tool({ name: "memory.query" })]);
+		expect(registry.automaticallyDisclosed()).toEqual([]);
+		expect(registry.isDisclosed("todo")).toBe(false);
+		expect(registry.isDisclosed("memory.query")).toBe(true);
+		expect(registry.isExplicitlyDisclosed("memory.query")).toBe(true);
 	});
 
 	it("keeps Room governance receipts out of model context and exposes one short evidence ref", () => {
@@ -259,6 +278,48 @@ describe("BackendToolRegistry", () => {
 
 		expect(registered.sort()).toEqual(["memory.query", "planning.update"]);
 		expect(registry.disclosed()).toEqual([]);
+	});
+
+	it("bounds one Session's parallel gateway requests without serializing the Tool loop", async () => {
+		let activeRequests = 0;
+		let maximumActiveRequests = 0;
+		const fetchMock = vi.fn<typeof fetch>().mockImplementation(async () => {
+			activeRequests += 1;
+			maximumActiveRequests = Math.max(maximumActiveRequests, activeRequests);
+			await new Promise((resolve) => setTimeout(resolve, 4));
+			activeRequests -= 1;
+			return new Response(JSON.stringify({ ok: true, result: { summary: "已读取文件" } }), {
+				status: 200,
+				headers: { "Content-Type": "application/json" },
+			});
+		});
+		vi.stubGlobal("fetch", fetchMock);
+		try {
+			const options = {
+				sessionId: "session-many-reads",
+				registry: new BackendToolRegistry(),
+				gatewayUrl: "http://127.0.0.1:8768/api/agent/tool/execute",
+			};
+			const definition = createBackendToolDefinition(options, tool({ name: "workspace_read" }));
+			const results = await Promise.all(
+				Array.from({ length: 52 }, (_, index) =>
+					definition.execute(
+						`call-${index}`,
+						{ query: `file-${index}` } as never,
+						undefined,
+						undefined,
+						{} as never,
+					),
+				),
+			);
+
+			expect(fetchMock).toHaveBeenCalledTimes(52);
+			expect(maximumActiveRequests).toBe(8);
+			expect(results).toHaveLength(52);
+			expect(results.every((result) => result.content[0]?.type === "text")).toBe(true);
+		} finally {
+			vi.unstubAllGlobals();
+		}
 	});
 
 	it("keeps the native approval bridge on a dynamically loaded tool", async () => {

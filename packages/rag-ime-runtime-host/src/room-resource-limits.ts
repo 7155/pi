@@ -2,9 +2,9 @@ import type { ExtensionFactory } from "@earendil-works/pi-coding-agent";
 
 export interface RoomResourceLimits {
 	deadlineAtMs: number;
-	maxInputTokens: number;
+	maxInputTokens?: number;
 	maxOutputTokens: number;
-	maxToolCalls: number;
+	maxToolCalls?: number;
 	maxToolCost: number;
 	retryRemaining: number;
 	repairRemaining: number;

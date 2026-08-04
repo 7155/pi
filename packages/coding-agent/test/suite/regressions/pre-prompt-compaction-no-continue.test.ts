@@ -58,6 +58,7 @@ describe("pre-prompt compaction regression", () => {
 		};
 		harness.sessionManager.appendMessage(lengthStopAssistant);
 		harness.session.agent.state.messages = harness.sessionManager.buildSessionContext().messages;
+		harness.session.setThresholdCompactionContinuation("must not run during pre-prompt maintenance", 1);
 		harness.setResponses([fauxAssistantMessage("answered next prompt")]);
 		const continueSpy = vi.spyOn(harness.session.agent, "continue");
 
@@ -71,5 +72,10 @@ describe("pre-prompt compaction regression", () => {
 		});
 		expect(getUserTexts(harness)).toContain("next prompt");
 		expect(harness.faux.state.callCount).toBe(1);
+		expect(
+			harness.session.messages.some(
+				(message) => message.role === "custom" && message.customType === "threshold-compaction-continuation",
+			),
+		).toBe(false);
 	});
 });

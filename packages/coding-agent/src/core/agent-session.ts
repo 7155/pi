@@ -352,6 +352,9 @@ export class AgentSession {
 	private _compactionAbortController: AbortController | undefined = undefined;
 	private _autoCompactionAbortController: AbortController | undefined = undefined;
 	private _overflowRecoveryAttempted = false;
+	private _thresholdCompactionContinuationText = "";
+	private _thresholdCompactionContinuationLimit = 0;
+	private _thresholdCompactionContinuationsIssued = 0;
 
 	// Branch summarization state
 	private _branchSummaryAbortController: AbortController | undefined = undefined;
@@ -1407,6 +1410,11 @@ export class AgentSession {
 				return;
 			}
 
+			// A new externally accepted prompt owns a fresh, bounded threshold
+			// continuation budget. Queued steer/follow-up messages stay inside
+			// the current run and therefore do not reset it.
+			this._thresholdCompactionContinuationsIssued = 0;
+
 			// Flush any pending bash messages before the new prompt
 			this._flushPendingBashMessages();
 
@@ -1434,7 +1442,7 @@ export class AgentSession {
 			// The user's new prompt is sent below, so do not call agent.continue() here.
 			const lastAssistant = this._findLastAssistantMessage();
 			if (lastAssistant) {
-				await this._checkCompaction(lastAssistant, false);
+				await this._checkCompaction(lastAssistant, false, false);
 			}
 
 			// Build messages array (custom message if any, then user message)
@@ -2330,12 +2338,17 @@ export class AgentSession {
 	 *
 	 * Two cases:
 	 * 1. Overflow: LLM returned context overflow error, remove error message from agent state, compact, auto-retry
-	 * 2. Threshold: Context over threshold, compact, NO auto-retry (user continues manually)
+	 * 2. Threshold: Context over threshold, compact, then optionally deliver one
+	 *    runtime-configured bounded continuation.
 	 *
 	 * @param assistantMessage The assistant message to check
 	 * @param skipAbortedCheck If false, include aborted messages (for pre-prompt check). Default: true
 	 */
-	private async _checkCompaction(assistantMessage: AssistantMessage, skipAbortedCheck = true): Promise<boolean> {
+	private async _checkCompaction(
+		assistantMessage: AssistantMessage,
+		skipAbortedCheck = true,
+		allowThresholdContinuation = true,
+	): Promise<boolean> {
 		const settings = this.settingsManager.getCompactionSettings();
 		if (!settings.enabled) return false;
 
@@ -2421,7 +2434,9 @@ export class AgentSession {
 			contextTokens = directContextTokens;
 		}
 		if (shouldCompact(contextTokens, contextWindow, settings)) {
-			return await this._runAutoCompaction("threshold", false);
+			return allowThresholdContinuation
+				? await this._runAutoCompaction("threshold", false)
+				: await this._runAutoCompaction("threshold", false, false);
 		}
 		return false;
 	}
@@ -2429,7 +2444,11 @@ export class AgentSession {
 	/**
 	 * Internal: Run auto-compaction with events.
 	 */
-	private async _runAutoCompaction(reason: "overflow" | "threshold", willRetry: boolean): Promise<boolean> {
+	private async _runAutoCompaction(
+		reason: "overflow" | "threshold",
+		willRetry: boolean,
+		allowThresholdContinuation = true,
+	): Promise<boolean> {
 		const settings = this.settingsManager.getCompactionSettings();
 		const operationScope = this._beginOperationScope("auto_compaction");
 		this._autoCompactionAbortController = new AbortController();
@@ -2462,6 +2481,13 @@ export class AgentSession {
 			if (!preparation) {
 				return false;
 			}
+			const thresholdContinuationPlanned =
+				reason === "threshold" &&
+				allowThresholdContinuation &&
+				this._isAgentRunActive &&
+				this._thresholdCompactionContinuationText.length > 0 &&
+				this._thresholdCompactionContinuationsIssued < this._thresholdCompactionContinuationLimit;
+			const continuationPlanned = willRetry || this.agent.hasQueuedMessages() || thresholdContinuationPlanned;
 
 			this._emit({ type: "compaction_start", reason });
 			started = true;
@@ -2476,7 +2502,7 @@ export class AgentSession {
 					branchEntries: pathEntries,
 					customInstructions: undefined,
 					reason,
-					willRetry,
+					willRetry: continuationPlanned,
 					signal: this._autoCompactionAbortController.signal,
 				})) as SessionBeforeCompactResult | undefined;
 
@@ -2559,7 +2585,7 @@ export class AgentSession {
 					compactionEntry: savedCompactionEntry,
 					fromExtension,
 					reason,
-					willRetry,
+					willRetry: continuationPlanned,
 				});
 				if (extensionResult?.systemPrompt !== undefined) {
 					this._baseSystemPrompt = extensionResult.systemPrompt;
@@ -2574,7 +2600,37 @@ export class AgentSession {
 				estimatedTokensAfter,
 				details,
 			};
-			this._emit({ type: "compaction_end", reason, result, aborted: false, willRetry });
+			if (thresholdContinuationPlanned && !this.agent.hasQueuedMessages()) {
+				this._thresholdCompactionContinuationsIssued += 1;
+				const continuationNumber = this._thresholdCompactionContinuationsIssued;
+				this.agent.followUp(
+					{
+						role: "custom",
+						customType: "threshold-compaction-continuation",
+						content: [{ type: "text", text: this._thresholdCompactionContinuationText }],
+						display: false,
+						details: {
+							reason,
+							continuationNumber,
+							continuationLimit: this._thresholdCompactionContinuationLimit,
+						},
+						timestamp: Date.now(),
+					},
+					{
+						origin: "threshold_compaction",
+						idempotencyKey: `${this.sessionId}:threshold-compaction:${continuationNumber}`,
+						maxAttempts: 1,
+					},
+				);
+			}
+			const continueAfterCompaction = willRetry || this.agent.hasQueuedMessages();
+			this._emit({
+				type: "compaction_end",
+				reason,
+				result,
+				aborted: false,
+				willRetry: continueAfterCompaction,
+			});
 
 			if (willRetry) {
 				const messages = this.agent.state.messages;
@@ -2585,9 +2641,9 @@ export class AgentSession {
 				return true;
 			}
 
-			// Auto-compaction can complete while follow-up/steering/custom messages are waiting.
-			// Continue once so queued messages are delivered.
-			return this.agent.hasQueuedMessages();
+			// Auto-compaction can complete while follow-up/steering/custom messages
+			// are waiting. Continue once so the exact queued envelope is delivered.
+			return continueAfterCompaction;
 		} catch (error) {
 			const errorMessage = error instanceof Error ? error.message : "compaction failed";
 			if (started) {
@@ -2616,6 +2672,22 @@ export class AgentSession {
 	 */
 	setAutoCompactionEnabled(enabled: boolean): void {
 		this.settingsManager.setCompactionEnabled(enabled);
+	}
+
+	/**
+	 * Configure an opt-in, bounded continuation after threshold compaction.
+	 *
+	 * The continuation is queued as a hidden custom/user-context message and is
+	 * never issued by pre-prompt maintenance compaction. A fresh external prompt
+	 * resets the per-run budget.
+	 */
+	setThresholdCompactionContinuation(text: string | undefined, maxContinuations = 1): void {
+		this._thresholdCompactionContinuationText = text?.trim() ?? "";
+		this._thresholdCompactionContinuationLimit =
+			this._thresholdCompactionContinuationText && Number.isSafeInteger(maxContinuations)
+				? Math.max(0, maxContinuations)
+				: 0;
+		this._thresholdCompactionContinuationsIssued = 0;
 	}
 
 	/** Whether auto-compaction is enabled */

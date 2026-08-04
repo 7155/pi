@@ -311,8 +311,10 @@ export function formatBackendToolRouteCatalog(
 	options: ToolPromptCatalogOptions = {},
 ): string {
 	if (tools.length === 0) return "";
+	const progressiveTools = tools.filter((tool) => tool.alwaysAvailable !== true);
+	if (progressiveTools.length === 0) return "";
 	const activeNames = new Set(options.activeNames ?? []);
-	const deferred = tools.filter((tool) => !activeNames.has(tool.name));
+	const deferred = progressiveTools.filter((tool) => !activeNames.has(tool.name));
 	const projected = options.focusNames !== undefined;
 	const focusNames = new Set(options.focusNames ?? []);
 	const entries = deferred
