@@ -33,6 +33,13 @@ interface RuntimeProjectionTarget {
 	operation: string;
 }
 
+const PROJECTED_TOOL_LIFECYCLE_LABELS: Readonly<Record<string, string>> = {
+	[READ_TOOL_NAME]: "读取文件",
+	[EDIT_TOOL_NAME]: "编辑文件",
+	[WRITE_TOOL_NAME]: "写入文件",
+	[BASH_TOOL_NAME]: "运行命令",
+};
+
 function record(value: unknown): Record<string, unknown> {
 	return typeof value === "object" && value !== null && !Array.isArray(value)
 		? (value as Record<string, unknown>)
@@ -200,6 +207,7 @@ function projected(
 	projectModelResult: (result: Record<string, unknown>) => unknown,
 	artifacts: ToolArtifactBuffer,
 ): ToolDefinition<any, any, any> {
+	const lifecycleLabel = PROJECTED_TOOL_LIFECYCLE_LABELS[definition.name];
 	return createProjectedBackendToolDefinition(
 		options,
 		{
@@ -210,6 +218,7 @@ function projected(
 				...mapArguments(inputRecord(args)),
 			}),
 			projectModelResult,
+			...(lifecycleLabel ? { lifecycle: { label: lifecycleLabel, heartbeatMs: 2_000 } } : {}),
 		},
 		artifacts,
 	);

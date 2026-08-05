@@ -11,6 +11,7 @@ import { ToolResultStore } from "../src/tool-result-store.ts";
 const temporaryDirectories: string[] = [];
 
 afterEach(() => {
+	vi.useRealTimers();
 	vi.unstubAllGlobals();
 	for (const directory of temporaryDirectories.splice(0)) {
 		rmSync(directory, { recursive: true, force: true });
@@ -183,6 +184,101 @@ describe("ToolResultStore", () => {
 });
 
 describe("governed Pi-native workspace tools", () => {
+	it("streams truthful lifecycle updates while a governed bash request is still pending", async () => {
+		vi.useFakeTimers();
+		const registry = new BackendToolRegistry();
+		registry.sync([hiddenTarget("workspace_shell", "bash", "run")]);
+		const definitions = new Map<string, ToolDefinition<any, any, any>>();
+		const extension = createNativeWorkspaceToolsExtension({
+			sessionId: "session-native-bash-lifecycle",
+			registry,
+			gatewayUrl: "http://127.0.0.1:8768/api/agent/tool/execute",
+			cwd: "/workspace",
+			resultStore: temporaryStore(),
+		});
+		const factory = typeof extension === "function" ? extension : extension.factory;
+		factory({
+			registerTool(definition: ToolDefinition<any, any, any>) {
+				definitions.set(definition.name, definition);
+			},
+		} as never);
+
+		let resolveFetch: ((response: Response) => void) | undefined;
+		const fetchMock = vi.fn<typeof fetch>().mockImplementation(
+			() =>
+				new Promise<Response>((resolve) => {
+					resolveFetch = resolve;
+				}),
+		);
+		vi.stubGlobal("fetch", fetchMock);
+		const updates = vi.fn();
+
+		const execution = definitions
+			.get("bash")
+			?.execute(
+				"call-bash-lifecycle",
+				{ command: "run focused tests", timeout: 20 },
+				undefined,
+				updates,
+				{} as never,
+			);
+
+		expect(updates).toHaveBeenCalledTimes(1);
+		expect(updates.mock.calls[0]?.[0]).toMatchObject({
+			content: [],
+			details: {
+				schemaVersion: "rag-ime.projected-tool-lifecycle.v1",
+				toolName: "bash",
+				lifecycleStage: "started",
+				elapsedMs: 0,
+			},
+		});
+
+		await vi.advanceTimersByTimeAsync(2_100);
+		expect(fetchMock).toHaveBeenCalledTimes(1);
+		expect(updates).toHaveBeenCalledTimes(2);
+		expect(updates.mock.calls[1]?.[0]).toMatchObject({
+			content: [],
+			details: {
+				schemaVersion: "rag-ime.projected-tool-lifecycle.v1",
+				toolName: "bash",
+				lifecycleStage: "running",
+			},
+		});
+		expect(String(updates.mock.calls[1]?.[0]?.details?.summary)).toContain("仍在执行");
+		expect(JSON.stringify(updates.mock.calls)).not.toContain("workspace_shell");
+		expect(JSON.stringify(updates.mock.calls)).not.toContain("stdout");
+		expect(JSON.stringify(updates.mock.calls)).not.toContain("stderr");
+
+		if (!resolveFetch) throw new Error("Expected the governed gateway request to start");
+		resolveFetch(
+			new Response(
+				JSON.stringify({
+					ok: true,
+					result: {
+						summary: "命令执行完成，退出码 0",
+						output: "three focused tests passed",
+						exitCode: 0,
+					},
+				}),
+				{ status: 200, headers: { "Content-Type": "application/json" } },
+			),
+		);
+		const result = await execution;
+
+		expect(result?.content[0]).toEqual({
+			type: "text",
+			text: "three focused tests passed\n[exit code: 0]",
+		});
+		expect(updates.mock.calls.at(-1)?.[0]).toMatchObject({
+			content: [],
+			details: {
+				toolName: "bash",
+				lifecycleStage: "response_received",
+			},
+		});
+	});
+
 	it("keeps backend targets hidden while exposing native tools with actual results", async () => {
 		const registry = new BackendToolRegistry();
 		registry.sync([hiddenTarget("workspace_read", "read", "read"), hiddenTarget("workspace_shell", "bash", "run")]);

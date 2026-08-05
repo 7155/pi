@@ -804,6 +804,7 @@ async function executeGatewayTool(
 	args: unknown,
 	signal: AbortSignal | undefined,
 	artifacts: ToolArtifactBuffer,
+	onLifecycle?: (stage: "response_received" | "waiting_approval" | "waiting_review") => void,
 ): Promise<{ content: Array<{ type: "text"; text: string }>; details: unknown }> {
 	const prepared = artifacts.prepare(tool.name, args);
 	const payload = await requestProductGateway(
@@ -820,6 +821,7 @@ async function executeGatewayTool(
 		},
 		signal,
 	);
+	onLifecycle?.("response_received");
 	artifacts.acknowledge(prepared.deliveryKeys);
 	const result: Record<string, unknown> = {
 		...(payload.result ?? {}),
@@ -830,6 +832,7 @@ async function executeGatewayTool(
 		const run = typeof result.run === "object" && result.run !== null ? (result.run as Record<string, unknown>) : {};
 		const runId = String(run.runId ?? result.runId ?? "");
 		if (!runId || !options.waitForDecision) throw new Error("Product review bridge is unavailable");
+		onLifecycle?.("waiting_review");
 		const reviewed = await options.waitForDecision("review", runId, result, signal);
 		const summary = reviewed
 			? "控制中心已完成本次草案审阅。本轮不要继续调用记忆维护工具，请简要确认后结束。"
@@ -864,6 +867,7 @@ async function executeGatewayTool(
 				: {};
 		const approvalId = String(approval.approvalId ?? result.approvalId ?? "");
 		if (!approvalId || !options.waitForDecision) throw new Error("Product approval bridge is unavailable");
+		onLifecycle?.("waiting_approval");
 		const approved = await options.waitForDecision("approval", approvalId, result, signal);
 		let resolved: Record<string, unknown> = approval;
 		try {
@@ -956,6 +960,10 @@ export function createProjectedBackendToolDefinition(
 		targetToolName: string;
 		mapArguments(args: unknown): Record<string, unknown>;
 		projectModelResult?(result: Record<string, unknown>): unknown;
+		lifecycle?: {
+			label: string;
+			heartbeatMs?: number;
+		};
 	},
 	artifacts = new ToolArtifactBuffer(),
 ): ToolDefinition<any, any, any> {
@@ -969,15 +977,68 @@ export function createProjectedBackendToolDefinition(
 	return {
 		...projection.definition,
 		executionMode: "parallel",
-		execute: async (toolCallId, args, signal) => {
-			const executed = await executeGatewayTool(
-				options,
-				target,
-				toolCallId,
-				projection.mapArguments(args),
-				signal,
-				artifacts,
-			);
+		execute: async (toolCallId, args, signal, onUpdate) => {
+			const mappedArguments = projection.mapArguments(args);
+			const lifecycle = projection.lifecycle;
+			const startedAt = Date.now();
+			let lifecycleStage: "started" | "running" | "response_received" | "waiting_approval" | "waiting_review" =
+				"started";
+			const lifecycleSummary = (stage: typeof lifecycleStage, elapsedMs: number): string => {
+				if (!lifecycle) return "";
+				switch (stage) {
+					case "started":
+						return `${lifecycle.label}已开始，正在等待受控工作区返回`;
+					case "running":
+						return `${lifecycle.label}仍在执行，已持续 ${Math.max(1, Math.floor(elapsedMs / 1_000))} 秒`;
+					case "response_received":
+						return `${lifecycle.label}已返回结果，正在整理回执`;
+					case "waiting_approval":
+						return `${lifecycle.label}正在等待必要的操作确认`;
+					case "waiting_review":
+						return `${lifecycle.label}正在等待必要的独立复核`;
+				}
+			};
+			const emitLifecycle = (stage: typeof lifecycleStage): void => {
+				if (!lifecycle || !onUpdate) return;
+				lifecycleStage = stage;
+				const elapsedMs = Math.max(0, Date.now() - startedAt);
+				onUpdate({
+					// The JSON gateway currently returns one final document. Empty content
+					// keeps lifecycle progress distinct from real stdout/stderr or file data.
+					content: [],
+					details: {
+						schemaVersion: "rag-ime.projected-tool-lifecycle.v1",
+						toolName: projection.definition.name,
+						lifecycleStage: stage,
+						summary: lifecycleSummary(stage, elapsedMs),
+						elapsedMs,
+					},
+				});
+			};
+			emitLifecycle("started");
+			const heartbeatMs = Math.max(500, lifecycle?.heartbeatMs ?? 2_000);
+			const heartbeat =
+				lifecycle && onUpdate
+					? setInterval(() => {
+							emitLifecycle(
+								lifecycleStage === "started" || lifecycleStage === "running" ? "running" : lifecycleStage,
+							);
+						}, heartbeatMs)
+					: undefined;
+			let executed: Awaited<ReturnType<typeof executeGatewayTool>>;
+			try {
+				executed = await executeGatewayTool(
+					options,
+					target,
+					toolCallId,
+					mappedArguments,
+					signal,
+					artifacts,
+					emitLifecycle,
+				);
+			} finally {
+				if (heartbeat !== undefined) clearInterval(heartbeat);
+			}
 			if (!projection.projectModelResult) return executed;
 			const details =
 				typeof executed.details === "object" && executed.details !== null && !Array.isArray(executed.details)
