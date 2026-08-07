@@ -657,6 +657,10 @@ export class AgentSession {
 		this._settlementEmissionPending = true;
 		this._lastSettledReceipt = receipt;
 		if (receipt.disposition !== "suspended") this._activeRunId = undefined;
+		// The receipt is already terminal for this run. Expose that fact before
+		// settlement observers run; _settlementEmissionPending still keeps
+		// waitForIdle blocked until every observer and the public event finish.
+		this._isAgentRunActive = false;
 		try {
 			this._settlementObserversActive = true;
 			try {
@@ -669,7 +673,6 @@ export class AgentSession {
 				});
 			} finally {
 				this._settlementObserversActive = false;
-				this._isAgentRunActive = false;
 			}
 			this._emit({ type: "agent_settled", receipt });
 		} finally {

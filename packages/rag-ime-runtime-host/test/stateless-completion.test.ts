@@ -276,7 +276,13 @@ describe("stateless completion", () => {
 			await vi.waitFor(() => expect(modelRuntime.streamSimple).toHaveBeenCalledOnce());
 			await expect(
 				host.handle(request("cancel", "completion.cancel", { requestId: "surface-pending" })),
-			).resolves.toMatchObject({ cancelled: true });
+			).resolves.toMatchObject({
+				cancelled: true,
+				scopeReceipt: {
+					scopeId: "completion:surface-pending",
+					reason: "stateless_completion_cancelled",
+				},
+			});
 			await expect(pending).rejects.toThrow("cancelled");
 		} finally {
 			await host.dispose();

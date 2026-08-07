@@ -10,7 +10,7 @@ import {
 	type Model,
 	type ModelThinkingLevel,
 } from "@earendil-works/pi-ai";
-import { configureHttpDispatcher, ModelRuntime } from "@earendil-works/pi-coding-agent";
+import { configureHttpDispatcher, ModelRuntime, RunScope } from "@earendil-works/pi-coding-agent";
 import { pendingRoomCancellationSurfaces, roomCancellationSurfaces } from "./cancellation-receipts.ts";
 import { PiProductSession } from "./pi-session.ts";
 import { ManagedPluginManager } from "./plugin-manager.ts";
@@ -289,7 +289,7 @@ export class RagImeRuntimeHost {
 	readonly plugins: ManagedPluginManager;
 	private readonly options: RuntimeHostOptions;
 	private readonly allowedWorkspaceRoots: string[];
-	private readonly completions = new Map<string, AbortController>();
+	private readonly completions = new Map<string, RunScope>();
 	private readonly roomReceipts = new Map<string, Record<string, unknown>>();
 	private readonly roomCancelOperations = new Map<string, RoomCancelOperation>();
 	private readonly roomCancelFences = new Map<string, RoomCancelParams>();
@@ -334,7 +334,11 @@ export class RagImeRuntimeHost {
 	}
 
 	async dispose(): Promise<void> {
-		for (const controller of this.completions.values()) controller.abort();
+		await Promise.all(
+			[...this.completions.values()].map(async (scope) => {
+				await scope.cancel("runtime_host_disposed");
+			}),
+		);
 		this.completions.clear();
 		this.roomReceipts.clear();
 		this.roomCancelOperations.clear();
@@ -511,8 +515,18 @@ export class RagImeRuntimeHost {
 					throw new RuntimeProtocolError("REQUEST_ALREADY_ACTIVE", `Completion is already active: ${requestId}`);
 				}
 
-				const controller = new AbortController();
-				this.completions.set(requestId, controller);
+				const completionScope = new RunScope({
+					scopeId: `completion:${requestId}`,
+					sessionId: `stateless:${requestId}`,
+					runId: `completion:${requestId}`,
+					kind: "prompt",
+				});
+				const releaseProvider = completionScope.register({
+					operationId: `provider:${requestId}`,
+					kind: "provider",
+					cancel: () => undefined,
+				});
+				this.completions.set(requestId, completionScope);
 				const started = performance.now();
 				try {
 					// Re-read Pi's local configuration for every request. The product only
@@ -549,7 +563,7 @@ export class RagImeRuntimeHost {
 							"Stateless completion does not accept images; provide semantic Context Packet text",
 						);
 					}
-					if (controller.signal.aborted) {
+					if (completionScope.signal.aborted) {
 						throw new RuntimeProtocolError("REQUEST_ABORTED", "Stateless completion was cancelled");
 					}
 					const message = requiredString(params, "message", 64_000);
@@ -568,7 +582,7 @@ export class RagImeRuntimeHost {
 						cacheRetention: "none",
 						maxRetries: 0,
 						maxTokens: Math.min(model.maxTokens, 4096),
-						signal: controller.signal,
+						signal: completionScope.signal,
 						timeoutMs,
 					});
 					let response: AssistantMessage | undefined;
@@ -578,7 +592,7 @@ export class RagImeRuntimeHost {
 					let reasoningChars = 0;
 					let lastReasoningProgressChars = 0;
 					for await (const event of stream) {
-						if (controller.signal.aborted) break;
+						if (completionScope.signal.aborted) break;
 						if (event.type === "thinking_start") {
 							if (reasoningStartedAtMs <= 0) {
 								reasoningStartedAtMs = Math.max(1, Math.round(performance.now() - started));
@@ -679,14 +693,22 @@ export class RagImeRuntimeHost {
 						elapsedMs: Math.max(0, Math.round(performance.now() - started)),
 					};
 				} finally {
-					this.completions.delete(requestId);
+					releaseProvider();
+					completionScope.settle();
+					if (this.completions.get(requestId) === completionScope) {
+						this.completions.delete(requestId);
+					}
 				}
 			}
 			case "completion.cancel": {
 				const requestId = completionIdParam(params);
-				const controller = this.completions.get(requestId);
-				controller?.abort();
-				return { requestId, cancelled: controller !== undefined };
+				const scope = this.completions.get(requestId);
+				const scopeReceipt = scope ? await scope.cancel("stateless_completion_cancelled") : undefined;
+				return {
+					requestId,
+					cancelled: scope !== undefined,
+					...(scopeReceipt ? { scopeReceipt } : {}),
+				};
 			}
 			case "session.open": {
 				const sessionId = requiredSessionId(params);
