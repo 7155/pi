@@ -46,6 +46,7 @@ export const RUNTIME_PRIMITIVE_CAPABILITIES = Object.freeze({
 	agentSettledReceipt: "2",
 	contextProvider: "1",
 	sessionAwaitSettled: true,
+	sessionSettlementGet: true,
 	sessionContinuationQueue: true,
 	sessionCancelOperationRegistry: true,
 	sessionCancelOperations: Object.freeze({

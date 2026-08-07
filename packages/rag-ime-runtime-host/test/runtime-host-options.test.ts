@@ -19,6 +19,7 @@ describe("runtime host primitive capabilities", () => {
 			agentSettledReceipt: "2",
 			contextProvider: "1",
 			sessionAwaitSettled: true,
+			sessionSettlementGet: true,
 			sessionContinuationQueue: true,
 			sessionCancelOperationRegistry: true,
 			sessionCancelOperations: {
