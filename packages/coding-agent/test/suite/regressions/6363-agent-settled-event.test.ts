@@ -66,6 +66,44 @@ describe("regression #6363: agent settled event and idle waiting", () => {
 		expect(publicEvents).toEqual(["agent_settled"]);
 	});
 
+	it("waits for terminal settlement listeners before an abort reports idle", async () => {
+		let markSettlementStarted = () => {};
+		const settlementStarted = new Promise<void>((resolve) => {
+			markSettlementStarted = resolve;
+		});
+		let releaseSettlement = () => {};
+		const settlementReleased = new Promise<void>((resolve) => {
+			releaseSettlement = resolve;
+		});
+		const harness = await createHarness({
+			extensionFactories: [
+				(pi) => {
+					pi.on("agent_settled", async () => {
+						markSettlementStarted();
+						await settlementReleased;
+					});
+				},
+			],
+		});
+		harnesses.push(harness);
+		harness.setResponses([fauxAssistantMessage("done")]);
+
+		const prompt = harness.session.prompt("test");
+		await settlementStarted;
+		let abortResolved = false;
+		const abort = harness.session.abort().then((receipt) => {
+			abortResolved = true;
+			return receipt;
+		});
+		await new Promise((resolve) => setTimeout(resolve, 0));
+		expect(abortResolved).toBe(false);
+
+		releaseSettlement();
+		const [abortReceipt] = await Promise.all([abort, prompt]);
+		expect(abortReceipt.idle).toBe(true);
+		expect(harness.eventsOfType("agent_settled")).toHaveLength(1);
+	});
+
 	it("cancels an in-flight retry delay through the total run scope", async () => {
 		let markRetryStarted = () => {};
 		const retryStarted = new Promise<void>((resolve) => {

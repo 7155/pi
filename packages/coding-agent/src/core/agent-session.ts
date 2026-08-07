@@ -332,6 +332,7 @@ export class AgentSession {
 	private _unsubscribeAgent?: () => void;
 	private _eventListeners: AgentSessionEventListener[] = [];
 	private _isAgentRunActive = false;
+	private _settlementEmissionPending = false;
 	private _idleWaitPromise: Promise<void> | undefined;
 	private _resolveIdleWait: (() => void) | undefined;
 
@@ -649,6 +650,7 @@ export class AgentSession {
 	}
 
 	private async _emitAgentSettled(receipt: AgentSettledReceipt): Promise<void> {
+		this._settlementEmissionPending = true;
 		this._isAgentRunActive = false;
 		this._lastSettledReceipt = receipt;
 		if (receipt.disposition !== "suspended") this._activeRunId = undefined;
@@ -656,16 +658,22 @@ export class AgentSession {
 			await this._extensionRunner.emit({ type: "agent_settled", receipt });
 			this._emit({ type: "agent_settled", receipt });
 		} finally {
+			this._settlementEmissionPending = false;
 			this._resolveIdleWaitIfIdle();
 		}
 	}
 
 	private _emitAgentSettleFailed(error: AgentSettleLifecycleError, receipt: AgentSettledReceipt): void {
+		this._settlementEmissionPending = true;
 		this._isAgentRunActive = false;
 		this._lastSettledReceipt = receipt;
 		this._activeRunId = undefined;
-		this._emit({ type: "agent_settle_failed", error: error.message, receipt });
-		this._resolveIdleWaitIfIdle();
+		try {
+			this._emit({ type: "agent_settle_failed", error: error.message, receipt });
+		} finally {
+			this._settlementEmissionPending = false;
+			this._resolveIdleWaitIfIdle();
+		}
 	}
 
 	// Track last assistant message for auto-compaction check
@@ -1953,7 +1961,7 @@ export class AgentSession {
 	}
 
 	async waitForIdle(): Promise<void> {
-		if (this.isIdle) {
+		if (this.isIdle && !this._settlementEmissionPending) {
 			return;
 		}
 		await this._getIdleWaitPromise();
