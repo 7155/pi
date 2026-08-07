@@ -15,6 +15,11 @@ interface SessionContextRefreshOptions {
 	getAgentSkillRecovery?(): Record<string, unknown> | undefined;
 	getAgentToolRecovery?(): Record<string, unknown> | undefined;
 	providerContextJournal: ProviderContextJournal;
+	assembleProviderContext?: (input: {
+		stage: "after_compaction";
+		queryText: string;
+		systemPrompt: string;
+	}) => Promise<string>;
 }
 
 interface SessionContextRefreshResult {
@@ -148,17 +153,24 @@ export function createSessionContextRefreshExtension(options: SessionContextRefr
 					event.compactionEntry.id,
 					preCompactionMessages ?? options.getRecentMessages(),
 				);
+				const baseSystemPrompt = options.providerContextJournal.beginEpoch(
+					"compaction",
+					ctx.getSystemPrompt(),
+					{
+						sessionContext: refreshed?.sessionContext ?? options.getSessionContext(),
+						roomContext: refreshed?.roomRecoveryContext ?? options.getRoomRecoveryContext(),
+						transientContext: "",
+					},
+					refreshed?.contextEpoch,
+				);
 				return {
-					systemPrompt: options.providerContextJournal.beginEpoch(
-						"compaction",
-						ctx.getSystemPrompt(),
-						{
-							sessionContext: refreshed?.sessionContext ?? options.getSessionContext(),
-							roomContext: refreshed?.roomRecoveryContext ?? options.getRoomRecoveryContext(),
-							transientContext: "",
-						},
-						refreshed?.contextEpoch,
-					),
+					systemPrompt: options.assembleProviderContext
+						? await options.assembleProviderContext({
+								stage: "after_compaction",
+								queryText: "",
+								systemPrompt: baseSystemPrompt,
+							})
+						: baseSystemPrompt,
 				};
 			} finally {
 				preCompactionMessages = undefined;

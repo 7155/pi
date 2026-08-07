@@ -142,6 +142,7 @@ export type AgentContinuation = ContinuationEnvelope<AgentMessage>;
 
 class PendingMessageQueue {
 	private readonly queue = new ContinuationQueue<AgentMessage>();
+	private readonly leased = new Map<string, string | undefined>();
 	private timer?: ReturnType<typeof setTimeout>;
 	public mode: QueueMode;
 	private readonly kind: "steer" | "follow_up";
@@ -202,7 +203,7 @@ class PendingMessageQueue {
 			cancelGeneration: this.getGeneration(),
 			limit: this.mode === "all" ? Number.MAX_SAFE_INTEGER : 1,
 		});
-		for (const item of leased) this.queue.complete(item.id);
+		for (const item of leased) this.leased.set(item.id, item.leaseId);
 		if (leased.length > 0) this.onLease(leased);
 		this.schedule();
 		return leased.map((item) => item.payload);
@@ -215,6 +216,19 @@ class PendingMessageQueue {
 
 	snapshot(): AgentContinuation[] {
 		return this.queue.snapshot().items;
+	}
+
+	hasReady(now = Date.now()): boolean {
+		return this.queue.hasReady({ now, cancelGeneration: this.getGeneration() });
+	}
+
+	settleLeases(failureReason?: string): void {
+		for (const [id, leaseId] of this.leased) {
+			if (failureReason) this.queue.release(id, leaseId, failureReason);
+			else this.queue.complete(id, leaseId);
+		}
+		this.leased.clear();
+		this.schedule();
 	}
 
 	cancelById(id: string, reason: string): ContinuationCancelReceipt {
@@ -455,9 +469,14 @@ export class Agent {
 		this.clearFollowUpQueue();
 	}
 
-	/** Returns true when either queue still contains pending messages. */
+	/** Returns true when either queue still contains scheduled messages. */
 	hasQueuedMessages(): boolean {
 		return this.steeringQueue.hasItems() || this.followUpQueue.hasItems();
+	}
+
+	/** Returns true only when a queued continuation may run at this instant. */
+	hasReadyQueuedMessages(now = Date.now()): boolean {
+		return this.steeringQueue.hasReady(now) || this.followUpQueue.hasReady(now);
 	}
 
 	/** Active abort signal for the current run, if any. */
@@ -652,12 +671,18 @@ export class Agent {
 		this._state.streamingMessage = undefined;
 		this._state.errorMessage = undefined;
 
+		let failureReason: string | undefined;
 		try {
 			await executor(abortController.signal);
 		} catch (error) {
+			failureReason = abortController.signal.aborted
+				? "run_aborted"
+				: error instanceof Error
+					? error.message
+					: String(error);
 			await this.handleRunFailure(error, abortController.signal.aborted);
 		} finally {
-			this.finishRun();
+			this.finishRun(failureReason);
 		}
 	}
 
@@ -679,7 +704,12 @@ export class Agent {
 		await this.processEvents({ type: "agent_end", messages: [failureMessage] });
 	}
 
-	private finishRun(): void {
+	private finishRun(failureReason?: string): void {
+		// A continuation becomes terminal only after the run that consumed it
+		// reached the final agent_end/listener boundary. A failed run releases
+		// the lease while its retry budget remains.
+		this.steeringQueue.settleLeases(failureReason);
+		this.followUpQueue.settleLeases(failureReason);
 		this._state.isStreaming = false;
 		this._state.streamingMessage = undefined;
 		this._state.pendingToolCalls = new Set<string>();

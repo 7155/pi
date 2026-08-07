@@ -12,6 +12,7 @@
 
 ### Added
 
+- Added V2 settled receipts to `AgentSession` and extensions, hierarchical run scopes, ready-versus-scheduled continuation handling, and the public context-provider Runtime SDK.
 - Added run-scoped cancellation receipts and provider, tool, and retry operation registration to `AgentSession` and RPC state.
 - Added cancellation-scope registration for manual and automatic compaction, branch summarization, and standalone bash execution.
 - Added RPC continuation listing and cancellation by continuation ID, correlation ID, or generation. Delayed

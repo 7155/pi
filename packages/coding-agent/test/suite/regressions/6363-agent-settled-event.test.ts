@@ -172,6 +172,43 @@ describe("regression #6363: agent settled event and idle waiting", () => {
 		expect(harness.eventsOfType("agent_settled")).toHaveLength(1);
 	});
 
+	it("keeps one run identity across a suspended delayed continuation", async () => {
+		let scheduled = false;
+		const harness = await createHarness({
+			extensionFactories: [
+				(pi) => {
+					pi.on("before_agent_settle", () => {
+						if (scheduled) return;
+						scheduled = true;
+						return {
+							followUp: {
+								text: "delayed continuation",
+								continuation: {
+									id: "delayed-continuation",
+									idempotencyKey: "delayed-continuation",
+									notBefore: Date.now() + 20,
+								},
+							},
+						};
+					});
+				},
+			],
+		});
+		harnesses.push(harness);
+		harness.setResponses([fauxAssistantMessage("first"), fauxAssistantMessage("second")]);
+
+		await harness.session.prompt("start");
+		expect(harness.eventsOfType("agent_settled")).toHaveLength(1);
+		expect(harness.eventsOfType("agent_settled")[0]?.receipt.disposition).toBe("suspended");
+		await harness.session.waitForIdle();
+
+		const receipts = harness.eventsOfType("agent_settled").map((event) => event.receipt);
+		expect(receipts).toHaveLength(2);
+		expect(receipts.map((receipt) => receipt.disposition)).toEqual(["suspended", "completed"]);
+		expect(receipts[1]?.runId).toBe(receipts[0]?.runId);
+		expect(receipts[1]?.scopeId).not.toBe(receipts[0]?.scopeId);
+	});
+
 	it("does not expose a false settled event when the settlement owner fails", async () => {
 		const harness = await createHarness({
 			extensionFactories: [

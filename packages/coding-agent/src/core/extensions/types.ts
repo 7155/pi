@@ -10,6 +10,7 @@
 
 import type {
 	AgentMessage,
+	AgentSettledReceiptV2,
 	AgentToolResult,
 	AgentToolUpdateCallback,
 	ContinuationOptions,
@@ -733,9 +734,10 @@ export interface BeforeAgentSettleEvent {
 	};
 }
 
-/** Fired after an agent run has fully settled and no automatic retry, compaction, or queued continuation will run. */
+/** Fired at a stable Pi runtime boundary. `disposition` distinguishes terminal completion from a scheduled continuation. */
 export interface AgentSettledEvent {
 	type: "agent_settled";
+	receipt: AgentSettledReceiptV2;
 }
 
 /** Fired at the start of each turn */

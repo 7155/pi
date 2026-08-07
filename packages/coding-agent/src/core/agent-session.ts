@@ -20,6 +20,7 @@ import type {
 	AgentContinuation,
 	AgentEvent,
 	AgentMessage,
+	AgentSettledReceiptV2,
 	AgentState,
 	AgentTool,
 	CancelOperationSnapshot,
@@ -29,7 +30,7 @@ import type {
 	StreamFn,
 	ThinkingLevel,
 } from "@earendil-works/pi-agent-core";
-import { CancelScope } from "@earendil-works/pi-agent-core";
+import { createAgentSettledReceipt, flattenRunScopeOperations, RunScope } from "@earendil-works/pi-agent-core";
 import type {
 	AssistantMessage,
 	AuthResult,
@@ -150,11 +151,11 @@ export type AgentSessionEvent =
 			messages: AgentMessage[];
 			willRetry: boolean;
 	  }
-	| { type: "agent_settled"; receipt?: AgentSettledReceipt }
+	| { type: "agent_settled"; receipt: AgentSettledReceipt }
 	| {
 			type: "agent_settle_failed";
 			error: string;
-			receipt?: AgentSettledReceipt;
+			receipt: AgentSettledReceipt;
 	  }
 	| {
 			type: "queue_update";
@@ -179,13 +180,7 @@ export type AgentSessionEvent =
 /** Listener function for agent session events */
 export type AgentSessionEventListener = (event: AgentSessionEvent) => void;
 
-export interface AgentSettledReceipt {
-	scopeId: string;
-	generation: number;
-	aborted: boolean;
-	pendingOperations: number;
-	operationCounts: Record<string, number>;
-}
+export type AgentSettledReceipt = AgentSettledReceiptV2;
 
 /** Complete, machine-checkable proof for one AgentSession abort request. */
 export interface AgentAbortReceipt {
@@ -365,8 +360,10 @@ export class AgentSession {
 	private _retryLimitOverride: number | undefined;
 	private _providerSessionAffinityBase: string | undefined;
 	private _providerSessionAffinityGeneration = 0;
-	private _cancelScope: CancelScope | undefined;
+	private _cancelScope: RunScope | undefined;
 	private _cancelScopeSequence = 0;
+	/** Preserved across suspended continuation scopes for one logical product turn. */
+	private _activeRunId: string | undefined;
 	private _beforeSettleAttempt = 0;
 	private _cancelOperationCounts = new Map<string, number>();
 	private _toolCancelUnregister = new Map<string, () => void>();
@@ -651,11 +648,12 @@ export class AgentSession {
 		resolve();
 	}
 
-	private async _emitAgentSettled(receipt?: AgentSettledReceipt): Promise<void> {
+	private async _emitAgentSettled(receipt: AgentSettledReceipt): Promise<void> {
 		this._isAgentRunActive = false;
 		this._lastSettledReceipt = receipt;
+		if (receipt.disposition !== "suspended") this._activeRunId = undefined;
 		try {
-			await this._extensionRunner.emit({ type: "agent_settled" });
+			await this._extensionRunner.emit({ type: "agent_settled", receipt });
 			this._emit({ type: "agent_settled", receipt });
 		} finally {
 			this._resolveIdleWaitIfIdle();
@@ -664,6 +662,8 @@ export class AgentSession {
 
 	private _emitAgentSettleFailed(error: AgentSettleLifecycleError, receipt: AgentSettledReceipt): void {
 		this._isAgentRunActive = false;
+		this._lastSettledReceipt = receipt;
+		this._activeRunId = undefined;
 		this._emit({ type: "agent_settle_failed", error: error.message, receipt });
 		this._resolveIdleWaitIfIdle();
 	}
@@ -1174,7 +1174,7 @@ export class AgentSession {
 	// =========================================================================
 
 	private async _runAgentPrompt(messages: AgentMessage | AgentMessage[]): Promise<void> {
-		const scope = this._beginCancelScope();
+		const scope = this._beginCancelScope("prompt");
 		const unregisterProvider = this._registerCancelOperation("provider", "provider", () => this.agent.abort());
 		this._isAgentRunActive = true;
 		let settleFailure: AgentSettleLifecycleError | undefined;
@@ -1190,7 +1190,7 @@ export class AgentSession {
 			unregisterProvider();
 			this._resetPerRunSystemPrompt();
 			this._flushPendingBashMessages();
-			const receipt = this._settledReceipt(scope);
+			const receipt = await this._settledReceipt(scope, settleFailure?.message);
 			if (settleFailure) this._emitAgentSettleFailed(settleFailure, receipt);
 			else await this._emitAgentSettled(receipt);
 			if (this._cancelScope === scope) this._cancelScope = undefined;
@@ -1199,7 +1199,7 @@ export class AgentSession {
 
 	private async _runAgentContinuation(): Promise<void> {
 		if (this._isAgentRunActive || !this.agent.hasQueuedMessages()) return;
-		const scope = this._beginCancelScope();
+		const scope = this._beginCancelScope("continuation");
 		const unregisterTimer = this._registerCancelOperation("continuation-timer", "continuation_timer", () => {
 			this.agent.cancelActiveContinuationGeneration("user_abort");
 		});
@@ -1217,7 +1217,7 @@ export class AgentSession {
 			unregisterProvider();
 			this._resetPerRunSystemPrompt();
 			this._flushPendingBashMessages();
-			const receipt = this._settledReceipt(scope);
+			const receipt = await this._settledReceipt(scope, settleFailure?.message);
 			if (settleFailure) this._emitAgentSettleFailed(settleFailure, receipt);
 			else await this._emitAgentSettled(receipt);
 			if (this._cancelScope === scope) this._cancelScope = undefined;
@@ -1242,10 +1242,16 @@ export class AgentSession {
 		}
 	}
 
-	private _beginCancelScope(): CancelScope {
-		const scope = new CancelScope({
-			scopeId: `${this.sessionId}:run:${++this._cancelScopeSequence}`,
+	private _beginCancelScope(kind: "prompt" | "continuation" | "compaction" | "background" = "prompt"): RunScope {
+		const scopeId = `${this.sessionId}:run:${++this._cancelScopeSequence}`;
+		const runId = kind === "continuation" && this._activeRunId ? this._activeRunId : scopeId;
+		const scope = new RunScope({
+			scopeId,
+			runId,
+			sessionId: this.sessionId,
+			kind,
 		});
+		if (kind === "prompt" || kind === "continuation") this._activeRunId = runId;
 		this._cancelScope = scope;
 		this._beforeSettleAttempt = 0;
 		this._cancelOperationCounts = new Map();
@@ -1255,33 +1261,58 @@ export class AgentSession {
 	private _registerCancelOperation(operationId: string, kind: string, cancel: () => void | Promise<void>): () => void {
 		const scope = this._cancelScope;
 		if (!scope || scope.signal.aborted) return () => {};
+		const scopeKind =
+			kind === "provider"
+				? "provider"
+				: kind === "tool"
+					? "tool"
+					: kind.includes("compaction")
+						? "compaction"
+						: kind.includes("continuation") || kind.includes("retry")
+							? "continuation"
+							: "background";
+		const child = scope.child({
+			scopeId: `${scope.scopeId}:${kind}:${operationId}`,
+			kind: scopeKind,
+		});
 		this._cancelOperationCounts.set(kind, (this._cancelOperationCounts.get(kind) ?? 0) + 1);
-		return scope.register({ operationId, kind, cancel });
-	}
-
-	private _settledReceipt(scope: CancelScope): AgentSettledReceipt {
-		const snapshot = scope.snapshot();
-		return {
-			scopeId: snapshot.scopeId,
-			generation: snapshot.generation,
-			aborted: snapshot.cancelled,
-			pendingOperations: snapshot.operations.length,
-			operationCounts: Object.fromEntries(this._cancelOperationCounts),
+		const unregister = child.register({ operationId, kind, cancel });
+		return () => {
+			unregister();
+			child.settle();
 		};
 	}
 
-	private _beginOperationScope(kind: string): { scope: CancelScope; owned: boolean } {
+	private async _settledReceipt(scope: RunScope, settleError?: string): Promise<AgentSettledReceipt> {
+		const entries = this.sessionManager.getEntries();
+		const message = this._findLastAssistantMessage();
+		return await createAgentSettledReceipt({
+			sessionId: this.sessionId,
+			scope: scope.snapshot(),
+			message: message as unknown as Record<string, unknown> | undefined,
+			transcript: {
+				messageCount: this.agent.state.messages.length,
+				entryIds: entries.map((entry) => entry.id),
+				leafId: this.sessionManager.getLeafId() ?? undefined,
+			},
+			continuations: this.agent.listContinuations(),
+			operationCounts: Object.fromEntries(this._cancelOperationCounts),
+			settleError,
+		});
+	}
+
+	private _beginOperationScope(kind: string): { scope: RunScope; owned: boolean } {
 		if (this._cancelScope && !this._cancelScope.signal.aborted) {
 			return { scope: this._cancelScope, owned: false };
 		}
-		const scope = this._beginCancelScope();
+		const scope = this._beginCancelScope(kind.includes("compaction") ? "compaction" : "background");
 		this._cancelOperationCounts.set(kind, 0);
 		return { scope, owned: true };
 	}
 
-	private _finishOperationScope(scope: CancelScope, owned: boolean): void {
+	private async _finishOperationScope(scope: RunScope, owned: boolean): Promise<void> {
 		if (!owned) return;
-		this._lastSettledReceipt = this._settledReceipt(scope);
+		this._lastSettledReceipt = await this._settledReceipt(scope);
 		if (this._cancelScope === scope) this._cancelScope = undefined;
 	}
 
@@ -1312,7 +1343,8 @@ export class AgentSession {
 
 		// The agent loop drains both queues before emitting agent_end. Any messages
 		// here were queued by agent_end extension handlers and need a continuation.
-		if (this.agent.hasQueuedMessages()) return true;
+		if (this.agent.hasReadyQueuedMessages()) return true;
+		if (this.agent.hasQueuedMessages()) return false;
 		if (this._cancelScope?.signal.aborted || String(msg.stopReason) === "aborted") return false;
 
 		const emitBeforeAgentSettle = this._extensionRunner.emitBeforeAgentSettle;
@@ -1334,7 +1366,7 @@ export class AgentSession {
 			);
 			if (!settle?.followUp) return false;
 			await this._queueFollowUp(settle.followUp.text, undefined, settle.followUp.continuation);
-			return this.agent.hasQueuedMessages();
+			return this.agent.hasReadyQueuedMessages();
 		} catch (error) {
 			if (error instanceof AgentSettleLifecycleError) throw error;
 			throw new AgentSettleLifecycleError(error);
@@ -1888,7 +1920,7 @@ export class AgentSession {
 	 */
 	async abort(): Promise<AgentAbortReceipt> {
 		const scope = this._cancelScope;
-		const operations = scope?.snapshot().operations ?? [];
+		const operations = scope ? flattenRunScopeOperations(scope.snapshot()) : [];
 		const cancellation: CancelReceipt = scope
 			? await scope.cancel("user_abort")
 			: {
@@ -1904,7 +1936,7 @@ export class AgentSession {
 		this.agent.abort();
 		await this.waitForIdle();
 		const drainedWithinDeadline = scope ? await scope.awaitDrained(30_000) : true;
-		const pendingOperations = scope?.snapshot().operations ?? [];
+		const pendingOperations = scope ? flattenRunScopeOperations(scope.snapshot()) : [];
 		return {
 			schemaVersion: "pi.agent-abort-receipt.v1",
 			scopeId: cancellation.scopeId,
@@ -1928,7 +1960,7 @@ export class AgentSession {
 	}
 
 	getRuntimeLifecycleSnapshot(): {
-		activeScope: ReturnType<CancelScope["snapshot"]> | null;
+		activeScope: ReturnType<RunScope["snapshot"]> | null;
 		lastSettledReceipt: AgentSettledReceipt | null;
 	} {
 		return {
@@ -2312,7 +2344,7 @@ export class AgentSession {
 		} finally {
 			unregisterCompaction();
 			this._compactionAbortController = undefined;
-			this._finishOperationScope(operationScope.scope, operationScope.owned);
+			await this._finishOperationScope(operationScope.scope, operationScope.owned);
 			this._reconnectToAgent();
 		}
 	}
@@ -2663,7 +2695,7 @@ export class AgentSession {
 		} finally {
 			unregisterAutoCompaction();
 			this._autoCompactionAbortController = undefined;
-			this._finishOperationScope(operationScope.scope, operationScope.owned);
+			await this._finishOperationScope(operationScope.scope, operationScope.owned);
 		}
 	}
 
@@ -3274,7 +3306,7 @@ export class AgentSession {
 		} finally {
 			unregisterBash();
 			this._bashAbortController = undefined;
-			this._finishOperationScope(operationScope.scope, operationScope.owned);
+			await this._finishOperationScope(operationScope.scope, operationScope.owned);
 		}
 	}
 
@@ -3563,7 +3595,7 @@ export class AgentSession {
 		} finally {
 			unregisterBranchSummary();
 			this._branchSummaryAbortController = undefined;
-			this._finishOperationScope(operationScope.scope, operationScope.owned);
+			await this._finishOperationScope(operationScope.scope, operationScope.owned);
 		}
 	}
 

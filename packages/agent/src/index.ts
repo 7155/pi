@@ -2,6 +2,8 @@
 export * from "./agent.ts";
 // Loop functions
 export * from "./agent-loop.ts";
+// Product-neutral lifecycle and context primitives
+export * from "./context-provider.ts";
 export * from "./harness/agent-harness.ts";
 export {
 	type BranchPreparation,
@@ -42,7 +44,7 @@ export * from "./harness/utils/shell-output.ts";
 export * from "./harness/utils/truncate.ts";
 // Proxy utilities
 export * from "./proxy.ts";
-// Product-neutral lifecycle primitives
 export * from "./runtime-primitives.ts";
+export * from "./runtime-settlement.ts";
 // Types
 export * from "./types.ts";

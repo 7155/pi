@@ -10,7 +10,24 @@ import {
 	publicPiForkCandidates,
 	publicPiRewriteTarget,
 } from "../src/pi-session.ts";
+import { ProductContextProvider } from "../src/product-context-provider.ts";
 import { ProviderContextJournal } from "../src/provider-context-journal.ts";
+
+function testProductContextProvider(
+	mutable: Record<string, any>,
+	options: { roomRequired?: boolean } = {},
+): ProductContextProvider {
+	return new ProductContextProvider({
+		sessionId: "session:test",
+		roomRequired: options.roomRequired,
+		getRunId: () => String(mutable.activeTurn?.turnId ?? "session:test:preflight"),
+		getRoomContext: () => String(mutable.roomContext ?? ""),
+		getRoomRecoveryContext: () => String(mutable.roomRecoveryContext ?? ""),
+		getSessionContext: () => String(mutable.sessionContext ?? ""),
+		getTurnContext: () => String(mutable.transientContext ?? ""),
+		isRoomBound: () => Boolean(mutable.activeRoom ?? mutable.roomContext ?? mutable.roomRecoveryContext),
+	});
+}
 
 function assistant(text: string, timestamp: number): AssistantMessage {
 	return {
@@ -452,6 +469,7 @@ describe("per-turn Provider context lifecycle", () => {
 				followUpWithSystemPrompt,
 			},
 		});
+		mutable.productContextProvider = testProductContextProvider(mutable, { roomRequired: true });
 
 		const result = await mutable.queueRoomContinuation({
 			message: "repair the missing commit",
@@ -817,13 +835,16 @@ describe("managed Room runtime turn identity", () => {
 			backendBridge: { gatewayUrl: undefined },
 			roomProviderContext: undefined,
 			roomResourceLimits: undefined,
+			providerContextJournal: new ProviderContextJournal(),
 			session: {
 				isIdle: false,
+				systemPrompt: "stable system prompt",
 				getSessionStats: () => ({ tokens: { input: 8, output: 3 } }),
 				setRetryLimitOverride: vi.fn(),
 				followUp,
 			},
 		});
+		mutable.productContextProvider = testProductContextProvider(mutable);
 
 		const receipt = await productSession.dispatchRoom({
 			message: "retry bounded Room work",

@@ -39,8 +39,13 @@ const COMPLETION_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,199}$/;
 const THINKING_LEVELS = new Set<ModelThinkingLevel>(["off", "minimal", "low", "medium", "high", "xhigh", "max"]);
 
 export const RUNTIME_PRIMITIVE_CAPABILITIES = Object.freeze({
-	continuationEnvelope: "1",
+	continuationEnvelope: "2",
+	continuationLease: "1",
 	cancelScope: "1",
+	runScope: "1",
+	agentSettledReceipt: "2",
+	contextProvider: "1",
+	sessionAwaitSettled: true,
 	sessionContinuationQueue: true,
 	sessionCancelOperationRegistry: true,
 	sessionCancelOperations: Object.freeze({
@@ -743,6 +748,11 @@ export class RagImeRuntimeHost {
 			}
 			case "session.control_state":
 				return this.session(params).controlState();
+			case "session.await_settled":
+				return await this.session(params).awaitSettled(requiredString(params, "turnId", 240), {
+					allowSuspended: optionalBoolean(params, "allowSuspended"),
+					timeoutMs: params.timeoutMs === undefined ? undefined : requiredNonNegativeInteger(params, "timeoutMs"),
+				});
 			case "session.snapshot":
 				return this.session(params).snapshot();
 			case "session.debug.context":

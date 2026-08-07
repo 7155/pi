@@ -160,6 +160,16 @@ describe("Room runtime RPC", () => {
 		});
 		const target = {
 			externalSessionId: "session:target",
+			awaitSettled: vi.fn(async (turnId: string) => ({
+				schemaVersion: "rag-ime.pi-turn-settlement.v1" as const,
+				sessionId: "session:target",
+				turnId,
+				receipt: {
+					schemaVersion: "pi.agent-settled.v2" as const,
+					receiptId: "receipt:turn:1",
+					disposition: "completed" as const,
+				},
+			})),
 			dispatchRoom: vi.fn(async (_options: Record<string, any>) => ({ delivery: "prompt", turnId: "turn:1" })),
 			cancelRoom: vi.fn((_lineage: Record<string, any>) => ({
 				cancelledIds: ["continuation:1"],
@@ -213,6 +223,24 @@ describe("Room runtime RPC", () => {
 		try {
 			const hello = (await host.handle(request("hello", "hello", {}))) as Record<string, any>;
 			expect(hello.capabilities.runtimePrimitives.roomTypes).toBe(true);
+			const settled = await host.handle(
+				request("settled", "session.await_settled", {
+					sessionId: "session:target",
+					turnId: "turn:1",
+					allowSuspended: false,
+					timeoutMs: 600_000,
+				}),
+			);
+			expect(settled).toMatchObject({
+				schemaVersion: "rag-ime.pi-turn-settlement.v1",
+				sessionId: "session:target",
+				turnId: "turn:1",
+				receipt: { schemaVersion: "pi.agent-settled.v2", disposition: "completed" },
+			});
+			expect(target.awaitSettled).toHaveBeenCalledWith("turn:1", {
+				allowSuspended: false,
+				timeoutMs: 600_000,
+			});
 			const params = {
 				sessionId: "session:target",
 				rootId: "root:1",

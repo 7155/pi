@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import type { ExtensionFactory } from "@earendil-works/pi-coding-agent";
+import type { ContextAssembly, ContextAssemblyReceipt, ExtensionFactory } from "@earendil-works/pi-coding-agent";
 import type { RuntimeContextSnapshot } from "./transient-context.ts";
 
 const MANAGED_CONTEXT_BLOCK_PATTERN =
@@ -19,15 +19,26 @@ export interface ProviderContextJournalSnapshot {
 	epochReason: string;
 	entryCount: number;
 	contentHashes: string[];
+	assemblyHash?: string;
+	assemblyReceipt?: ContextAssemblyReceipt;
+}
+
+function managedBlock(kind: ProviderContextKind, body: string): string {
+	const value = body.trim().replace(/<\/rag-ime-context>/giu, "&lt;/rag-ime-context&gt;");
+	return value ? [`<rag-ime-context type="${kind}">`, value, "</rag-ime-context>"].join("\n") : "";
+}
+
+function withoutManagedContext(systemPrompt: string): string {
+	return systemPrompt.replace(MANAGED_CONTEXT_BLOCK_PATTERN, "").trimEnd();
 }
 
 /**
- * Owns one Pi Session's Provider-only context.
+ * Owns one Pi Session's Provider-only context rendering.
  *
- * Room and approved Session memory form the append-only, cache-friendly
- * prefix for an epoch. Current input and UI evidence is a replaceable tail:
- * keeping older turn_context blocks would make stale foreground state look
- * simultaneously true and would grow every later Provider request.
+ * Legacy string callers retain the original append-within-epoch behavior.
+ * New ContextProvider callers use `projectAssembly()`, which renders exactly
+ * one current receipted assembly and therefore cannot accumulate stale Room,
+ * Memory, Knowledge, or WorkDocument snapshots across turns.
  */
 export class ProviderContextJournal {
 	private epoch: number;
@@ -35,6 +46,7 @@ export class ProviderContextJournal {
 	private entries: ProviderContextEntry[] = [];
 	private contentHashes = new Set<string>();
 	private turnContext: ProviderContextEntry | undefined;
+	private latestAssembly?: ContextAssemblyReceipt;
 
 	constructor(initialEpoch = 1, initialReason = "session_open") {
 		if (!Number.isSafeInteger(initialEpoch) || initialEpoch < 1) {
@@ -44,11 +56,27 @@ export class ProviderContextJournal {
 		this.epochReason = initialReason.trim() || "session_open";
 	}
 
+	/** Compatibility path for existing string-based Runtime hosts. */
 	project(systemPrompt: string, context: RuntimeContextSnapshot): string {
+		this.latestAssembly = undefined;
 		this.append("room_context", context.roomContext ?? "");
 		this.append("session_memory", context.sessionContext);
 		this.replaceTurnContext(context.transientContext);
-		return this.render(systemPrompt);
+		return this.renderLegacy(systemPrompt);
+	}
+
+	/** Preferred path: render the exact current ContextProvider assembly. */
+	projectAssembly(systemPrompt: string, assembly: ContextAssembly): string {
+		this.latestAssembly = structuredClone(assembly.receipt);
+		const turn = [assembly.byPlacement.turn_context, assembly.byPlacement.continuation_context]
+			.filter(Boolean)
+			.join("\n\n");
+		const blocks = [
+			managedBlock("room_context", assembly.byPlacement.stable_system),
+			managedBlock("session_memory", assembly.byPlacement.session_system),
+			managedBlock("turn_context", turn),
+		].filter(Boolean);
+		return [withoutManagedContext(systemPrompt), ...blocks].filter(Boolean).join("\n\n");
 	}
 
 	clearTurnContext(): void {
@@ -70,6 +98,7 @@ export class ProviderContextJournal {
 		this.entries = [];
 		this.contentHashes.clear();
 		this.turnContext = undefined;
+		this.latestAssembly = undefined;
 		return this.project(systemPrompt, context);
 	}
 
@@ -79,8 +108,12 @@ export class ProviderContextJournal {
 			schemaVersion: "rag-ime.provider-context-journal.v1",
 			epoch: this.epoch,
 			epochReason: this.epochReason,
-			entryCount: currentEntries.length,
-			contentHashes: currentEntries.map((entry) => entry.contentHash),
+			entryCount: this.latestAssembly?.contributions.length ?? currentEntries.length,
+			contentHashes: this.latestAssembly
+				? this.latestAssembly.contributions.map((entry) => entry.contentHash)
+				: currentEntries.map((entry) => entry.contentHash),
+			assemblyHash: this.latestAssembly?.assemblyHash,
+			assemblyReceipt: this.latestAssembly ? structuredClone(this.latestAssembly) : undefined,
 		};
 	}
 
@@ -110,17 +143,14 @@ export class ProviderContextJournal {
 		return this.turnContext ? [...this.entries, this.turnContext] : this.entries;
 	}
 
-	private render(systemPrompt: string): string {
-		const base = systemPrompt.replace(MANAGED_CONTEXT_BLOCK_PATTERN, "").trimEnd();
-		const entries = this.currentEntries();
-		if (entries.length === 0) return base;
-		const blocks = entries.map((entry) =>
-			[`<rag-ime-context type="${entry.kind}">`, entry.body, "</rag-ime-context>"].join("\n"),
-		);
+	private renderLegacy(systemPrompt: string): string {
+		const base = withoutManagedContext(systemPrompt);
+		const blocks = this.currentEntries().map((entry) => managedBlock(entry.kind, entry.body));
 		return [base, ...blocks].filter(Boolean).join("\n\n");
 	}
 }
 
+/** Existing compatibility extension. */
 export function createProviderContextJournalExtension(
 	journal: ProviderContextJournal,
 	getContext: () => RuntimeContextSnapshot,
@@ -129,6 +159,20 @@ export function createProviderContextJournalExtension(
 		pi.on("before_agent_start", (event) => {
 			const context = getContext();
 			const systemPrompt = journal.project(event.systemPrompt, context);
+			return systemPrompt === event.systemPrompt ? undefined : { systemPrompt };
+		});
+	};
+}
+
+/** Preferred extension for deterministic, provenance-bearing ContextProviders. */
+export function createContextProviderJournalExtension(
+	journal: ProviderContextJournal,
+	assemble: (input: { prompt: string }) => Promise<ContextAssembly>,
+): ExtensionFactory {
+	return (pi) => {
+		pi.on("before_agent_start", async (event) => {
+			const assembly = await assemble({ prompt: event.prompt });
+			const systemPrompt = journal.projectAssembly(event.systemPrompt, assembly);
 			return systemPrompt === event.systemPrompt ? undefined : { systemPrompt };
 		});
 	};

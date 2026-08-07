@@ -28,6 +28,7 @@ import {
 import { createLifecycleHookController } from "./lifecycle-hooks.ts";
 import { createMemoryCaptureExtension, prepareGovernedMemoryCapture } from "./memory-capture-tool.ts";
 import { bootstrapNativeWorkspaceToolTargets, createNativeWorkspaceToolsExtension } from "./native-workspace-tools.ts";
+import { ProductContextProvider } from "./product-context-provider.ts";
 import {
 	PROTOCOL_VERSION,
 	type RoomCancelParams,
@@ -35,7 +36,7 @@ import {
 	RuntimeProtocolError,
 	sameRoomCancelLineage,
 } from "./protocol.ts";
-import { createProviderContextJournalExtension, ProviderContextJournal } from "./provider-context-journal.ts";
+import { createContextProviderJournalExtension, ProviderContextJournal } from "./provider-context-journal.ts";
 import { roomSkillPromptFocus, roomToolPromptFocus } from "./room-prompt-catalog.ts";
 import { createRoomResourceLimitExtension, type RoomResourceLimits } from "./room-resource-limits.ts";
 import { type ActiveRoomDispatch, createRoomSettleLifecycleExtension } from "./room-settle-lifecycle.ts";
@@ -55,6 +56,7 @@ import {
 } from "./tool-bridge.ts";
 import { ToolLoopProgressGuard } from "./tool-loop-progress-guard.ts";
 import { ToolResultStore } from "./tool-result-store.ts";
+import { type PiTurnSettlementReceipt, TurnSettlementTracker } from "./turn-settlement.ts";
 import { createWorkflowControlExtension } from "./workflow-control.ts";
 
 export interface PiSessionOpenOptions {
@@ -418,6 +420,8 @@ export class PiProductSession implements PooledSession {
 	private readonly settingsManager: SettingsManager;
 	private readonly debugContextRecorder: PiDebugContextRecorder;
 	private readonly providerContextJournal: ProviderContextJournal;
+	private readonly productContextProvider: ProductContextProvider;
+	private readonly turnSettlements: TurnSettlementTracker;
 	private readonly backendBridge: BackendToolBridgeOptions;
 	private readonly emitEvent: (event: RuntimeEventEnvelope) => void;
 	private unsubscribe: (() => void) | undefined;
@@ -460,6 +464,7 @@ export class PiProductSession implements PooledSession {
 		settingsManager: SettingsManager,
 		debugContextRecorder: PiDebugContextRecorder,
 		providerContextJournal: ProviderContextJournal,
+		productContextProvider: ProductContextProvider,
 		backendBridge: BackendToolBridgeOptions,
 		roomSkillLoad: RoomSkillLoadReceipt | undefined,
 	) {
@@ -477,6 +482,8 @@ export class PiProductSession implements PooledSession {
 		this.settingsManager = settingsManager;
 		this.debugContextRecorder = debugContextRecorder;
 		this.providerContextJournal = providerContextJournal;
+		this.productContextProvider = productContextProvider;
+		this.turnSettlements = new TurnSettlementTracker(options.externalSessionId);
 		this.backendBridge = backendBridge;
 		this.emitEvent = options.emitEvent;
 		const inheritedStopPolicy = session.agent.shouldStopAfterTurn;
@@ -594,6 +601,21 @@ export class PiProductSession implements PooledSession {
 		const initialContextEpoch = Number(options.roomCapability?.contextEpoch ?? 1);
 		const initialContextEpochReason = String(options.roomCapability?.contextEpochReason ?? "session_open");
 		const providerContextJournal = new ProviderContextJournal(initialContextEpoch, initialContextEpochReason);
+		const productContextProvider = new ProductContextProvider({
+			sessionId: options.externalSessionId,
+			roomRequired: roomBound,
+			getRunId: () => productSession?.activeTurn?.turnId ?? `${options.externalSessionId}:preflight`,
+			getRoomContext: () => productSession?.roomContext ?? options.roomContext ?? "",
+			getRoomRecoveryContext: () => productSession?.roomRecoveryContext ?? options.roomRecoveryContext ?? "",
+			getSessionContext: () => productSession?.sessionContext ?? options.sessionContext ?? "",
+			getTurnContext: () => productSession?.transientContext ?? "",
+			getRoomRevision: () => String(productSession?.roomCapability?.contextEpoch ?? initialContextEpoch),
+			getRoomRecoveryRevision: () =>
+				`recovery:${String(productSession?.roomCapability?.contextEpoch ?? initialContextEpoch)}`,
+			getSessionRevision: () => `memory:${productSession?.sessionContextRefreshRevision ?? 0}`,
+			getTurnRevision: () => productSession?.activeTurn?.turnId ?? "turn:pending",
+			isRoomBound: () => Boolean(productSession?.roomCapability ?? options.roomCapability),
+		});
 		let requiredSkillPrompt = "";
 		const loadedSkillNames = new Set<string>();
 		const skillPromptFocus = roomSkillPromptFocus(options.roomSkillPolicy) ?? [];
@@ -671,6 +693,10 @@ export class PiProductSession implements PooledSession {
 							: undefined;
 					},
 					providerContextJournal,
+					assembleProviderContext: async ({ systemPrompt }) => {
+						const assembled = await productContextProvider.assemble({ stage: "after_compaction" });
+						return providerContextJournal.projectAssembly(systemPrompt, assembled.assembly);
+					},
 				}),
 				createWorkflowControlExtension({
 					bridge: backendBridge,
@@ -686,11 +712,11 @@ export class PiProductSession implements PooledSession {
 					getResourceUsage: () => productSession?.roomResourceUsage() ?? {},
 				}),
 				lifecycleHooks.extension,
-				createProviderContextJournalExtension(providerContextJournal, () => ({
-					roomContext: productSession?.roomContext ?? "",
-					sessionContext: productSession?.sessionContext ?? "",
-					transientContext: productSession?.transientContext ?? "",
-				})),
+				createContextProviderJournalExtension(
+					providerContextJournal,
+					async ({ prompt }) =>
+						(await productContextProvider.assemble({ stage: "turn_start", queryText: prompt })).assembly,
+				),
 				{ name: "rag-ime-debug-context", factory: debugContextRecorder.extension() },
 			],
 			noExtensions: true,
@@ -776,6 +802,7 @@ export class PiProductSession implements PooledSession {
 			settingsManager,
 			debugContextRecorder,
 			providerContextJournal,
+			productContextProvider,
 			backendBridge,
 			roomSkillLoad,
 		);
@@ -1049,6 +1076,9 @@ export class PiProductSession implements PooledSession {
 
 	private onSessionEvent(event: AgentSessionEvent): void {
 		const turn = this.activeTurn;
+		if ((event.type === "agent_settled" || event.type === "agent_settle_failed") && turn?.turnId && event.receipt) {
+			this.turnSettlements.record(turn, event.receipt);
+		}
 		const pendingAssistant =
 			event.type === "message_end" && event.message.role === "assistant"
 				? (event.message as unknown as Record<string, unknown>)
@@ -1092,7 +1122,7 @@ export class PiProductSession implements PooledSession {
 				),
 			},
 		});
-		if (event.type === "agent_settled") {
+		if (event.type === "agent_settled" && event.receipt?.disposition !== "suspended") {
 			this.activeTurn = undefined;
 			this.activeRoom = undefined;
 			this.roomUsageBaseline = undefined;
@@ -1105,6 +1135,13 @@ export class PiProductSession implements PooledSession {
 			this.transientContext = "";
 			this.providerContextJournal.clearTurnContext();
 		}
+	}
+
+	async awaitSettled(
+		turnId: string,
+		options: { allowSuspended?: boolean; timeoutMs?: number } = {},
+	): Promise<PiTurnSettlementReceipt> {
+		return await this.turnSettlements.wait(turnId, options);
 	}
 
 	private telemetry(
@@ -1219,6 +1256,10 @@ export class PiProductSession implements PooledSession {
 			activeTurn: this.activeTurn,
 			roomCapability: this.roomCapability ? structuredClone(this.roomCapability) : undefined,
 			activeRoom: this.activeRoom ? structuredClone(this.activeRoom) : undefined,
+			turnSettlement: this.activeTurn
+				? this.turnSettlements.get(this.activeTurn.turnId)
+				: this.turnSettlements.latest(),
+			contextAssembly: this.productContextProvider.snapshot(),
 			sequence: this.sequence,
 		};
 	}
@@ -1243,6 +1284,10 @@ export class PiProductSession implements PooledSession {
 			toolManifest: this.toolRegistry.list(),
 			roomCapability: this.roomCapability ? structuredClone(this.roomCapability) : undefined,
 			activeRoom: this.activeRoom ? structuredClone(this.activeRoom) : undefined,
+			turnSettlement: this.activeTurn
+				? this.turnSettlements.get(this.activeTurn.turnId)
+				: this.turnSettlements.latest(),
+			contextAssembly: this.productContextProvider.snapshot(),
 			toolLoopProgressStop: this.progressGuard().stopReceipt(),
 			roomProviderContext: this.roomProviderContext ? structuredClone(this.roomProviderContext) : undefined,
 			disclosedBackendTools: this.toolRegistry.disclosed().map((tool) => tool.name),
@@ -1733,14 +1778,14 @@ export class PiProductSession implements PooledSession {
 			correlationId: options.rootId,
 			idempotencyKey: options.dispatchId,
 		};
+		const assembledContext = await this.productContextProvider.assemble({
+			stage: "continuation_resume",
+			queryText: options.message,
+		});
 		const continuation = this.session.isIdle
 			? await this.session.followUpWithSystemPrompt(
 					options.message,
-					this.providerContextJournal.project(this.session.systemPrompt, {
-						roomContext: this.roomContext,
-						sessionContext: this.sessionContext,
-						transientContext: this.transientContext,
-					}),
+					this.providerContextJournal.projectAssembly(this.session.systemPrompt, assembledContext.assembly),
 					undefined,
 					continuationOptions,
 				)
@@ -1980,6 +2025,7 @@ export class PiProductSession implements PooledSession {
 	}
 
 	dispose(): void {
+		this.turnSettlements.dispose();
 		for (const pending of this.pendingUIRequests.values()) pending.cancel();
 		this.pendingUIRequests.clear();
 		for (const pending of this.pendingDecisions.values()) {

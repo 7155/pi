@@ -1,3 +1,26 @@
+// Product-neutral embedded Runtime SDK
+export {
+	type AgentSettledReceiptV2,
+	type ContextAssembly,
+	type ContextAssemblyReceipt,
+	type ContextCacheSegment,
+	type ContextContribution,
+	type ContextContributionReceipt,
+	type ContextFailureMode,
+	type ContextOmissionReceipt,
+	type ContextPlacement,
+	type ContextProvenance,
+	type ContextProvider,
+	type ContextProviderDescriptor,
+	ContextProviderPipeline,
+	type ContextProviderPipelineOptions,
+	type ContextProviderRequest,
+	type ContextStage,
+	createAgentSettledReceipt,
+	RunScope,
+	type RunScopeSnapshot,
+} from "@earendil-works/pi-agent-core";
+
 // Core session management
 
 export { type Args, parseArgs } from "./cli/args.ts";

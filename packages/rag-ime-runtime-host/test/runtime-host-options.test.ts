@@ -12,8 +12,13 @@ import {
 describe("runtime host primitive capabilities", () => {
 	it("advertises only the product-neutral primitives available in this release", () => {
 		expect(RUNTIME_PRIMITIVE_CAPABILITIES).toEqual({
-			continuationEnvelope: "1",
+			continuationEnvelope: "2",
+			continuationLease: "1",
 			cancelScope: "1",
+			runScope: "1",
+			agentSettledReceipt: "2",
+			contextProvider: "1",
+			sessionAwaitSettled: true,
 			sessionContinuationQueue: true,
 			sessionCancelOperationRegistry: true,
 			sessionCancelOperations: {
