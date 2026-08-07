@@ -168,6 +168,12 @@ class PendingMessageQueue {
 	enqueue(message: AgentMessage, options: ContinuationOptions = {}): AgentContinuation {
 		const now = Date.now();
 		const id = options.id ?? crypto.randomUUID();
+		const cancelGeneration = this.getGeneration();
+		if (options.cancelGeneration !== undefined && options.cancelGeneration !== cancelGeneration) {
+			throw new Error(
+				`continuation cancelGeneration ${options.cancelGeneration} does not match current generation ${cancelGeneration}`,
+			);
+		}
 		const envelope: AgentContinuation = {
 			id,
 			correlationId: options.correlationId ?? id,
@@ -176,7 +182,7 @@ class PendingMessageQueue {
 			kind: this.kind,
 			payload: message,
 			idempotencyKey: options.idempotencyKey ?? id,
-			cancelGeneration: options.cancelGeneration ?? this.getGeneration(),
+			cancelGeneration,
 			createdAt: now,
 			notBefore: options.notBefore,
 			deadline: options.deadline,
@@ -477,8 +483,18 @@ export class Agent {
 			(value) => value !== undefined,
 		);
 		if (selected.length !== 1) throw new Error("exactly one continuation cancellation selector is required");
-		if (selector.generation !== undefined && selector.generation >= this.continuationGeneration) {
-			this.continuationGeneration = selector.generation + 1;
+		if (selector.generation !== undefined) {
+			if (!Number.isSafeInteger(selector.generation) || selector.generation < 0) {
+				throw new Error("continuation cancellation generation must be a non-negative safe integer");
+			}
+			if (selector.generation > this.continuationGeneration) {
+				throw new Error(
+					`cannot cancel future continuation generation ${selector.generation}; current generation is ${this.continuationGeneration}`,
+				);
+			}
+			if (selector.generation === this.continuationGeneration) {
+				this.continuationGeneration += 1;
+			}
 		}
 		const cancel = (queue: PendingMessageQueue) =>
 			selector.id !== undefined

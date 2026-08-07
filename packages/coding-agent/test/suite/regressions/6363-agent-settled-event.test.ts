@@ -342,6 +342,113 @@ describe("regression #6363: agent settled event and idle waiting", () => {
 		expect(getUserTexts(harness)).toEqual(["start"]);
 	});
 
+	it("rejects continuations and cancellation requests from a different generation", async () => {
+		const harness = await createHarness();
+		harnesses.push(harness);
+
+		await harness.session.abort();
+		expect(harness.session.agent.currentContinuationGeneration).toBe(1);
+		await expect(
+			harness.session.followUp("stale work", undefined, {
+				id: "stale-generation",
+				idempotencyKey: "stale-generation",
+				cancelGeneration: 0,
+			}),
+		).rejects.toThrow("does not match current generation");
+		expect(() => harness.session.cancelContinuation({ generation: 2 })).toThrow(
+			"cannot cancel future continuation generation",
+		);
+	});
+
+	it("keeps an exact continuation prompt until persistence acknowledges the leased message", async () => {
+		const harness = await createHarness();
+		harnesses.push(harness);
+		const continuation = await harness.session.followUpWithSystemPrompt(
+			"resume Room work",
+			"room prompt revision 7",
+			undefined,
+			{
+				id: "room-resume",
+				idempotencyKey: "room-resume",
+				notBefore: Date.now() + 10_000,
+				maxAttempts: 2,
+			},
+		);
+		const internal = harness.session as unknown as {
+			_systemPromptByContinuationId: Map<string, string>;
+			_resetPerRunSystemPrompt(): void;
+		};
+
+		harness.session.agent.onContinuationsLeased?.([continuation]);
+
+		expect(internal._systemPromptByContinuationId.get(continuation.id)).toBe("room prompt revision 7");
+		expect(harness.session.agent.state.systemPrompt).toBe("room prompt revision 7");
+		internal._resetPerRunSystemPrompt();
+		expect(internal._systemPromptByContinuationId.get(continuation.id)).toBe("room prompt revision 7");
+	});
+
+	it("advances the continuation cancellation generation exactly once when an active continuation is aborted", async () => {
+		let markStarted = () => {};
+		const started = new Promise<void>((resolve) => {
+			markStarted = resolve;
+		});
+		const abortableTool: AgentTool = {
+			name: "abortable-continuation",
+			label: "Abortable continuation",
+			description: "Wait for cancellation inside a queued continuation",
+			parameters: Type.Object({}),
+			execute: async (_toolCallId, _params, signal) => {
+				markStarted();
+				await new Promise<void>((resolve) => {
+					if (signal?.aborted) resolve();
+					else signal?.addEventListener("abort", () => resolve(), { once: true });
+				});
+				return { content: [{ type: "text", text: "cancelled" }], details: {} };
+			},
+		};
+		const harness = await createHarness({ tools: [abortableTool] });
+		harnesses.push(harness);
+		harness.setResponses([
+			fauxAssistantMessage("ready"),
+			fauxAssistantMessage(fauxToolCall("abortable-continuation", {}), { stopReason: "toolUse" }),
+		]);
+		await harness.session.prompt("start");
+
+		await harness.session.followUp("continue now", undefined, {
+			id: "active-continuation-abort",
+			idempotencyKey: "active-continuation-abort",
+			maxAttempts: 2,
+		});
+		await started;
+		const abortReceipt = await harness.session.abort();
+		await harness.session.waitForIdle();
+
+		expect(abortReceipt.generation).toBe(1);
+		expect(harness.session.agent.currentContinuationGeneration).toBe(1);
+		const receipt = harness.eventsOfType("agent_settled").at(-1)?.receipt;
+		expect(receipt).toMatchObject({
+			disposition: "aborted",
+			generation: 1,
+			continuations: { generation: 1 },
+		});
+		expect(receipt?.operationCounts).not.toHaveProperty("continuation_timer");
+	});
+
+	it("starts a new run scope at the current continuation cancellation generation", async () => {
+		const harness = await createHarness();
+		harnesses.push(harness);
+		await harness.session.abort();
+		harness.setResponses([fauxAssistantMessage("next generation")]);
+
+		await harness.session.prompt("start after abort");
+
+		const receipt = harness.eventsOfType("agent_settled").at(-1)?.receipt;
+		expect(receipt).toMatchObject({
+			generation: 1,
+			continuations: { generation: 1 },
+		});
+	});
+
 	it("extension command waitForIdle waits for session-level settlement", async () => {
 		let releaseTool = () => {};
 		const released = new Promise<void>((resolve) => {

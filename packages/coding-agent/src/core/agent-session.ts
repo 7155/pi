@@ -444,7 +444,10 @@ export class AgentSession {
 			for (const continuation of continuations) {
 				const systemPrompt = this._systemPromptByContinuationId.get(continuation.id);
 				if (systemPrompt === undefined) continue;
-				this._systemPromptByContinuationId.delete(continuation.id);
+				// Keep the exact prompt until the queued user message is durably
+				// persisted and its lease is acknowledged. A persistence failure
+				// releases the lease back to pending; deleting here would make that
+				// retry run with a different prompt and lose product context.
 				this._systemPromptOverride = systemPrompt;
 				this.agent.state.systemPrompt = systemPrompt;
 				break;
@@ -1236,9 +1239,6 @@ export class AgentSession {
 	private async _runAgentContinuation(): Promise<void> {
 		if (this._isAgentRunActive || !this.agent.hasQueuedMessages()) return;
 		const scope = this._beginCancelScope("continuation");
-		const unregisterTimer = this._registerCancelOperation("continuation-timer", "continuation_timer", () => {
-			this.agent.cancelActiveContinuationGeneration("user_abort");
-		});
 		const unregisterProvider = this._registerCancelOperation("provider", "provider", () => this.agent.abort());
 		this._isAgentRunActive = true;
 		let settleFailure: AgentSettleLifecycleError | undefined;
@@ -1249,7 +1249,6 @@ export class AgentSession {
 			if (error instanceof AgentSettleLifecycleError) settleFailure = error;
 			throw error;
 		} finally {
-			unregisterTimer();
 			unregisterProvider();
 			this._resetPerRunSystemPrompt();
 			this._flushPendingBashMessages();
@@ -1285,6 +1284,8 @@ export class AgentSession {
 			scopeId,
 			runId,
 			sessionId: this.sessionId,
+			generation:
+				kind === "prompt" || kind === "continuation" ? this.agent.currentContinuationGeneration : undefined,
 			kind,
 		});
 		if (kind === "prompt" || kind === "continuation") this._activeRunId = runId;

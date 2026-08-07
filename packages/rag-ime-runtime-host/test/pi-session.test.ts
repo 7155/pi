@@ -476,6 +476,7 @@ describe("per-turn Provider context lifecycle", () => {
 			dispatchId: "dispatch:1",
 			rootId: "root:1",
 			generation: 2,
+			dispatchAttempt: 3,
 		});
 
 		expect(followUpWithSystemPrompt).toHaveBeenCalledOnce();
@@ -493,7 +494,9 @@ describe("per-turn Provider context lifecycle", () => {
 			undefined,
 			{
 				correlationId: "root:1",
-				idempotencyKey: "dispatch:1",
+				idempotencyKey: "dispatch:1:runtime-attempt:3",
+				origin: "room_dispatch",
+				maxAttempts: 2,
 			},
 		]);
 		expect(result).toEqual({
@@ -861,6 +864,12 @@ describe("managed Room runtime turn identity", () => {
 			continuationId: "continuation:retry",
 		});
 		expect(turnIdObservedByFollowUp).toBe(receipt.turnId);
+		expect(followUp).toHaveBeenCalledWith("retry bounded Room work", undefined, {
+			correlationId: "root:continuation",
+			idempotencyKey: "dispatch:continuation-retry:runtime-attempt:3",
+			origin: "room_dispatch",
+			maxAttempts: 2,
+		});
 		expect(mutable.activeRoom).toMatchObject({
 			dispatchId: "dispatch:continuation-retry",
 			dispatchAttempt: 3,

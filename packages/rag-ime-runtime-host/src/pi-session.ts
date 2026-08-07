@@ -1777,6 +1777,7 @@ export class PiProductSession implements PooledSession {
 		dispatchId: string;
 		rootId: string;
 		generation: number;
+		dispatchAttempt: number;
 	}): Promise<Record<string, unknown>> {
 		const turnId = this.activeTurn?.turnId;
 		if (!turnId) {
@@ -1784,7 +1785,15 @@ export class PiProductSession implements PooledSession {
 		}
 		const continuationOptions = {
 			correlationId: options.rootId,
-			idempotencyKey: options.dispatchId,
+			// Dispatch identity is stable across PAW retries, while an execution
+			// attempt is replaceable. Keying only by dispatchId would deduplicate a
+			// new retry against a terminal continuation from an earlier attempt.
+			idempotencyKey: `${options.dispatchId}:runtime-attempt:${options.dispatchAttempt}`,
+			origin: "room_dispatch",
+			// One extra lease attempt closes the crash window between leasing the
+			// queued user message and persisting it. Once persistence acknowledges
+			// the message, Provider failures do not replay this continuation.
+			maxAttempts: 2,
 		};
 		const assembledContext = await this.productContextProvider.assemble({
 			stage: "continuation_resume",
@@ -1797,10 +1806,7 @@ export class PiProductSession implements PooledSession {
 					undefined,
 					continuationOptions,
 				)
-			: await this.session.followUp(options.message, undefined, {
-					...continuationOptions,
-					cancelGeneration: options.generation,
-				});
+			: await this.session.followUp(options.message, undefined, continuationOptions);
 		return { delivery: "followUp", turnId, continuationId: continuation.id };
 	}
 
