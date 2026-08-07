@@ -92,8 +92,8 @@ describe("ContinuationQueue", () => {
 		queue.enqueue(continuation({ id: "same-generation", idempotencyKey: "same-generation" }));
 		const [leased] = queue.drain({ now: 100, cancelGeneration: 0, limit: 1 });
 
-		expect(queue.complete(leased!.id)).toBe(true);
-		expect(queue.complete(leased!.id)).toBe(false);
+		expect(queue.complete(leased!.id, leased!.leaseId!)).toBe(true);
+		expect(queue.complete(leased!.id, leased!.leaseId!)).toBe(false);
 		expect(queue.cancelById(leased!.id, "too_late").cancelledIds).toEqual([]);
 		expect(queue.cancelGeneration(0, "generation_stopped").cancelledIds).toEqual(["same-generation"]);
 	});

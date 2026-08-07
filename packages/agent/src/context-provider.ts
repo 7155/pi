@@ -135,6 +135,15 @@ function canonicalJson(value: unknown): string {
 	return JSON.stringify(value) ?? "null";
 }
 
+/** Conservative fallback; product adapters may supply their model tokenizer. */
+export function estimateContextTokensConservatively(content: string): number {
+	let units = 0;
+	for (const character of content) {
+		units += (character.codePointAt(0) ?? 0) > 0x7f ? 1 : 0.25;
+	}
+	return Math.max(1, Math.ceil(units));
+}
+
 function validateDescriptor(descriptor: ContextProviderDescriptor): void {
 	const id = nonEmpty(descriptor.id, "provider id");
 	const version = nonEmpty(descriptor.version, "provider version");
@@ -165,7 +174,7 @@ function escapeAttribute(value: string): string {
 }
 
 function escapeContextBoundary(content: string): string {
-	return content.replace(/<\/pi-context>/giu, "&lt;/pi-context&gt;");
+	return content.replace(/<(?=\/?pi-context\b)/giu, "&lt;");
 }
 
 function renderContribution(providerId: string, revision: string, content: string): string {
@@ -203,7 +212,7 @@ export class ContextProviderPipeline {
 			ids.add(provider.descriptor.id);
 		}
 		this.providers = [...providers];
-		this.estimateTokens = options.estimateTokens ?? ((content) => Math.max(1, Math.ceil(content.length / 4)));
+		this.estimateTokens = options.estimateTokens ?? estimateContextTokensConservatively;
 		this.now = options.now ?? (() => Date.now());
 	}
 
@@ -214,6 +223,8 @@ export class ContextProviderPipeline {
 		const sessionId = nonEmpty(request.sessionId, "sessionId");
 		const runId = nonEmpty(request.runId, "runId");
 		if (!CONTEXT_STAGES.has(request.stage)) throw new Error(`invalid context stage: ${request.stage}`);
+		if (request.signal.aborted) throw request.signal.reason ?? new Error("context assembly aborted");
+		const assembledAtMs = finiteTimestamp(this.now(), "assembledAtMs");
 		const applicable = this.providers
 			.filter((provider) => provider.descriptor.stages.includes(request.stage))
 			.sort(
@@ -259,14 +270,16 @@ export class ContextProviderPipeline {
 					signal: request.signal,
 				});
 			} catch (error) {
+				if (request.signal.aborted) throw request.signal.reason ?? error;
 				if (descriptor.failureMode === "required") throw error;
 				omissions.push({
 					providerId: descriptor.id,
 					reason: "optional_error",
-					detail: error instanceof Error ? error.message : String(error),
+					detail: error instanceof Error ? error.name : "Error",
 				});
 				continue;
 			}
+			if (request.signal.aborted) throw request.signal.reason ?? new Error("context assembly aborted");
 			const content = contribution?.content.trim() ?? "";
 			if (!contribution || !content) {
 				if (descriptor.failureMode === "required")
@@ -280,14 +293,21 @@ export class ContextProviderPipeline {
 				if (contribution.expiresAtMs <= fetchedAtMs) {
 					throw new Error(`context provider ${descriptor.id} expiresAtMs must be later than fetchedAtMs`);
 				}
-				if (contribution.expiresAtMs <= this.now()) {
+				if (contribution.expiresAtMs <= assembledAtMs) {
 					if (descriptor.failureMode === "required")
 						throw new Error(`required context provider ${descriptor.id} returned expired content`);
 					omissions.push({ providerId: descriptor.id, reason: "expired" });
 					continue;
 				}
 			}
-			const measuredTokens = safeInteger(this.estimateTokens(content), `${descriptor.id}.measuredTokens`);
+			const contentHash = await sha256(content);
+			if (contribution.contentHash !== undefined && contribution.contentHash !== contentHash) {
+				throw new Error(`context provider ${descriptor.id} content hash mismatch`);
+			}
+			const revision = nonEmpty(contribution.revision, `${descriptor.id}.revision`);
+			const provenance = validateProvenance(descriptor.id, contribution.provenance);
+			const renderedBlock = renderContribution(descriptor.id, revision, content);
+			const measuredTokens = safeInteger(this.estimateTokens(renderedBlock), `${descriptor.id}.measuredTokens`);
 			const reportedTokens =
 				contribution.estimatedTokens === undefined
 					? 0
@@ -300,11 +320,6 @@ export class ContextProviderPipeline {
 				omissions.push({ providerId: descriptor.id, reason: "budget_exceeded" });
 				continue;
 			}
-			const contentHash = await sha256(content);
-			if (contribution.contentHash !== undefined && contribution.contentHash !== contentHash) {
-				throw new Error(`context provider ${descriptor.id} content hash mismatch`);
-			}
-			const revision = nonEmpty(contribution.revision, `${descriptor.id}.revision`);
 			const receipt: ContextContributionReceipt = {
 				providerId: descriptor.id,
 				providerVersion: descriptor.version,
@@ -317,11 +332,11 @@ export class ContextProviderPipeline {
 				contentHash,
 				fetchedAtMs,
 				expiresAtMs: contribution.expiresAtMs,
-				provenance: validateProvenance(descriptor.id, contribution.provenance),
+				provenance,
 			};
 			contributions.push(receipt);
 			const blocks = rendered.get(descriptor.placement) ?? [];
-			blocks.push(renderContribution(descriptor.id, revision, content));
+			blocks.push(renderedBlock);
 			rendered.set(descriptor.placement, blocks);
 			remaining -= estimatedTokens;
 		}
@@ -342,7 +357,7 @@ export class ContextProviderPipeline {
 			estimatedTokens,
 			contributions,
 			omissions,
-			assembledAtMs: this.now(),
+			assembledAtMs,
 		};
 		return {
 			byPlacement,

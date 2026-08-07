@@ -142,7 +142,8 @@ export type AgentContinuation = ContinuationEnvelope<AgentMessage>;
 
 class PendingMessageQueue {
 	private readonly queue = new ContinuationQueue<AgentMessage>();
-	private readonly leased = new Map<string, string | undefined>();
+	private readonly activeLeases = new Map<string, { leaseId: string; message: AgentMessage }>();
+	private readonly leaseByMessage = new WeakMap<object, { id: string; leaseId: string }>();
 	private timer?: ReturnType<typeof setTimeout>;
 	public mode: QueueMode;
 	private readonly kind: "steer" | "follow_up";
@@ -203,14 +204,22 @@ class PendingMessageQueue {
 			cancelGeneration: this.getGeneration(),
 			limit: this.mode === "all" ? Number.MAX_SAFE_INTEGER : 1,
 		});
-		for (const item of leased) this.leased.set(item.id, item.leaseId);
+		for (const item of leased) {
+			if (!item.leaseId) throw new Error(`leased continuation is missing leaseId: ${item.id}`);
+			this.activeLeases.set(item.id, { leaseId: item.leaseId, message: item.payload });
+			this.leaseByMessage.set(item.payload as object, { id: item.id, leaseId: item.leaseId });
+		}
 		if (leased.length > 0) this.onLease(leased);
 		this.schedule();
 		return leased.map((item) => item.payload);
 	}
 
 	clear(): void {
-		for (const item of this.queue.snapshot().items) this.queue.cancelById(item.id, "queue_cleared");
+		const cancelledIds: string[] = [];
+		for (const item of this.queue.snapshot().items) {
+			cancelledIds.push(...this.queue.cancelById(item.id, "queue_cleared").cancelledIds);
+		}
+		this.forgetLeases(cancelledIds);
 		this.schedule();
 	}
 
@@ -222,31 +231,52 @@ class PendingMessageQueue {
 		return this.queue.hasReady({ now, cancelGeneration: this.getGeneration() });
 	}
 
-	settleLeases(failureReason?: string): void {
-		for (const [id, leaseId] of this.leased) {
-			if (failureReason) this.queue.release(id, leaseId, failureReason);
-			else this.queue.complete(id, leaseId);
+	acknowledgeMessage(message: AgentMessage): boolean {
+		const lease = this.leaseByMessage.get(message as object);
+		if (!lease) return false;
+		this.leaseByMessage.delete(message as object);
+		this.activeLeases.delete(lease.id);
+		const completed = this.queue.complete(lease.id, lease.leaseId);
+		this.schedule();
+		return completed;
+	}
+
+	releaseUnacknowledged(reason: string): void {
+		for (const [id, lease] of this.activeLeases) {
+			this.queue.release(id, lease.leaseId, reason);
+			this.leaseByMessage.delete(lease.message as object);
 		}
-		this.leased.clear();
+		this.activeLeases.clear();
 		this.schedule();
 	}
 
 	cancelById(id: string, reason: string): ContinuationCancelReceipt {
 		const receipt = this.queue.cancelById(id, reason);
+		this.forgetLeases(receipt.cancelledIds);
 		this.schedule();
 		return receipt;
 	}
 
 	cancelCorrelation(correlationId: string, reason: string): ContinuationCancelReceipt {
 		const receipt = this.queue.cancelCorrelation(correlationId, reason);
+		this.forgetLeases(receipt.cancelledIds);
 		this.schedule();
 		return receipt;
 	}
 
 	cancelGeneration(generation: number, reason: string): ContinuationCancelReceipt {
 		const receipt = this.queue.cancelGeneration(generation, reason);
+		this.forgetLeases(receipt.cancelledIds);
 		this.schedule();
 		return receipt;
+	}
+
+	private forgetLeases(ids: readonly string[]): void {
+		for (const id of ids) {
+			const lease = this.activeLeases.get(id);
+			if (lease) this.leaseByMessage.delete(lease.message as object);
+			this.activeLeases.delete(id);
+		}
 	}
 
 	private schedule(): void {
@@ -325,6 +355,8 @@ export class Agent {
 	public onContinuationReady?: () => void;
 	/** Runtime hook invoked after exact continuation envelopes are leased, before Provider context is captured. */
 	public onContinuationsLeased?: (continuations: AgentContinuation[]) => void;
+	/** Coding Agent switches this to explicit so SessionManager persistence owns acknowledgement. */
+	public continuationAcknowledgementMode: "after_listeners" | "explicit" = "after_listeners";
 
 	constructor(options: AgentOptions = {}) {
 		this._state = createMutableAgentState(options.initialState);
@@ -426,6 +458,15 @@ export class Agent {
 		return [...this.steeringQueue.snapshot(), ...this.followUpQueue.snapshot()].sort(
 			(left, right) => left.createdAt - right.createdAt || left.id.localeCompare(right.id),
 		);
+	}
+
+	acknowledgeContinuationMessage(message: AgentMessage): boolean {
+		return this.steeringQueue.acknowledgeMessage(message) || this.followUpQueue.acknowledgeMessage(message);
+	}
+
+	releaseUnacknowledgedContinuations(reason: string): void {
+		this.steeringQueue.releaseUnacknowledged(reason);
+		this.followUpQueue.releaseUnacknowledged(reason);
 	}
 
 	cancelContinuation(
@@ -675,14 +716,11 @@ export class Agent {
 		try {
 			await executor(abortController.signal);
 		} catch (error) {
-			failureReason = abortController.signal.aborted
-				? "run_aborted"
-				: error instanceof Error
-					? error.message
-					: String(error);
+			failureReason = abortController.signal.aborted ? "run_aborted" : "run_failed";
 			await this.handleRunFailure(error, abortController.signal.aborted);
 		} finally {
-			this.finishRun(failureReason);
+			this.releaseUnacknowledgedContinuations(failureReason ?? "continuation_not_persisted");
+			this.finishRun();
 		}
 	}
 
@@ -704,12 +742,7 @@ export class Agent {
 		await this.processEvents({ type: "agent_end", messages: [failureMessage] });
 	}
 
-	private finishRun(failureReason?: string): void {
-		// A continuation becomes terminal only after the run that consumed it
-		// reached the final agent_end/listener boundary. A failed run releases
-		// the lease while its retry budget remains.
-		this.steeringQueue.settleLeases(failureReason);
-		this.followUpQueue.settleLeases(failureReason);
+	private finishRun(): void {
 		this._state.isStreaming = false;
 		this._state.streamingMessage = undefined;
 		this._state.pendingToolCalls = new Set<string>();
@@ -770,6 +803,9 @@ export class Agent {
 		}
 		for (const listener of this.listeners) {
 			await listener(event, signal);
+		}
+		if (event.type === "message_end" && this.continuationAcknowledgementMode === "after_listeners") {
+			this.acknowledgeContinuationMessage(event.message);
 		}
 	}
 }

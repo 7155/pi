@@ -12,9 +12,12 @@ function receipt(receiptId: string, disposition: AgentSettledReceiptV2["disposit
 		generation: 0,
 		disposition,
 		stopReason: disposition === "suspended" ? "continuation_scheduled" : "natural",
-		transcript: { messageCount: 1, entryCount: 1, contentHash: "a".repeat(64) },
+		transcript: { messageCount: 1, entryCount: 1, lineageHash: "a".repeat(64), contentHash: "a".repeat(64) },
 		continuations: {
+			generation: 0,
 			pendingIds: disposition === "suspended" ? ["continuation-1"] : [],
+			readyIds: [],
+			scheduledIds: disposition === "suspended" ? ["continuation-1"] : [],
 			leasedIds: [],
 			terminalIds: [],
 			terminalIdsOmitted: 0,
@@ -80,5 +83,30 @@ describe("TurnSettlementTracker", () => {
 		tracker.record({ turnId: "turn-1" }, receipt("suspended", "suspended"));
 		const mismatched = { ...receipt("terminal", "completed"), runId: "another-run" };
 		expect(() => tracker.record({ turnId: "turn-1" }, mismatched)).toThrow("changed runId");
+	});
+
+	it("ignores an older reconnect replay and validates the client message identity", () => {
+		const tracker = new TurnSettlementTracker("session-1", "pi-session-1");
+		tracker.record(
+			{ turnId: "turn-1", clientMessageId: "client-1" },
+			{ ...receipt("newer", "suspended"), settledAtMs: 20 },
+		);
+		const value = tracker.record(
+			{ turnId: "turn-1", clientMessageId: "client-1" },
+			{ ...receipt("older", "completed"), settledAtMs: 10 },
+		);
+		expect(value.receipt.receiptId).toBe("newer");
+		expect(() => tracker.get("turn-1", "client-2")).toThrow("clientMessageId");
+	});
+
+	it("caps settlement waiters", async () => {
+		const tracker = new TurnSettlementTracker("session-1", "pi-session-1", {
+			maxWaiters: 2,
+			maxWaitersPerTurn: 1,
+		});
+		const first = tracker.wait("turn-1", { timeoutMs: 1_000 });
+		await expect(tracker.wait("turn-1", { timeoutMs: 1_000 })).rejects.toThrow("too many");
+		tracker.record({ turnId: "turn-1" }, receipt("terminal", "completed"));
+		await expect(first).resolves.toMatchObject({ receipt: { receiptId: "terminal" } });
 	});
 });

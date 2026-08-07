@@ -748,10 +748,18 @@ export class RagImeRuntimeHost {
 			}
 			case "session.control_state":
 				return this.session(params).controlState();
+			case "session.settlement.get":
+				return {
+					settlement: this.session(params).settlement(
+						requiredString(params, "turnId", 240),
+						optionalString(params, "clientMessageId", 128),
+					),
+				};
 			case "session.await_settled":
 				return await this.session(params).awaitSettled(requiredString(params, "turnId", 240), {
 					allowSuspended: optionalBoolean(params, "allowSuspended"),
 					timeoutMs: params.timeoutMs === undefined ? undefined : requiredNonNegativeInteger(params, "timeoutMs"),
+					expectedClientMessageId: optionalString(params, "clientMessageId", 128),
 				});
 			case "session.snapshot":
 				return this.session(params).snapshot();

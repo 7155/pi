@@ -369,6 +369,7 @@ export class AgentSession {
 	private _cancelOperationCounts = new Map<string, number>();
 	private _toolCancelUnregister = new Map<string, () => void>();
 	private _lastSettledReceipt: AgentSettledReceipt | undefined;
+	private _settlementObserversActive = false;
 
 	// Bash execution state
 	private _bashAbortController: AbortController | undefined = undefined;
@@ -428,6 +429,9 @@ export class AgentSession {
 		this._baseToolsOverride = config.baseToolsOverride;
 		this._sessionStartEvent = config.sessionStartEvent ?? { type: "session_start", reason: "startup" };
 
+		// SessionManager persistence, rather than Provider completion, owns the
+		// acknowledgement boundary for queued user messages.
+		this.agent.continuationAcknowledgementMode = "explicit";
 		// Always subscribe to agent events for internal handling
 		// (session persistence, extensions, auto-compaction, retry logic)
 		this._unsubscribeAgent = this.agent.subscribe(this._handleAgentEvent);
@@ -651,15 +655,32 @@ export class AgentSession {
 
 	private async _emitAgentSettled(receipt: AgentSettledReceipt): Promise<void> {
 		this._settlementEmissionPending = true;
-		this._isAgentRunActive = false;
 		this._lastSettledReceipt = receipt;
 		if (receipt.disposition !== "suspended") this._activeRunId = undefined;
 		try {
-			await this._extensionRunner.emit({ type: "agent_settled", receipt });
+			this._settlementObserversActive = true;
+			try {
+				await this._extensionRunner.emit({ type: "agent_settled", receipt });
+			} catch (error) {
+				this._extensionRunner.emitError({
+					extensionPath: "<agent-settled-observer>",
+					event: "agent_settled",
+					error: error instanceof Error ? error.message : String(error),
+				});
+			} finally {
+				this._settlementObserversActive = false;
+				this._isAgentRunActive = false;
+			}
 			this._emit({ type: "agent_settled", receipt });
 		} finally {
 			this._settlementEmissionPending = false;
 			this._resolveIdleWaitIfIdle();
+		}
+	}
+
+	private _assertSettlementAdmissionOpen(): void {
+		if (this._settlementObserversActive) {
+			throw new Error("Cannot start or queue Agent work from an agent_settled observer");
 		}
 	}
 
@@ -743,6 +764,10 @@ export class AgentSession {
 				this.sessionManager.appendMessage(event.message);
 			}
 			// Other message types (bashExecution, compactionSummary, branchSummary) are persisted elsewhere
+
+			// The exact queued message is acknowledged only after the persistence
+			// call above completed successfully.
+			this.agent.acknowledgeContinuationMessage(event.message);
 
 			// Track assistant message for auto-compaction (checked on agent_end)
 			if (event.message.role === "assistant") {
@@ -1199,9 +1224,9 @@ export class AgentSession {
 			this._resetPerRunSystemPrompt();
 			this._flushPendingBashMessages();
 			const receipt = await this._settledReceipt(scope, settleFailure?.message);
+			if (this._cancelScope === scope) this._cancelScope = undefined;
 			if (settleFailure) this._emitAgentSettleFailed(settleFailure, receipt);
 			else await this._emitAgentSettled(receipt);
-			if (this._cancelScope === scope) this._cancelScope = undefined;
 		}
 	}
 
@@ -1226,9 +1251,9 @@ export class AgentSession {
 			this._resetPerRunSystemPrompt();
 			this._flushPendingBashMessages();
 			const receipt = await this._settledReceipt(scope, settleFailure?.message);
+			if (this._cancelScope === scope) this._cancelScope = undefined;
 			if (settleFailure) this._emitAgentSettleFailed(settleFailure, receipt);
 			else await this._emitAgentSettled(receipt);
-			if (this._cancelScope === scope) this._cancelScope = undefined;
 		}
 	}
 
@@ -1292,6 +1317,7 @@ export class AgentSession {
 	}
 
 	private async _settledReceipt(scope: RunScope, settleError?: string): Promise<AgentSettledReceipt> {
+		scope.seal();
 		const entries = this.sessionManager.getEntries();
 		const message = this._findLastAssistantMessage();
 		return await createAgentSettledReceipt({
@@ -1300,10 +1326,12 @@ export class AgentSession {
 			message: message as unknown as Record<string, unknown> | undefined,
 			transcript: {
 				messageCount: this.agent.state.messages.length,
-				entryIds: entries.map((entry) => entry.id),
+				entryCount: entries.length,
 				leafId: this.sessionManager.getLeafId() ?? undefined,
+				lastEntryId: entries.at(-1)?.id,
 			},
 			continuations: this.agent.listContinuations(),
+			continuationGeneration: this.agent.currentContinuationGeneration,
 			operationCounts: Object.fromEntries(this._cancelOperationCounts),
 			settleError,
 		});
@@ -1391,6 +1419,7 @@ export class AgentSession {
 	 * @throws Error if no model selected or no API key available (when not streaming)
 	 */
 	async prompt(text: string, options?: PromptOptions): Promise<void> {
+		this._assertSettlementAdmissionOpen();
 		const expandPromptTemplates = options?.expandPromptTemplates ?? true;
 		const preflightResult = options?.preflightResult;
 		let messages: AgentMessage[] | undefined;
@@ -1617,6 +1646,7 @@ export class AgentSession {
 	 * @throws Error if text is an extension command
 	 */
 	async steer(text: string, images?: ImageContent[], continuation?: ContinuationOptions): Promise<AgentContinuation> {
+		this._assertSettlementAdmissionOpen();
 		// Check for extension commands (cannot be queued)
 		if (text.startsWith("/")) {
 			this._throwIfExtensionCommand(text);
@@ -1641,6 +1671,7 @@ export class AgentSession {
 		images?: ImageContent[],
 		continuation?: ContinuationOptions,
 	): Promise<AgentContinuation> {
+		this._assertSettlementAdmissionOpen();
 		// Check for extension commands (cannot be queued)
 		if (text.startsWith("/")) {
 			this._throwIfExtensionCommand(text);
@@ -1776,6 +1807,7 @@ export class AgentSession {
 		message: Pick<CustomMessage<T>, "customType" | "content" | "display" | "details">,
 		options?: { triggerTurn?: boolean; deliverAs?: "steer" | "followUp" | "nextTurn" },
 	): Promise<void> {
+		this._assertSettlementAdmissionOpen();
 		const appMessage = {
 			role: "custom" as const,
 			customType: message.customType,

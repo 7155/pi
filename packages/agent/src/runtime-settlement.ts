@@ -12,6 +12,7 @@ export type AgentRunStopReason =
 	| "error"
 	| "cancelled"
 	| "continuation_scheduled"
+	| "continuation_unsettled"
 	| "settlement_rejected"
 	| "operations_pending";
 
@@ -37,15 +38,21 @@ export interface AgentTranscriptReceipt {
 	messageCount: number;
 	entryCount: number;
 	leafId?: string;
-	sessionFile?: string;
+	lastEntryId?: string;
+	lineageHash: string;
+	/** Compatibility alias for the first V2 draft. */
 	contentHash: string;
 }
 
 export interface AgentContinuationSettlement {
+	generation: number;
 	pendingIds: string[];
+	readyIds: string[];
+	scheduledIds: string[];
 	leasedIds: string[];
 	terminalIds: string[];
 	terminalIdsOmitted: number;
+	nextScheduledAt?: number;
 	idsHash: string;
 	counts: Record<ContinuationState, number>;
 }
@@ -100,11 +107,12 @@ export interface CreateAgentSettledReceiptInput<TPayload = unknown> {
 	message?: AgentSettlementMessageInput;
 	transcript: {
 		messageCount: number;
-		entryIds: string[];
+		entryCount: number;
 		leafId?: string;
-		sessionFile?: string;
+		lastEntryId?: string;
 	};
 	continuations: ContinuationEnvelope<TPayload>[];
+	continuationGeneration: number;
 	/** Total registrations observed during the run, not only operations still pending. */
 	operationCounts?: Record<string, number>;
 	settleError?: string;
@@ -150,6 +158,7 @@ function canonicalJson(value: unknown): string {
 
 async function continuationSettlement<TPayload>(
 	items: readonly ContinuationEnvelope<TPayload>[],
+	options: { generation: number; settledAtMs: number },
 ): Promise<AgentContinuationSettlement> {
 	const counts: Record<ContinuationState, number> = {
 		pending: 0,
@@ -160,23 +169,38 @@ async function continuationSettlement<TPayload>(
 		failed: 0,
 	};
 	const pendingIds: string[] = [];
+	const readyIds: string[] = [];
+	const scheduledIds: string[] = [];
 	const leasedIds: string[] = [];
 	const terminalIds: string[] = [];
+	let nextScheduledAt: number | undefined;
 	for (const item of items) {
 		counts[item.state] += 1;
-		if (item.state === "pending") pendingIds.push(item.id);
-		else if (item.state === "leased") leasedIds.push(item.id);
+		if (item.state === "pending") {
+			pendingIds.push(item.id);
+			const staleGeneration = item.cancelGeneration !== options.generation;
+			const deadlineExpired = item.deadline !== undefined && item.deadline < options.settledAtMs;
+			const delayed = item.notBefore !== undefined && item.notBefore > options.settledAtMs;
+			if (!staleGeneration && !deadlineExpired && delayed) {
+				scheduledIds.push(item.id);
+				if (nextScheduledAt === undefined || item.notBefore! < nextScheduledAt) nextScheduledAt = item.notBefore;
+			} else {
+				readyIds.push(item.id);
+			}
+		} else if (item.state === "leased") leasedIds.push(item.id);
 		else terminalIds.push(item.id);
 	}
-	pendingIds.sort();
-	leasedIds.sort();
-	terminalIds.sort();
+	for (const values of [pendingIds, readyIds, scheduledIds, leasedIds, terminalIds]) values.sort();
 	return {
+		generation: options.generation,
 		pendingIds: pendingIds.slice(0, CONTINUATION_ID_PREVIEW_LIMIT),
+		readyIds: readyIds.slice(0, CONTINUATION_ID_PREVIEW_LIMIT),
+		scheduledIds: scheduledIds.slice(0, CONTINUATION_ID_PREVIEW_LIMIT),
 		leasedIds: leasedIds.slice(0, CONTINUATION_ID_PREVIEW_LIMIT),
 		terminalIds: terminalIds.slice(-CONTINUATION_ID_PREVIEW_LIMIT),
 		terminalIdsOmitted: Math.max(0, terminalIds.length - CONTINUATION_ID_PREVIEW_LIMIT),
-		idsHash: await sha256(canonicalJson({ pendingIds, leasedIds, terminalIds })),
+		nextScheduledAt,
+		idsHash: await sha256(canonicalJson({ pendingIds, readyIds, scheduledIds, leasedIds, terminalIds })),
 		counts,
 	};
 }
@@ -223,14 +247,20 @@ export async function createAgentSettledReceipt<TPayload = unknown>(
 ): Promise<AgentSettledReceiptV2> {
 	const sessionId = nonEmpty(input.sessionId, "sessionId");
 	if (input.scope.sessionId !== sessionId) throw new Error("run scope belongs to a different Session");
+	if (!input.scope.sealed) throw new Error("run scope must be sealed before settlement");
 	const runId = nonEmpty(input.runId?.trim() || input.scope.runId, "runId");
 	const settledAtMs = input.settledAtMs ?? Date.now();
 	if (!Number.isFinite(settledAtMs) || settledAtMs < 0) throw new Error("settledAtMs must be non-negative");
 
+	const continuationGeneration = nonNegativeInteger(input.continuationGeneration, "continuationGeneration");
 	const messageCount = nonNegativeInteger(input.transcript.messageCount, "transcript.messageCount");
-	const entryIds = input.transcript.entryIds.map((id) => nonEmpty(id, "transcript entry id"));
-	if (new Set(entryIds).size !== entryIds.length) throw new Error("transcript entry IDs must be unique");
-	const continuations = await continuationSettlement(input.continuations);
+	const entryCount = nonNegativeInteger(input.transcript.entryCount, "transcript.entryCount");
+	const leafId = text(input.transcript.leafId);
+	const lastEntryId = text(input.transcript.lastEntryId);
+	const continuations = await continuationSettlement(input.continuations, {
+		generation: continuationGeneration,
+		settledAtMs,
+	});
 	const messageStopReason = text(input.message?.stopReason);
 	const messageError = text(input.message?.errorMessage);
 	const settleError = text(input.settleError);
@@ -238,9 +268,12 @@ export async function createAgentSettledReceipt<TPayload = unknown>(
 	const pendingByKind = countsByKind(pendingRuntimeOperations);
 	const registeredByKind = normalizedRegisteredCounts(pendingByKind, input.operationCounts);
 	const pendingOperations = pendingRuntimeOperations.length;
-	const suspended = continuations.counts.pending > 0 || continuations.counts.leased > 0;
+	const continuationUnsettled = continuations.readyIds.length > 0 || continuations.leasedIds.length > 0;
+	const suspended = continuations.scheduledIds.length > 0 && !continuationUnsettled;
 	const aborted = input.scope.cancelled || messageStopReason === "aborted";
-	const failed = Boolean(settleError || messageError || messageStopReason === "error" || pendingOperations > 0);
+	const failed = Boolean(
+		settleError || messageError || messageStopReason === "error" || pendingOperations > 0 || continuationUnsettled,
+	);
 	const disposition: AgentRunDisposition = aborted
 		? "aborted"
 		: failed
@@ -254,11 +287,13 @@ export async function createAgentSettledReceipt<TPayload = unknown>(
 			? "cancelled"
 			: pendingOperations > 0
 				? "operations_pending"
-				: messageError || messageStopReason === "error"
-					? "error"
-					: suspended
-						? "continuation_scheduled"
-						: "natural";
+				: continuationUnsettled
+					? "continuation_unsettled"
+					: messageError || messageStopReason === "error"
+						? "error"
+						: suspended
+							? "continuation_scheduled"
+							: "natural";
 
 	const finalMessage = input.message
 		? {
@@ -271,18 +306,14 @@ export async function createAgentSettledReceipt<TPayload = unknown>(
 				usage: normalizedUsage(input.message.usage),
 			}
 		: undefined;
+	const lineageHash = await sha256(canonicalJson({ messageCount, entryCount, leafId, lastEntryId }));
 	const transcript: AgentTranscriptReceipt = {
 		messageCount,
-		entryCount: entryIds.length,
-		leafId: text(input.transcript.leafId),
-		sessionFile: text(input.transcript.sessionFile),
-		contentHash: await sha256(
-			canonicalJson({
-				messageCount,
-				entryIds,
-				leafId: text(input.transcript.leafId),
-			}),
-		),
+		entryCount,
+		leafId,
+		lastEntryId,
+		lineageHash,
+		contentHash: lineageHash,
 	};
 	const operations: AgentOperationSettlement = {
 		pending: pendingOperations,

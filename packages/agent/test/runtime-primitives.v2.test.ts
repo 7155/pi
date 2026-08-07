@@ -24,22 +24,33 @@ describe("ContinuationQueue v2 leases", () => {
 		const queue = new ContinuationQueue<string>({ createLeaseId: () => "lease-1", now: () => 100 });
 		queue.enqueue(continuation());
 		const [leased] = queue.drain({ now: 100, cancelGeneration: 0, limit: 1 });
+		expect(leased?.leaseId).toBe("lease-1");
 		expect(leased).toMatchObject({ state: "leased", leaseId: "lease-1", attempt: 1 });
 		expect(queue.snapshot().items[0]).toMatchObject({ state: "leased", leaseId: "lease-1" });
 		expect(queue.complete(leased!.id, "wrong-lease")).toBe(false);
-		expect(queue.complete(leased!.id, leased!.leaseId)).toBe(true);
+		expect(queue.complete(leased!.id, leased!.leaseId!)).toBe(true);
 	});
 
 	it("releases a failed run back to pending while budget remains", () => {
 		const queue = new ContinuationQueue<string>({ createLeaseId: () => "lease-1" });
 		queue.enqueue(continuation());
 		const [leased] = queue.drain({ now: 100, cancelGeneration: 0, limit: 1 });
-		expect(queue.release(leased!.id, leased!.leaseId, "provider_failed")).toEqual({
+		expect(leased?.leaseId).toBe("lease-1");
+		expect(queue.release(leased!.id, leased!.leaseId!, "provider_failed")).toEqual({
 			released: true,
 			terminal: false,
 			state: "pending",
 		});
 		expect(queue.snapshot().items[0]).toMatchObject({ state: "pending", attempt: 1, lastFailure: "provider_failed" });
+	});
+
+	it("rejects ID-only or stale lease settlement", () => {
+		const queue = new ContinuationQueue<string>({ createLeaseId: () => "lease-current" });
+		queue.enqueue(continuation());
+		const [leased] = queue.drain({ now: 100, cancelGeneration: 0, limit: 1 });
+		expect(() => queue.complete(leased!.id, undefined as unknown as string)).toThrow("leaseId");
+		expect(() => queue.release(leased!.id, undefined as unknown as string, "late_worker")).toThrow("leaseId");
+		expect(queue.snapshot().items[0]).toMatchObject({ state: "leased", leaseId: "lease-current" });
 	});
 
 	it("restores a persisted leased continuation and recovers an abandoned lease once", () => {
@@ -61,10 +72,24 @@ describe("ContinuationQueue v2 leases", () => {
 	});
 
 	it("preserves FIFO order for continuations with the same priority and timestamp", () => {
-		const queue = new ContinuationQueue<string>({ createLeaseId: () => "lease" });
+		let leaseSequence = 0;
+		const queue = new ContinuationQueue<string>({ createLeaseId: () => `lease-${++leaseSequence}` });
 		queue.enqueue(continuation({ id: "b", idempotencyKey: "b" }));
 		queue.enqueue(continuation({ id: "a", idempotencyKey: "a" }));
 		expect(queue.drain({ now: 100, cancelGeneration: 0, limit: 2 }).map((item) => item.id)).toEqual(["b", "a"]);
+	});
+
+	it("validates every generated lease before mutating any selected continuation", () => {
+		const leaseIds = ["lease-1", ""];
+		const queue = new ContinuationQueue<string>({ createLeaseId: () => leaseIds.shift() ?? "" });
+		queue.enqueue(continuation({ id: "first", idempotencyKey: "first" }));
+		queue.enqueue(continuation({ id: "second", idempotencyKey: "second" }));
+
+		expect(() => queue.drain({ now: 100, cancelGeneration: 0, limit: 2 })).toThrow("empty leaseId");
+		expect(queue.snapshot().items).toEqual([
+			expect.objectContaining({ id: "first", state: "pending", attempt: 0 }),
+			expect.objectContaining({ id: "second", state: "pending", attempt: 0 }),
+		]);
 	});
 });
 
@@ -126,5 +151,16 @@ describe("RunScope", () => {
 					parent,
 				}),
 		).toThrow("parent Session");
+	});
+
+	it("seals settlement against late operations and ghost children", () => {
+		const parent = new RunScope({ scopeId: "parent", sessionId: "session-1", kind: "prompt" });
+		(parent as RunScope & { seal(): void }).seal();
+
+		expect(() => parent.register({ operationId: "late", kind: "tool", cancel: () => undefined })).toThrow(
+			"sealed scope",
+		);
+		expect(() => parent.child({ scopeId: "ghost", kind: "tool" })).toThrow("sealed scope");
+		expect(parent.snapshot().children).toEqual([]);
 	});
 });

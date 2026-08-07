@@ -1143,9 +1143,13 @@ export class PiProductSession implements PooledSession {
 
 	async awaitSettled(
 		turnId: string,
-		options: { allowSuspended?: boolean; timeoutMs?: number } = {},
+		options: { allowSuspended?: boolean; timeoutMs?: number; expectedClientMessageId?: string } = {},
 	): Promise<PiTurnSettlementReceipt> {
 		return await this.turnSettlements.wait(turnId, options);
+	}
+
+	settlement(turnId: string, expectedClientMessageId?: string): PiTurnSettlementReceipt | undefined {
+		return this.turnSettlements.get(turnId, expectedClientMessageId);
 	}
 
 	private telemetry(

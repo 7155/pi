@@ -442,4 +442,48 @@ describe("AgentSession queue characterization", () => {
 
 		expect(getUserTexts(harness)).toEqual(["hello", "conflict report"]);
 	});
+
+	it("acknowledges a queued user message after persistence even if its Provider call fails", async () => {
+		const waiting = await createWaitingHarness();
+		const { harness, waitForToolStart, promptPromise, releaseToolExecution } = waiting;
+		harnesses.push(harness);
+
+		harness.setResponses([
+			fauxAssistantMessage(fauxToolCall("wait", {}), { stopReason: "toolUse" }),
+			fauxAssistantMessage("original turn complete"),
+			() => {
+				throw new Error("queued Provider failed");
+			},
+		]);
+
+		await waitForToolStart;
+		const continuation = await harness.session.followUp("persist before Provider failure");
+		releaseToolExecution();
+		await promptPromise;
+
+		expect(getUserTexts(harness)).toContain("persist before Provider failure");
+		expect(harness.session.agent.listContinuations().find((item) => item.id === continuation.id)?.state).toBe(
+			"completed",
+		);
+	});
+
+	it("keeps agent_settled observers observation-only", async () => {
+		const harness = await createHarness({
+			extensionFactories: [
+				(pi: ExtensionAPI) => {
+					pi.on("agent_settled", () => {
+						pi.sendUserMessage("late work", { deliverAs: "followUp" });
+					});
+				},
+			],
+		});
+		harnesses.push(harness);
+		harness.setResponses([fauxAssistantMessage("done")]);
+
+		await harness.session.prompt("hello");
+		await new Promise((resolve) => setTimeout(resolve, 0));
+
+		expect(harness.session.agent.listContinuations()).toEqual([]);
+		expect(getUserTexts(harness)).toEqual(["hello"]);
+	});
 });

@@ -185,20 +185,31 @@ export class ContinuationQueue<TPayload = unknown> {
 		// same clock tick retain the queue's insertion order. Random continuation
 		// IDs are identity, not scheduling policy, and must not reorder user input.
 		eligible.sort((left, right) => right.priority - left.priority || left.createdAt - right.createdAt);
-		return eligible.slice(0, options.limit).map((item) => {
+		const selected = eligible.slice(0, options.limit);
+		const generatedLeaseIds = new Set<string>();
+		const leaseIds = selected.map((item) => {
+			const leaseId = this.createLeaseId().trim();
+			if (!leaseId) throw new Error(`lease generator returned an empty leaseId for ${item.id}`);
+			if (generatedLeaseIds.has(leaseId)) {
+				throw new Error(`lease generator returned a duplicate leaseId: ${leaseId}`);
+			}
+			generatedLeaseIds.add(leaseId);
+			return leaseId;
+		});
+		return selected.map((item, index) => {
 			item.state = "leased";
 			item.attempt += 1;
-			item.leaseId = this.createLeaseId();
+			item.leaseId = leaseIds[index]!;
 			item.leasedAt = options.now;
 			item.lastFailure = undefined;
 			return { ...item };
 		});
 	}
 
-	complete(id: string, leaseId?: string): boolean {
+	complete(id: string, leaseId: string): boolean {
+		if (!leaseId?.trim()) throw new Error("leaseId must be a non-empty string");
 		const item = this.items.get(id);
-		if (!item || item.state !== "leased") return false;
-		if (leaseId !== undefined && item.leaseId !== leaseId) return false;
+		if (!item || item.state !== "leased" || item.leaseId !== leaseId) return false;
 		item.state = "completed";
 		item.leaseId = undefined;
 		item.leasedAt = undefined;
@@ -212,12 +223,12 @@ export class ContinuationQueue<TPayload = unknown> {
 	 * The continuation returns to pending while budget remains; otherwise it
 	 * becomes terminally failed. The same idempotency key remains authoritative.
 	 */
-	release(id: string, leaseId: string | undefined, reason: string): ContinuationReleaseReceipt {
+	release(id: string, leaseId: string, reason: string): ContinuationReleaseReceipt {
+		if (!leaseId?.trim()) throw new Error("leaseId must be a non-empty string");
 		if (!reason.trim()) throw new Error("release reason must be a non-empty string");
 		const item = this.items.get(id);
-		if (!item || item.state !== "leased") return { released: false, terminal: false, state: item?.state };
-		if (leaseId !== undefined && item.leaseId !== leaseId) {
-			return { released: false, terminal: false, state: item.state };
+		if (!item || item.state !== "leased" || item.leaseId !== leaseId) {
+			return { released: false, terminal: false, state: item?.state };
 		}
 		item.lastFailure = reason;
 		item.leaseId = undefined;
@@ -240,7 +251,7 @@ export class ContinuationQueue<TPayload = unknown> {
 		}
 		const recovered: string[] = [];
 		for (const item of this.items.values()) {
-			if (item.state !== "leased" || item.leasedAt === undefined) continue;
+			if (item.state !== "leased" || item.leasedAt === undefined || !item.leaseId) continue;
 			if (item.leasedAt + options.leaseTimeoutMs > options.now) continue;
 			if (this.release(item.id, item.leaseId, options.reason ?? "lease_owner_lost").released) {
 				recovered.push(item.id);
@@ -331,6 +342,7 @@ export interface CancelScopeSnapshot {
 	scopeId: string;
 	generation: number;
 	cancelled: boolean;
+	sealed: boolean;
 	reason?: string;
 	operations: CancelOperationSnapshot[];
 }
@@ -359,6 +371,7 @@ export class CancelScope {
 	private cancelPromise?: Promise<CancelReceipt>;
 	private readonly operations = new Map<string, RegisteredCancelOperation>();
 	private drainWaiters = new Set<() => void>();
+	private scopeSealed = false;
 
 	constructor(options: CancelScopeOptions) {
 		if (!options.scopeId.trim()) throw new Error("scopeId must be a non-empty string");
@@ -376,8 +389,18 @@ export class CancelScope {
 		return this.currentGeneration;
 	}
 
+	get sealed(): boolean {
+		return this.scopeSealed;
+	}
+
+	/** Freeze the operation set before a settlement receipt is measured. */
+	seal(): void {
+		this.scopeSealed = true;
+	}
+
 	register(operation: CancelOperationRegistration): () => void {
 		if (this.signal.aborted) throw new Error("cannot register an operation on a cancelled scope");
+		if (this.scopeSealed) throw new Error("cannot register an operation on a sealed scope");
 		if (!operation.operationId.trim() || !operation.kind.trim()) {
 			throw new Error("operationId and kind must be non-empty strings");
 		}
@@ -398,6 +421,7 @@ export class CancelScope {
 	cancel(reason: string): Promise<CancelReceipt> {
 		if (!reason.trim()) throw new Error("cancel reason must be a non-empty string");
 		if (this.cancelPromise) return this.cancelPromise;
+		this.seal();
 		this.cancelReason = reason;
 		this.currentGeneration += 1;
 		this.controller.abort(reason);
@@ -452,6 +476,7 @@ export class CancelScope {
 			scopeId: this.scopeId,
 			generation: this.currentGeneration,
 			cancelled: this.signal.aborted,
+			sealed: this.scopeSealed,
 			reason: this.cancelReason,
 			operations: [...this.operations.values()].map(({ operationId, kind, registeredAt }) => ({
 				operationId,
@@ -529,7 +554,6 @@ export class RunScope extends CancelScope {
 		this.parent = options.parent;
 		if (this.parent) {
 			if (this.parent.children.has(this.scopeId)) throw new Error(`child scope already exists: ${this.scopeId}`);
-			this.parent.children.set(this.scopeId, this);
 			const unregister = this.parent.register({
 				operationId: `scope:${this.scopeId}`,
 				kind: `scope:${this.kind}`,
@@ -537,6 +561,7 @@ export class RunScope extends CancelScope {
 					return await this.cancel(reason);
 				},
 			});
+			this.parent.children.set(this.scopeId, this);
 			this.detachFromParent = () => {
 				unregister();
 				this.parent?.children.delete(this.scopeId);
@@ -557,6 +582,7 @@ export class RunScope extends CancelScope {
 
 	/** Detach a quiescent child after its owner has persisted settlement. */
 	settle(): void {
+		this.seal();
 		if (this.snapshot().operations.length > 0) throw new Error("cannot settle a scope with active operations");
 		if (this.children.size > 0) throw new Error("cannot settle a scope with active child scopes");
 		this.detachFromParent?.();
