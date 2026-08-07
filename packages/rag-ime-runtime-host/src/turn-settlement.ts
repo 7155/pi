@@ -9,6 +9,7 @@ export interface TurnSettlementIdentity {
 export interface PiTurnSettlementReceipt {
 	schemaVersion: "rag-ime.pi-turn-settlement.v1";
 	sessionId: string;
+	runtimeSessionId: string;
 	turnId: string;
 	clientMessageId?: string;
 	receipt: AgentSettledReceiptV2;
@@ -43,13 +44,15 @@ function terminal(receipt: AgentSettledReceiptV2): boolean {
  */
 export class TurnSettlementTracker {
 	private readonly sessionId: string;
+	private readonly runtimeSessionId: string;
 	private readonly limit: number;
 	private readonly byTurnId = new Map<string, PiTurnSettlementReceipt>();
 	private readonly waiters = new Map<string, Set<SettlementWaiter>>();
 	private disposed = false;
 
-	constructor(sessionId: string, options: { limit?: number } = {}) {
+	constructor(sessionId: string, runtimeSessionId: string, options: { limit?: number } = {}) {
 		this.sessionId = nonEmpty(sessionId, "sessionId");
+		this.runtimeSessionId = nonEmpty(runtimeSessionId, "runtimeSessionId");
 		this.limit = options.limit ?? 32;
 		if (!Number.isSafeInteger(this.limit) || this.limit < 1 || this.limit > 1_024) {
 			throw new Error("settlement tracker limit must be between 1 and 1024");
@@ -59,8 +62,11 @@ export class TurnSettlementTracker {
 	record(identity: TurnSettlementIdentity, receipt: AgentSettledReceiptV2): PiTurnSettlementReceipt {
 		if (this.disposed) throw new Error("settlement tracker is disposed");
 		const turnId = nonEmpty(identity.turnId, "turnId");
-		if (receipt.sessionId !== this.sessionId) {
-			throw new RuntimeProtocolError("SETTLED_RECEIPT_MISMATCH", "settled receipt belongs to another Session");
+		if (receipt.sessionId !== this.runtimeSessionId) {
+			throw new RuntimeProtocolError(
+				"SETTLED_RECEIPT_MISMATCH",
+				"settled receipt belongs to another runtime Session",
+			);
 		}
 		const existing = this.byTurnId.get(turnId);
 		const clientMessageId = identity.clientMessageId?.trim() || undefined;
@@ -92,6 +98,7 @@ export class TurnSettlementTracker {
 		const value: PiTurnSettlementReceipt = {
 			schemaVersion: "rag-ime.pi-turn-settlement.v1",
 			sessionId: this.sessionId,
+			runtimeSessionId: this.runtimeSessionId,
 			turnId,
 			clientMessageId,
 			receipt: structuredClone(receipt),

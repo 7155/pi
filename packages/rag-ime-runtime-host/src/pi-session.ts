@@ -483,7 +483,11 @@ export class PiProductSession implements PooledSession {
 		this.debugContextRecorder = debugContextRecorder;
 		this.providerContextJournal = providerContextJournal;
 		this.productContextProvider = productContextProvider;
-		this.turnSettlements = new TurnSettlementTracker(options.externalSessionId);
+		// The product Session survives Runtime upgrades while Pi's append-only
+		// transcript has its own durable identity. Keep both identities explicit:
+		// the outer Turn receipt belongs to the product Session and the nested
+		// Agent receipt remains cryptographically bound to the Pi transcript.
+		this.turnSettlements = new TurnSettlementTracker(options.externalSessionId, session.sessionId);
 		this.backendBridge = backendBridge;
 		this.emitEvent = options.emitEvent;
 		const inheritedStopPolicy = session.agent.shouldStopAfterTurn;

@@ -163,6 +163,7 @@ describe("Room runtime RPC", () => {
 			awaitSettled: vi.fn(async (turnId: string) => ({
 				schemaVersion: "rag-ime.pi-turn-settlement.v1" as const,
 				sessionId: "session:target",
+				runtimeSessionId: "pi-session:target",
 				turnId,
 				receipt: {
 					schemaVersion: "pi.agent-settled.v2" as const,
@@ -234,6 +235,7 @@ describe("Room runtime RPC", () => {
 			expect(settled).toMatchObject({
 				schemaVersion: "rag-ime.pi-turn-settlement.v1",
 				sessionId: "session:target",
+				runtimeSessionId: "pi-session:target",
 				turnId: "turn:1",
 				receipt: { schemaVersion: "pi.agent-settled.v2", disposition: "completed" },
 			});
