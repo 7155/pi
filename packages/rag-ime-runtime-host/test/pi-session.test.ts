@@ -250,9 +250,11 @@ describe("active-turn message queue", () => {
 		const followUp: string[] = [];
 		const steer = vi.fn(async (message: string) => {
 			steering.push(message);
+			return { id: "continuation:steer" };
 		});
 		const queueFollowUp = vi.fn(async (message: string) => {
 			followUp.push(message);
+			return { id: "continuation:follow-up" };
 		});
 		const productSession = Object.create(PiProductSession.prototype) as PiProductSession;
 		Object.assign(productSession as unknown as Record<string, unknown>, {
@@ -280,6 +282,7 @@ describe("active-turn message queue", () => {
 			delivery: "steer",
 			turnId: "turn-1",
 			clientMessageId: "steer-1",
+			continuationId: "continuation:steer",
 			messageQueue: { steering: ["change direction"], followUp: [] },
 		});
 		await expect(
@@ -288,8 +291,16 @@ describe("active-turn message queue", () => {
 			delivery: "followUp",
 			messageQueue: { steering: ["change direction"], followUp: ["then summarize"] },
 		});
-		expect(steer).toHaveBeenCalledWith("change direction", undefined);
-		expect(queueFollowUp).toHaveBeenCalledWith("then summarize", undefined);
+		expect(steer).toHaveBeenCalledWith("change direction", undefined, {
+			idempotencyKey: "steer-1",
+			origin: "rpc_steer",
+			maxAttempts: 2,
+		});
+		expect(queueFollowUp).toHaveBeenCalledWith("then summarize", undefined, {
+			idempotencyKey: expect.any(String),
+			origin: "rpc_follow_up",
+			maxAttempts: 2,
+		});
 	});
 
 	it("rejects queued messages when no turn is running", async () => {
@@ -462,6 +473,13 @@ describe("per-turn Provider context lifecycle", () => {
 			roomContext: "Room frozen responsibility",
 			sessionContext: "approved memory",
 			transientContext: "current UI evidence",
+			roomSkillLoad: {
+				schemaVersion: "rag-ime.skill-load.v1",
+				name: "implementation-execution",
+				catalogRevision: "c".repeat(64),
+				contentRevision: "a".repeat(64),
+				loadReason: "stage_required",
+			},
 			providerContextJournal,
 			session: {
 				isIdle: true,
@@ -503,6 +521,13 @@ describe("per-turn Provider context lifecycle", () => {
 			delivery: "followUp",
 			turnId: "turn:room",
 			continuationId: "continuation:repair",
+			roomSkillLoad: {
+				schemaVersion: "rag-ime.skill-load.v1",
+				name: "implementation-execution",
+				catalogRevision: "c".repeat(64),
+				contentRevision: "a".repeat(64),
+				loadReason: "stage_required",
+			},
 		});
 	});
 });
@@ -525,6 +550,7 @@ describe("ordinary Session memory context epochs", () => {
 			session: {
 				isIdle: true,
 				systemPrompt: "stable system prompt",
+				sessionManager: { appendDurableCustomEntry: vi.fn() },
 				prompt,
 			},
 		});
@@ -596,6 +622,7 @@ describe("ordinary Session memory context epochs", () => {
 			session: {
 				isIdle: true,
 				systemPrompt: "stable system prompt",
+				sessionManager: { appendDurableCustomEntry: vi.fn() },
 				prompt: vi.fn(async (_message, options) => {
 					options.preflightResult(true);
 				}),
@@ -773,6 +800,87 @@ describe("managed Room context epochs", () => {
 });
 
 describe("managed Room runtime turn identity", () => {
+	it("releases a failed Room runtime binding so the next Dispatch can start", async () => {
+		const productSession = Object.create(PiProductSession.prototype) as PiProductSession;
+		const mutable = productSession as unknown as Record<string, any>;
+		const setRetryLimitOverride = vi.fn();
+		const providerContextJournal = new ProviderContextJournal();
+		const prompt = vi.fn(async (_message, options) => {
+			options.preflightResult(true);
+		});
+		Object.assign(mutable, {
+			activeTurn: { turnId: "turn:failed", clientMessageId: "client:failed" },
+			activeRoom: {
+				dispatchId: "dispatch:failed",
+				rootId: "root:failed",
+				generation: 0,
+				dispatchAttempt: 0,
+				runtimeTurnId: "turn:failed",
+				capabilityEpoch: 1,
+			},
+			roomUsageBaseline: { input: 0, output: 0 },
+			roomContext: "",
+			roomRecoveryContext: "",
+			sessionContext: "",
+			transientContext: "turn context",
+			sequence: 0,
+			turnSettlements: {
+				get: vi.fn(),
+				record: vi.fn(() => ({ receipt: { receiptId: "receipt:failed" } })),
+			},
+			providerContextJournal,
+			backendBridge: { gatewayUrl: undefined },
+			roomProviderContext: undefined,
+			roomResourceLimits: undefined,
+			roomSkillLoad: undefined,
+			emitEvent: vi.fn(),
+			telemetry: vi.fn(() => ({})),
+			session: {
+				isIdle: true,
+				systemPrompt: "stable system prompt",
+				setRetryLimitOverride,
+				getSessionStats: () => ({ tokens: { input: 0, output: 0 } }),
+				sessionManager: {
+					appendCustomEntry: vi.fn(),
+					appendDurableCustomEntry: vi.fn(),
+				},
+				prompt,
+			},
+		});
+
+		mutable.onSessionEvent({
+			type: "agent_settle_failed",
+			error: "settlement observer failed",
+			receipt: {
+				sessionId: "pi:session",
+				disposition: "failed",
+			},
+		});
+
+		expect(mutable.activeTurn).toBeUndefined();
+		expect(mutable.activeRoom).toBeUndefined();
+		expect(mutable.roomUsageBaseline).toBeUndefined();
+		expect(mutable.transientContext).toBe("");
+		expect(setRetryLimitOverride).toHaveBeenCalledWith(undefined);
+		expect(providerContextJournal.snapshot().entryCount).toBe(0);
+
+		await expect(
+			productSession.dispatchRoom({
+				message: "start the next bounded task",
+				dispatchId: "dispatch:next",
+				rootId: "root:next",
+				generation: 0,
+				dispatchAttempt: 0,
+				capabilityEpoch: 2,
+			}),
+		).resolves.toMatchObject({ delivery: "prompt" });
+		expect(prompt).toHaveBeenCalledOnce();
+		expect(mutable.activeRoom).toMatchObject({
+			dispatchId: "dispatch:next",
+			rootId: "root:next",
+		});
+	});
+
 	it("binds the initial accepted turn before the native prompt can settle", async () => {
 		const productSession = Object.create(PiProductSession.prototype) as PiProductSession;
 		const mutable = productSession as unknown as Record<string, any>;
@@ -797,6 +905,7 @@ describe("managed Room runtime turn identity", () => {
 			session: {
 				isIdle: true,
 				systemPrompt: "stable system prompt",
+				sessionManager: { appendDurableCustomEntry: vi.fn() },
 				getSessionStats: () => ({ tokens: { input: 0, output: 0 } }),
 				setRetryLimitOverride: vi.fn(),
 				prompt,

@@ -53,6 +53,11 @@ export interface SessionEntryBase {
 export interface SessionMessageEntry extends SessionEntryBase {
 	type: "message";
 	message: AgentMessage;
+	continuation?: {
+		id: string;
+		idempotencyKey: string;
+		leaseId?: string;
+	};
 }
 
 export interface ThinkingLevelChangeEntry extends SessionEntryBase {
@@ -985,13 +990,17 @@ export class SessionManager {
 	 * so it is easier to find them.
 	 * These need to be appended via appendCompaction() and appendBranchSummary() methods.
 	 */
-	appendMessage(message: Message | CustomMessage | BashExecutionMessage): string {
+	appendMessage(
+		message: Message | CustomMessage | BashExecutionMessage,
+		continuation?: SessionMessageEntry["continuation"],
+	): string {
 		const entry: SessionMessageEntry = {
 			type: "message",
 			id: generateId(this.byId),
 			parentId: this.leafId,
 			timestamp: new Date().toISOString(),
 			message,
+			continuation,
 		};
 		this._appendEntry(entry);
 		return entry.id;
@@ -1059,6 +1068,15 @@ export class SessionManager {
 		};
 		this._appendEntry(entry);
 		return entry.id;
+	}
+
+	appendDurableCustomEntry(customType: string, data?: unknown): string {
+		const id = this.appendCustomEntry(customType, data);
+		if (this.persist && !this.flushed) {
+			this._rewriteFile();
+			this.flushed = true;
+		}
+		return id;
 	}
 
 	/** Append a session info entry (e.g., display name). Returns entry id. */

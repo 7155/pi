@@ -183,13 +183,19 @@ describe("AgentSession bash and persistence characterization", () => {
 		await harness.session.prompt("start");
 
 		const entries = harness.sessionManager.getEntries();
-		expect(entries.map((entry) => entry.type)).toEqual([
+		const publicEntries = entries.filter(
+			(entry) => entry.type !== "custom" || entry.customType !== "pi.continuation-checkpoint",
+		);
+		expect(publicEntries.map((entry) => entry.type)).toEqual([
 			"custom_message",
 			"message",
 			"message",
 			"message",
 			"message",
 		]);
+		expect(
+			entries.some((entry) => entry.type === "custom" && entry.customType === "pi.continuation-checkpoint"),
+		).toBe(true);
 		expect(harness.session.messages.map((message) => message.role)).toEqual([
 			"custom",
 			"user",
@@ -238,7 +244,7 @@ describe("AgentSession bash and persistence characterization", () => {
 		await harness.session.abort();
 		await promptPromise;
 
-		const lastEntry = harness.sessionManager.getEntries()[harness.sessionManager.getEntries().length - 1];
+		const lastEntry = [...harness.sessionManager.getEntries()].reverse().find((entry) => entry.type === "message");
 		expect(lastEntry?.type).toBe("message");
 		if (lastEntry?.type === "message") {
 			expect(lastEntry.message.role).toBe("assistant");

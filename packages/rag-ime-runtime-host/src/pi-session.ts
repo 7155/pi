@@ -56,7 +56,12 @@ import {
 } from "./tool-bridge.ts";
 import { ToolLoopProgressGuard } from "./tool-loop-progress-guard.ts";
 import { ToolResultStore } from "./tool-result-store.ts";
-import { type PiTurnSettlementReceipt, TurnSettlementTracker } from "./turn-settlement.ts";
+import {
+	type PiTurnSettlementReceipt,
+	persistedTurnSettlement,
+	TURN_SETTLEMENT_CUSTOM_TYPE,
+	TurnSettlementTracker,
+} from "./turn-settlement.ts";
 import { createWorkflowControlExtension } from "./workflow-control.ts";
 
 export interface PiSessionOpenOptions {
@@ -310,6 +315,21 @@ export interface ActiveTurn {
 	clientMessageId?: string;
 }
 
+const TURN_BINDING_CUSTOM_TYPE = "rag-ime.pi-turn-binding";
+
+function persistedActiveTurn(value: unknown): ActiveTurn | undefined {
+	if (!value || typeof value !== "object" || Array.isArray(value)) return undefined;
+	const source = value as Record<string, unknown>;
+	if (source.schemaVersion !== "rag-ime.pi-turn-binding.v1" || typeof source.turnId !== "string") return undefined;
+	const turnId = source.turnId.trim();
+	if (!turnId) return undefined;
+	return {
+		turnId,
+		clientMessageId:
+			typeof source.clientMessageId === "string" ? source.clientMessageId.trim() || undefined : undefined,
+	};
+}
+
 export interface PiSessionAbortReceipt {
 	schemaVersion: "rag-ime.pi-session-abort-receipt.v1";
 	sessionId: string;
@@ -488,6 +508,21 @@ export class PiProductSession implements PooledSession {
 		// the outer Turn receipt belongs to the product Session and the nested
 		// Agent receipt remains cryptographically bound to the Pi transcript.
 		this.turnSettlements = new TurnSettlementTracker(options.externalSessionId, session.sessionId);
+		for (const entry of session.sessionManager.getBranch()) {
+			if (entry.type !== "custom" || entry.customType !== TURN_SETTLEMENT_CUSTOM_TYPE) continue;
+			const persisted = persistedTurnSettlement(entry.data);
+			if (persisted) this.turnSettlements.restore(persisted);
+		}
+		const latestTurnBinding = [...session.sessionManager.getBranch()]
+			.reverse()
+			.find((entry) => entry.type === "custom" && entry.customType === TURN_BINDING_CUSTOM_TYPE);
+		if (latestTurnBinding?.type === "custom") {
+			const recoveredTurn = persistedActiveTurn(latestTurnBinding.data);
+			const recoveredSettlement = recoveredTurn ? this.turnSettlements.get(recoveredTurn.turnId) : undefined;
+			if (recoveredTurn && (!recoveredSettlement || recoveredSettlement.receipt.disposition === "suspended")) {
+				this.activeTurn = recoveredTurn;
+			}
+		}
 		this.backendBridge = backendBridge;
 		this.emitEvent = options.emitEvent;
 		const inheritedStopPolicy = session.agent.shouldStopAfterTurn;
@@ -1081,7 +1116,11 @@ export class PiProductSession implements PooledSession {
 	private onSessionEvent(event: AgentSessionEvent): void {
 		const turn = this.activeTurn;
 		if ((event.type === "agent_settled" || event.type === "agent_settle_failed") && turn?.turnId && event.receipt) {
-			this.turnSettlements.record(turn, event.receipt);
+			const previous = this.turnSettlements.get(turn.turnId, turn.clientMessageId);
+			const settlement = this.turnSettlements.record(turn, event.receipt);
+			if (previous?.receipt.receiptId !== settlement.receipt.receiptId) {
+				this.session.sessionManager.appendCustomEntry(TURN_SETTLEMENT_CUSTOM_TYPE, settlement);
+			}
 		}
 		const pendingAssistant =
 			event.type === "message_end" && event.message.role === "assistant"
@@ -1126,15 +1165,13 @@ export class PiProductSession implements PooledSession {
 				),
 			},
 		});
-		if (event.type === "agent_settled" && event.receipt?.disposition !== "suspended") {
+		if (
+			(event.type === "agent_settled" && event.receipt?.disposition !== "suspended") ||
+			event.type === "agent_settle_failed"
+		) {
 			this.activeTurn = undefined;
 			this.activeRoom = undefined;
 			this.roomUsageBaseline = undefined;
-			this.session.setRetryLimitOverride(undefined);
-			this.transientContext = "";
-			this.providerContextJournal.clearTurnContext();
-		} else if (event.type === "agent_settle_failed" && !this.activeRoom) {
-			this.activeTurn = undefined;
 			this.session.setRetryLimitOverride(undefined);
 			this.transientContext = "";
 			this.providerContextJournal.clearTurnContext();
@@ -1613,6 +1650,10 @@ export class PiProductSession implements PooledSession {
 					preflightResult: (success) => {
 						if (preflightSettled) return;
 						if (success) {
+							this.session.sessionManager.appendDurableCustomEntry(TURN_BINDING_CUSTOM_TYPE, {
+								schemaVersion: "rag-ime.pi-turn-binding.v1",
+								...turn,
+							});
 							preflightSettled = true;
 							accept(turn);
 							return;
@@ -1654,14 +1695,22 @@ export class PiProductSession implements PooledSession {
 		if (!turn || this.session.isIdle) {
 			throw new RuntimeProtocolError("SESSION_IDLE", "Session has no active turn to receive a queued message");
 		}
-		if (options.delivery === "steer") await this.session.steer(options.message, options.images);
-		else await this.session.followUp(options.message, options.images);
+		const continuationOptions = {
+			idempotencyKey: options.clientMessageId?.trim() || randomUUID(),
+			origin: options.delivery === "steer" ? "rpc_steer" : "rpc_follow_up",
+			maxAttempts: 2,
+		};
+		const continuation =
+			options.delivery === "steer"
+				? await this.session.steer(options.message, options.images, continuationOptions)
+				: await this.session.followUp(options.message, options.images, continuationOptions);
 		return {
 			accepted: true,
 			queued: true,
 			delivery: options.delivery,
 			turnId: turn.turnId,
 			clientMessageId: options.clientMessageId,
+			continuationId: continuation.id,
 			messageQueue: this.messageQueue(),
 		};
 	}
@@ -1807,7 +1856,12 @@ export class PiProductSession implements PooledSession {
 					continuationOptions,
 				)
 			: await this.session.followUp(options.message, undefined, continuationOptions);
-		return { delivery: "followUp", turnId, continuationId: continuation.id };
+		return {
+			delivery: "followUp",
+			turnId,
+			continuationId: continuation.id,
+			roomSkillLoad: this.roomSkillLoadReceipt(),
+		};
 	}
 
 	private beginRoomDispatch(options: ActiveRoomDispatch & { roomResourceLimits?: RoomResourceLimits }): void {

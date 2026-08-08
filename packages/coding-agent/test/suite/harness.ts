@@ -72,6 +72,8 @@ export interface HarnessOptions {
 	resourceLoader?: ResourceLoader;
 	extensionFactories?: Array<InlineExtension | CreateTestExtensionsResultInput>;
 	withConfiguredAuth?: boolean;
+	persistSession?: boolean;
+	sessionFile?: string;
 }
 
 export interface Harness {
@@ -109,7 +111,11 @@ export async function createHarness(options: HarnessOptions = {}): Promise<Harne
 	const withConfiguredAuth = options.withConfiguredAuth ?? true;
 	const extensionRunnerRef: { current?: ExtensionRunner } = {};
 
-	const sessionManager = SessionManager.inMemory();
+	const sessionManager = options.sessionFile
+		? SessionManager.open(options.sessionFile, tempDir, tempDir)
+		: options.persistSession
+			? SessionManager.create(tempDir, tempDir)
+			: SessionManager.inMemory();
 	const settingsManager = SettingsManager.inMemory(options.settings);
 
 	const authStorage = AuthStorage.inMemory();
@@ -142,6 +148,7 @@ export async function createHarness(options: HarnessOptions = {}): Promise<Harne
 			model,
 			systemPrompt: options.systemPrompt ?? "You are a test assistant.",
 			tools: [],
+			messages: sessionManager.buildSessionContext().messages,
 		},
 		sessionId: options.providerSessionId,
 		convertToLlm,

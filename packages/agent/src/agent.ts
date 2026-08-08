@@ -141,7 +141,7 @@ export interface ContinuationOptions {
 export type AgentContinuation = ContinuationEnvelope<AgentMessage>;
 
 class PendingMessageQueue {
-	private readonly queue = new ContinuationQueue<AgentMessage>();
+	private queue = new ContinuationQueue<AgentMessage>();
 	private readonly activeLeases = new Map<string, { leaseId: string; message: AgentMessage }>();
 	private readonly leaseByMessage = new WeakMap<object, { id: string; leaseId: string }>();
 	private timer?: ReturnType<typeof setTimeout>;
@@ -231,6 +231,20 @@ class PendingMessageQueue {
 
 	snapshot(): AgentContinuation[] {
 		return this.queue.snapshot().items;
+	}
+
+	restore(items: AgentContinuation[]): void {
+		this.activeLeases.clear();
+		this.queue = new ContinuationQueue<AgentMessage>({
+			snapshot: {
+				items: items.map((item) => ({ ...item })),
+			},
+		});
+		this.queue.recoverExpiredLeases({ now: Date.now(), leaseTimeoutMs: 0, reason: "runtime_restarted" });
+	}
+
+	resume(): void {
+		this.schedule();
 	}
 
 	hasReady(now = Date.now()): boolean {
@@ -464,6 +478,25 @@ export class Agent {
 		return [...this.steeringQueue.snapshot(), ...this.followUpQueue.snapshot()].sort(
 			(left, right) => left.createdAt - right.createdAt || left.id.localeCompare(right.id),
 		);
+	}
+
+	restoreContinuationState(generation: number, continuations: AgentContinuation[]): void {
+		if (!Number.isSafeInteger(generation) || generation < 0) {
+			throw new Error("continuation generation must be a non-negative safe integer");
+		}
+		if (this.activeRun) throw new Error("cannot restore continuations while an Agent run is active");
+		this.continuationGeneration = generation;
+		this.steeringQueue.restore(continuations.filter((item) => item.kind === "steer"));
+		this.followUpQueue.restore(continuations.filter((item) => item.kind === "follow_up"));
+	}
+
+	resumeRestoredContinuations(): void {
+		this.steeringQueue.resume();
+		this.followUpQueue.resume();
+	}
+
+	continuationForMessage(message: AgentMessage): AgentContinuation | undefined {
+		return this.listContinuations().find((item) => item.payload === message);
 	}
 
 	acknowledgeContinuationMessage(message: AgentMessage): boolean {

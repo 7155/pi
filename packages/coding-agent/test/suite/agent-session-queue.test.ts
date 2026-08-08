@@ -486,4 +486,74 @@ describe("AgentSession queue characterization", () => {
 		expect(harness.session.agent.listContinuations()).toEqual([]);
 		expect(getUserTexts(harness)).toEqual(["hello"]);
 	});
+
+	it("restores a queued continuation from JSONL and delivers it exactly once", async () => {
+		const first = await createHarness({ persistSession: true });
+		harnesses.push(first);
+		first.setResponses([fauxAssistantMessage("initial response")]);
+		await first.session.prompt("initial prompt");
+		first.session.agent.onContinuationReady = () => {};
+		const admitted = await first.session.followUp("durable follow-up", undefined, {
+			idempotencyKey: "client:durable-follow-up",
+			origin: "rpc_follow_up",
+			maxAttempts: 2,
+		});
+		const sessionFile = first.sessionManager.getSessionFile();
+		expect(sessionFile).toBeTruthy();
+		expect(first.session.listContinuations()).toContainEqual(
+			expect.objectContaining({ id: admitted.id, state: "pending" }),
+		);
+		first.session.dispose();
+
+		const second = await createHarness({ sessionFile: sessionFile! });
+		harnesses.push(second);
+		second.setResponses([fauxAssistantMessage("restored response")]);
+		await second.session.bindExtensions({ mode: "rpc" });
+		await second.session.waitForIdle();
+
+		expect(getUserTexts(second).filter((text) => text === "durable follow-up")).toHaveLength(1);
+		expect(getAssistantTexts(second)).toContain("restored response");
+		expect(second.session.listContinuations()).toContainEqual(
+			expect.objectContaining({ id: admitted.id, state: "completed" }),
+		);
+
+		const third = await createHarness({ sessionFile: sessionFile! });
+		harnesses.push(third);
+		await third.session.bindExtensions({ mode: "rpc" });
+		await third.session.waitForIdle();
+		expect(getUserTexts(third).filter((text) => text === "durable follow-up")).toHaveLength(1);
+		expect(third.getPendingResponseCount()).toBe(0);
+	});
+
+	it("does not resume a cancelled continuation after the Session is reopened", async () => {
+		const first = await createHarness({ persistSession: true });
+		harnesses.push(first);
+		first.setResponses([fauxAssistantMessage("initial response")]);
+		await first.session.prompt("initial prompt");
+		first.session.agent.onContinuationReady = () => {};
+		const admitted = await first.session.followUp("cancelled before restart", undefined, {
+			idempotencyKey: "client:cancelled-before-restart",
+			origin: "rpc_follow_up",
+			maxAttempts: 2,
+		});
+		expect(first.session.cancelContinuation({ id: admitted.id }, "user_abort")).toEqual({
+			cancelledIds: [admitted.id],
+		});
+		const sessionFile = first.sessionManager.getSessionFile();
+		expect(sessionFile).toBeTruthy();
+		first.session.dispose();
+
+		const second = await createHarness({ sessionFile: sessionFile! });
+		harnesses.push(second);
+		second.setResponses([fauxAssistantMessage("must not run")]);
+		await second.session.bindExtensions({ mode: "rpc" });
+		await second.session.waitForIdle();
+
+		expect(getUserTexts(second)).not.toContain("cancelled before restart");
+		expect(getAssistantTexts(second)).not.toContain("must not run");
+		expect(second.getPendingResponseCount()).toBe(1);
+		expect(second.session.listContinuations()).not.toContainEqual(
+			expect.objectContaining({ id: admitted.id, state: "pending" }),
+		);
+	});
 });

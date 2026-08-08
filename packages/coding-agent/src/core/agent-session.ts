@@ -115,6 +115,15 @@ import { createAllToolDefinitions } from "./tools/index.ts";
 import { createToolDefinitionFromAgentTool } from "./tools/tool-definition-wrapper.ts";
 
 const UPSTREAM_ERROR_RETRY_BASE_DELAY_MS = 8_000;
+const CONTINUATION_CHECKPOINT_CUSTOM_TYPE = "pi.continuation-checkpoint";
+
+interface ContinuationCheckpoint {
+	schemaVersion: "pi.continuation-checkpoint.v1";
+	generation: number;
+	activeRunId?: string;
+	continuations: AgentContinuation[];
+	systemPrompts: Array<{ continuationId: string; systemPrompt: string }>;
+}
 
 // ============================================================================
 // Skill Block Parsing
@@ -460,6 +469,65 @@ export class AgentSession {
 			activeToolNames: this._initialActiveToolNames,
 			includeAllExtensionTools: true,
 		});
+		this._restoreContinuationCheckpoint();
+	}
+
+	private _continuationCheckpoint(): ContinuationCheckpoint {
+		return {
+			schemaVersion: "pi.continuation-checkpoint.v1",
+			generation: this.agent.currentContinuationGeneration,
+			activeRunId: this._activeRunId,
+			continuations: this.agent.listContinuations(),
+			systemPrompts: [...this._systemPromptByContinuationId].map(([continuationId, systemPrompt]) => ({
+				continuationId,
+				systemPrompt,
+			})),
+		};
+	}
+
+	private _persistContinuationCheckpoint(): void {
+		this.sessionManager.appendDurableCustomEntry(CONTINUATION_CHECKPOINT_CUSTOM_TYPE, this._continuationCheckpoint());
+	}
+
+	private _restoreContinuationCheckpoint(): void {
+		const checkpointEntry = [...this.sessionManager.getBranch()]
+			.reverse()
+			.find((entry) => entry.type === "custom" && entry.customType === CONTINUATION_CHECKPOINT_CUSTOM_TYPE);
+		if (!checkpointEntry || checkpointEntry.type !== "custom") return;
+		const source = checkpointEntry.data as Partial<ContinuationCheckpoint> | undefined;
+		if (source?.schemaVersion !== "pi.continuation-checkpoint.v1" || !Array.isArray(source.continuations)) return;
+		const persistedMessageIds = new Set(
+			this.sessionManager
+				.getBranch()
+				.filter((entry) => entry.type === "message" && entry.continuation?.id)
+				.map((entry) => (entry.type === "message" ? entry.continuation!.id : "")),
+		);
+		const continuations = source.continuations.map((item) =>
+			persistedMessageIds.has(item.id)
+				? {
+						...item,
+						state: "completed" as const,
+						leaseId: undefined,
+						leasedAt: undefined,
+						lastFailure: undefined,
+						terminalReason: undefined,
+					}
+				: item,
+		);
+		this.agent.restoreContinuationState(Number(source.generation ?? 0), continuations);
+		this._activeRunId = source.activeRunId?.trim() || undefined;
+		for (const item of source.systemPrompts ?? []) {
+			if (item?.continuationId && typeof item.systemPrompt === "string") {
+				this._systemPromptByContinuationId.set(item.continuationId, item.systemPrompt);
+			}
+		}
+		for (const continuation of continuations) {
+			if (continuation.state !== "pending") continue;
+			const text = continuation.payload.role === "user" ? this._getUserMessageText(continuation.payload) : "";
+			if (continuation.kind === "steer") this._steeringMessages.push({ id: continuation.id, text });
+			if (continuation.kind === "follow_up") this._followUpMessages.push({ id: continuation.id, text });
+			this._continuationIdByMessage.set(continuation.payload, continuation.id);
+		}
 	}
 
 	get modelRuntime(): ModelRuntime {
@@ -664,6 +732,7 @@ export class AgentSession {
 		// settlement observers run; _settlementEmissionPending still keeps
 		// waitForIdle blocked until every observer and the public event finish.
 		this._isAgentRunActive = false;
+		this._persistContinuationCheckpoint();
 		try {
 			this._settlementObserversActive = true;
 			try {
@@ -695,6 +764,7 @@ export class AgentSession {
 		this._isAgentRunActive = false;
 		this._lastSettledReceipt = receipt;
 		this._activeRunId = undefined;
+		this._persistContinuationCheckpoint();
 		try {
 			this._emit({ type: "agent_settle_failed", error: error.message, receipt });
 		} finally {
@@ -752,6 +822,7 @@ export class AgentSession {
 
 		// Handle session persistence
 		if (event.type === "message_end") {
+			const continuation = this.agent.continuationForMessage(event.message);
 			// Check if this is a custom message from extensions
 			if (event.message.role === "custom") {
 				// Persist as CustomMessageEntry
@@ -767,13 +838,26 @@ export class AgentSession {
 				event.message.role === "toolResult"
 			) {
 				// Regular LLM message - persist as SessionMessageEntry
-				this.sessionManager.appendMessage(event.message);
+				this.sessionManager.appendMessage(
+					event.message,
+					continuation
+						? {
+								id: continuation.id,
+								idempotencyKey: continuation.idempotencyKey,
+								leaseId: continuation.leaseId,
+							}
+						: undefined,
+				);
 			}
 			// Other message types (bashExecution, compactionSummary, branchSummary) are persisted elsewhere
 
 			// The exact queued message is acknowledged only after the persistence
 			// call above completed successfully.
 			this.agent.acknowledgeContinuationMessage(event.message);
+			if (continuation) {
+				this._systemPromptByContinuationId.delete(continuation.id);
+				this._persistContinuationCheckpoint();
+			}
 
 			// Track assistant message for auto-compaction (checked on agent_end)
 			if (event.message.role === "assistant") {
@@ -1496,7 +1580,13 @@ export class AgentSession {
 				throw new Error(formatNoModelSelectedMessage());
 			}
 
+			// An embedded caller-supplied stream owns its own transport and
+			// credentials (the same boundary used by deterministic Room/Session
+			// adapters), so the coding-agent model registry must not reject it
+			// before the stream is invoked. The default Pi stream still requires
+			// the runtime's authoritative provider auth.
 			const hasConfiguredAuth =
+				this.agent.streamFn !== streamSimple ||
 				this._modelRuntime.hasConfiguredAuth(this.model.provider) ||
 				(await this._modelRuntime.checkAuth(this.model.provider)) !== undefined;
 			if (!hasConfiguredAuth) {
@@ -1718,6 +1808,7 @@ export class AgentSession {
 		const current = this.agent.listContinuations().find((item) => item.id === admitted.id);
 		if (current?.state === "pending") {
 			this._systemPromptByContinuationId.set(admitted.id, systemPrompt);
+			this._persistContinuationCheckpoint();
 		}
 		return admitted;
 	}
@@ -1747,6 +1838,7 @@ export class AgentSession {
 			this._steeringMessages.push({ id: admitted.id, text });
 			this._continuationIdByMessage.set(admitted.payload, admitted.id);
 			this._emitQueueUpdate();
+			this._persistContinuationCheckpoint();
 		}
 		return admitted;
 	}
@@ -1776,6 +1868,7 @@ export class AgentSession {
 			this._followUpMessages.push({ id: admitted.id, text });
 			this._continuationIdByMessage.set(admitted.payload, admitted.id);
 			this._emitQueueUpdate();
+			this._persistContinuationCheckpoint();
 		}
 		return admitted;
 	}
@@ -1902,6 +1995,7 @@ export class AgentSession {
 		this._followUpMessages = [];
 		this.agent.clearAllQueues();
 		this._deleteContinuationSystemPrompts(clearedContinuationIds);
+		this._persistContinuationCheckpoint();
 		this._emitQueueUpdate();
 		return { steering, followUp };
 	}
@@ -1937,6 +2031,7 @@ export class AgentSession {
 			this._steeringMessages = this._steeringMessages.filter((item) => activeIds.has(item.id));
 			this._followUpMessages = this._followUpMessages.filter((item) => activeIds.has(item.id));
 			this._emitQueueUpdate();
+			this._persistContinuationCheckpoint();
 		}
 		this._resolveIdleWaitIfIdle();
 	}
@@ -2794,6 +2889,7 @@ export class AgentSession {
 		this._applyExtensionBindings(this._extensionRunner);
 		await this._extensionRunner.emit(this._sessionStartEvent);
 		await this.extendResourcesFromExtensions(this._sessionStartEvent.reason === "reload" ? "reload" : "startup");
+		this.agent.resumeRestoredContinuations();
 	}
 
 	private async extendResourcesFromExtensions(reason: "startup" | "reload"): Promise<void> {

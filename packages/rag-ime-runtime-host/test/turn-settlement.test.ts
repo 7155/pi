@@ -1,6 +1,10 @@
+import { mkdtemp, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import type { AgentSettledReceiptV2 } from "@earendil-works/pi-coding-agent";
+import { SessionManager } from "@earendil-works/pi-coding-agent";
 import { describe, expect, it } from "vitest";
-import { TurnSettlementTracker } from "../src/turn-settlement.ts";
+import { persistedTurnSettlement, TURN_SETTLEMENT_CUSTOM_TYPE, TurnSettlementTracker } from "../src/turn-settlement.ts";
 
 function receipt(receiptId: string, disposition: AgentSettledReceiptV2["disposition"]): AgentSettledReceiptV2 {
 	return {
@@ -108,5 +112,50 @@ describe("TurnSettlementTracker", () => {
 		await expect(tracker.wait("turn-1", { timeoutMs: 1_000 })).rejects.toThrow("too many");
 		tracker.record({ turnId: "turn-1" }, receipt("terminal", "completed"));
 		await expect(first).resolves.toMatchObject({ receipt: { receiptId: "terminal" } });
+	});
+
+	it("restores the exact settlement from the append-only JSONL Session journal", async () => {
+		const root = await mkdtemp(join(tmpdir(), "pi-turn-settlement-journal-"));
+		try {
+			const manager = SessionManager.create(root, root);
+			manager.appendMessage({ role: "user", content: "question", timestamp: 1 });
+			manager.appendMessage({
+				role: "assistant",
+				content: [{ type: "text", text: "answer" }],
+				api: "openai-completions",
+				provider: "test",
+				model: "test",
+				usage: {
+					input: 1,
+					output: 1,
+					cacheRead: 0,
+					cacheWrite: 0,
+					totalTokens: 2,
+					cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+				},
+				stopReason: "stop",
+				timestamp: 2,
+			});
+			const tracker = new TurnSettlementTracker("session-1", manager.getSessionId());
+			const persisted = tracker.record(
+				{ turnId: "turn-1", clientMessageId: "client-1" },
+				{ ...receipt("terminal", "completed"), sessionId: manager.getSessionId() },
+			);
+			manager.appendCustomEntry(TURN_SETTLEMENT_CUSTOM_TYPE, persisted);
+			const sessionFile = manager.getSessionFile();
+			expect(sessionFile).toBeTruthy();
+
+			const reopened = SessionManager.open(sessionFile!, root, root);
+			const restored = new TurnSettlementTracker("session-1", reopened.getSessionId());
+			for (const entry of reopened.getBranch()) {
+				if (entry.type !== "custom" || entry.customType !== TURN_SETTLEMENT_CUSTOM_TYPE) continue;
+				const value = persistedTurnSettlement(entry.data);
+				if (value) restored.restore(value);
+			}
+
+			expect(restored.get("turn-1", "client-1")).toEqual(persisted);
+		} finally {
+			await rm(root, { recursive: true, force: true });
+		}
 	});
 });

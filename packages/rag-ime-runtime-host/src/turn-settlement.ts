@@ -15,6 +15,26 @@ export interface PiTurnSettlementReceipt {
 	receipt: AgentSettledReceiptV2;
 }
 
+export const TURN_SETTLEMENT_CUSTOM_TYPE = "rag-ime.pi-turn-settlement";
+
+export function persistedTurnSettlement(value: unknown): PiTurnSettlementReceipt | undefined {
+	if (!value || typeof value !== "object" || Array.isArray(value)) return undefined;
+	const source = value as Record<string, unknown>;
+	const receipt = source.receipt;
+	if (
+		source.schemaVersion !== "rag-ime.pi-turn-settlement.v1" ||
+		typeof source.sessionId !== "string" ||
+		typeof source.runtimeSessionId !== "string" ||
+		typeof source.turnId !== "string" ||
+		receipt === null ||
+		typeof receipt !== "object" ||
+		Array.isArray(receipt)
+	) {
+		return undefined;
+	}
+	return structuredClone(source) as unknown as PiTurnSettlementReceipt;
+}
+
 export interface WaitForTurnSettlementOptions {
 	allowSuspended?: boolean;
 	timeoutMs?: number;
@@ -139,6 +159,16 @@ export class TurnSettlementTracker {
 	latest(): PiTurnSettlementReceipt | undefined {
 		const value = [...this.byTurnId.values()].at(-1);
 		return value ? structuredClone(value) : undefined;
+	}
+
+	restore(value: PiTurnSettlementReceipt): PiTurnSettlementReceipt {
+		if (value.sessionId !== this.sessionId || value.runtimeSessionId !== this.runtimeSessionId) {
+			throw new RuntimeProtocolError(
+				"SETTLED_RECEIPT_MISMATCH",
+				"persisted settlement belongs to another product or runtime Session",
+			);
+		}
+		return this.record({ turnId: value.turnId, clientMessageId: value.clientMessageId }, value.receipt);
 	}
 
 	async wait(turnId: string, options: WaitForTurnSettlementOptions = {}): Promise<PiTurnSettlementReceipt> {
