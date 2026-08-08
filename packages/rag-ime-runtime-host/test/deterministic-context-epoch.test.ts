@@ -291,10 +291,10 @@ describe("deterministic context epoch Provider", () => {
 
 	it("drives an ordinary Agent Session through progressive discovery and planning", () => {
 		expect(calls(agentSessionCanaryResponse(agentContext(["skill_load", ...nativeCodingTools])))).toEqual([
-			expect.objectContaining({ name: "skill_load", arguments: { name: "test-driven-implementation" } }),
+			expect.objectContaining({ name: "skill_load", arguments: { name: "implementation-execution" } }),
 		]);
 
-		const loadedSkill = '<loaded_skill name="test-driven-implementation">';
+		const loadedSkill = '<loaded_skill name="implementation-execution">';
 		const readTool = ["tool_load", ...nativeCodingTools];
 		expect(calls(agentSessionCanaryResponse(agentContext(readTool, loadedSkill)))).toEqual([
 			expect.objectContaining({ name: "read", id: "agent-missing-read" }),
@@ -305,17 +305,9 @@ describe("deterministic context epoch Provider", () => {
 			expect.objectContaining({ name: "ls", id: "agent-list" }),
 		]);
 
-		const planHistory = [
-			afterMissing,
-			'"id":"agent-list"',
-			'"id":"agent-search"',
-			'"id":"agent-read-app"',
-			'"id":"agent-plan-baseline"',
-			'"id":"agent-plan-patch"',
-			'"id":"agent-plan-regression"',
-		].join(" ");
-		const planTools = ["tool_load", ...nativeCodingTools, "agent_plan"];
-		expect(calls(agentSessionCanaryResponse(agentContext(planTools, `${loadedSkill} ${planHistory}`)))).toEqual([
+		const todoHistory = [afterMissing, '"id":"agent-list"', '"id":"agent-search"', '"id":"agent-read-app"'].join(" ");
+		const todoTools = ["tool_load", ...nativeCodingTools, "todo"];
+		expect(calls(agentSessionCanaryResponse(agentContext(todoTools, `${loadedSkill} ${todoHistory}`)))).toEqual([
 			expect.objectContaining({
 				name: "read",
 				id: "agent-read-boundary-1",
@@ -330,9 +322,9 @@ describe("deterministic context epoch Provider", () => {
 			calls(
 				agentSessionCanaryResponse(
 					agentReceiptContext(
-						planTools,
+						todoTools,
 						{
-							history: planHistory,
+							history: todoHistory,
 							path: "/workspace/read-boundary.txt",
 							content: "line\n".repeat(1_000),
 							startLine: 1,
@@ -355,116 +347,133 @@ describe("deterministic context epoch Provider", () => {
 		expect(
 			calls(
 				agentSessionCanaryResponse(
-					agentReceiptContext(planTools, completeBoundaryReceipt(planHistory), loadedSkill),
+					agentReceiptContext(
+						todoTools,
+						completeBoundaryReceipt(`${todoHistory} "id":"agent-todo-init"`),
+						loadedSkill,
+					),
 				),
 			),
 		).toEqual([
 			expect.objectContaining({
-				name: "agent_plan",
-				id: "agent-plan-review",
-				arguments: { op: "submit_review", note: expect.any(String) },
+				name: "todo",
+				id: "agent-todo-baseline-start",
+				arguments: { op: "start", task: "运行失败基线测试" },
 			}),
 		]);
 
 		const firstPlanItem = calls(
 			agentSessionCanaryResponse(
 				agentReceiptContext(
-					planTools,
+					todoTools,
 					completeBoundaryReceipt(`${afterMissing} "id":"agent-list" "id":"agent-search" "id":"agent-read-app"`),
 					loadedSkill,
 				),
 			),
 		)[0];
 		expect(firstPlanItem).toMatchObject({
-			name: "agent_plan",
-			id: "agent-plan-baseline",
+			name: "todo",
+			id: "agent-todo-init",
 			arguments: {
-				op: "update",
-				itemId: "agent-plan-item-baseline",
-				status: "pending",
+				op: "init",
+				list: [
+					{
+						phase: "实现与验证",
+						items: ["运行失败基线测试", "精确修改 normalize_scores", "运行回归测试并交付"],
+					},
+				],
 			},
 		});
 	});
 
-	it("completes every ordinary Agent plan item before final delivery", () => {
-		const loadedSkill = '<loaded_skill name="test-driven-implementation">';
+	it("completes every ordinary Agent Todo item before final delivery", () => {
+		const loadedSkill = '<loaded_skill name="implementation-execution">';
 		const baseHistory = [
 			loadedSkill,
 			'"id":"agent-missing-read"',
 			'"id":"agent-list"',
 			'"id":"agent-search"',
 			'"id":"agent-read-app"',
-			'"id":"agent-plan-baseline"',
-			'"id":"agent-plan-patch"',
-			'"id":"agent-plan-regression"',
-			'"id":"agent-plan-review"',
-			"原生控制中心已经批准当前执行计划",
+			'"id":"agent-todo-init"',
+			'"id":"agent-todo-baseline-start"',
 			'"id":"agent-baseline-shell"',
 		].join(" ");
-		const shellTools = ["tool_load", ...nativeCodingTools, "agent_plan"];
+		const shellTools = ["tool_load", ...nativeCodingTools, "todo"];
 		expect(
 			calls(
 				agentSessionCanaryResponse(
-					agentReceiptContext(shellTools, completeBoundaryReceipt(baseHistory), loadedSkill),
+					agentReceiptContext(shellTools, { ...completeBoundaryReceipt(baseHistory), exitCode: 1 }, loadedSkill),
 				),
 			),
 		).toEqual([
 			expect.objectContaining({
-				name: "agent_plan",
-				id: "agent-plan-baseline-done",
+				name: "todo",
+				id: "agent-todo-baseline-done",
 				arguments: {
-					op: "update",
-					itemId: "agent-plan-item-baseline",
-					status: "completed",
+					op: "done",
+					task: "运行失败基线测试",
 				},
 			}),
 		]);
 
 		const patchedReceipt = {
-			...completeBoundaryReceipt(`${baseHistory} "id":"agent-plan-baseline-done" "id":"agent-patch"`),
+			...completeBoundaryReceipt(
+				`${baseHistory} "id":"agent-todo-baseline-done" "id":"agent-todo-patch-start" "id":"agent-patch"`,
+			),
 			mutationApplied: true,
+			exitCode: 1,
 		};
 		expect(calls(agentSessionCanaryResponse(agentReceiptContext(shellTools, patchedReceipt, loadedSkill)))).toEqual([
 			expect.objectContaining({
-				name: "agent_plan",
-				id: "agent-plan-patch-done",
+				name: "todo",
+				id: "agent-todo-patch-done",
 				arguments: {
-					op: "update",
-					itemId: "agent-plan-item-patch",
-					status: "completed",
+					op: "done",
+					task: "精确修改 normalize_scores",
 				},
 			}),
 		]);
 
 		const testedReceipt = {
 			...completeBoundaryReceipt(
-				`${JSON.stringify(patchedReceipt)} "id":"agent-plan-patch-done" "id":"agent-regression-shell"`,
+				`${JSON.stringify(patchedReceipt)} "id":"agent-todo-patch-done" "id":"agent-todo-regression-start" "id":"agent-regression-shell"`,
 			),
 			mutationApplied: true,
 			exitCode: 0,
+			baselineFailure: {
+				toolCallId: "agent-baseline-shell",
+				toolName: "bash",
+				isError: true,
+			},
 		};
 		expect(calls(agentSessionCanaryResponse(agentReceiptContext(shellTools, testedReceipt, loadedSkill)))).toEqual([
 			expect.objectContaining({
-				name: "agent_plan",
-				id: "agent-plan-regression-done",
+				name: "todo",
+				id: "agent-todo-regression-checkpoint",
 				arguments: {
-					op: "update",
-					itemId: "agent-plan-item-regression",
-					status: "completed",
+					op: "checkpoint",
+					task: "运行回归测试并交付",
+					checkpoint: "回归测试通过，准备交付",
+					references: [{ kind: "test", label: "普通 Session 回归", reference: "test_calculator.py" }],
 				},
 			}),
 		]);
 
 		const completedItems = {
-			...completeBoundaryReceipt(`${JSON.stringify(testedReceipt)} "id":"agent-plan-regression-done"`),
+			...completeBoundaryReceipt(`${JSON.stringify(testedReceipt)} "id":"agent-todo-regression-checkpoint"`),
 			mutationApplied: true,
 			exitCode: 0,
+			baselineFailure: {
+				toolCallId: "agent-baseline-shell",
+				toolName: "bash",
+				isError: true,
+			},
 		};
 		expect(calls(agentSessionCanaryResponse(agentReceiptContext(shellTools, completedItems, loadedSkill)))).toEqual([
 			expect.objectContaining({
-				name: "agent_plan",
-				id: "agent-plan-complete",
-				arguments: expect.objectContaining({ op: "complete" }),
+				name: "todo",
+				id: "agent-todo-regression-done",
+				arguments: { op: "done", task: "运行回归测试并交付" },
 			}),
 		]);
 	});
@@ -498,7 +507,21 @@ describe("deterministic context epoch Provider", () => {
 			arguments: {
 				decision: "wait",
 				waitingFor: "user",
+				questionKind: "bounded",
 				question: expect.stringContaining("最小版本"),
+				questionOptions: [
+					{
+						value: "minimum",
+						label: "先完成最小可用界面",
+						description: expect.any(String),
+						recommended: true,
+					},
+					{
+						value: "polish",
+						label: "先做完整视觉和主题",
+						description: expect.any(String),
+					},
+				],
 				resumeCondition: expect.any(String),
 				publicSummary: expect.any(String),
 			},
@@ -509,6 +532,12 @@ describe("deterministic context epoch Provider", () => {
 			"优先保证键盘操作、状态反馈和基本错误提示，先不加入网络同步或复杂主题。",
 			"交付时保留现有项目约定，只改实现所需内容，并给出可复现的验证结果。",
 		].join(" ");
+		const definitionRequirements = [
+			{ requirementRef: "requirement:tui", statement: "写 TUI" },
+			{ requirementRef: "requirement:layout", statement: "显示标题、输入区和结果区" },
+			{ requirementRef: "requirement:feedback", statement: "提供键盘操作、状态与错误反馈" },
+			{ requirementRef: "requirement:verification", statement: "提供可重复执行的验证结果" },
+		];
 		const alignedHistory = `${stateHistory} ${answers}`;
 		expect(
 			calls(
@@ -538,13 +567,28 @@ describe("deterministic context epoch Provider", () => {
 			id: "room-full-auto-alignment-load-define",
 			arguments: { name: "room_define" },
 		});
+		const definitionStateHistory =
+			`${alignedHistory} "id":"room-full-auto-alignment-search-define" ` +
+			'"id":"room-full-auto-alignment-load-define"';
+		expect(
+			calls(
+				projectCollaborationCanaryResponse(
+					collaborationContext(alignmentTask, ["room_state", "room_define"], {
+						history: definitionStateHistory,
+						participants,
+					}),
+				),
+			)[0],
+		).toMatchObject({
+			name: "room_state",
+			id: "room-full-auto-alignment-definition-state",
+		});
 		const definition = calls(
 			projectCollaborationCanaryResponse(
 				collaborationContext(alignmentTask, ["room_state", "room_define"], {
-					history:
-						`${alignedHistory} "id":"room-full-auto-alignment-search-define" ` +
-						'"id":"room-full-auto-alignment-load-define"',
+					history: `${definitionStateHistory} "id":"room-full-auto-alignment-definition-state"`,
 					participants,
+					definitionRequirements,
 				}),
 			),
 		)[0];
@@ -553,136 +597,42 @@ describe("deterministic context epoch Provider", () => {
 			id: "room-full-auto-alignment-define",
 			arguments: {
 				implementationParticipantRef: "P-B",
+				entrySurface: expect.any(String),
+				primaryInteraction: expect.any(String),
+				observableCompletion: expect.any(String),
 				requirements: expect.arrayContaining([expect.stringContaining("键盘操作")]),
-				acceptanceCriteria: expect.arrayContaining([
-					expect.objectContaining({ fullNameZh: "启动后显示并可使用最小界面" }),
-				]),
+				acceptanceCriteria: definitionRequirements.map((requirement) =>
+					expect.objectContaining({ requirementRef: requirement.requirementRef }),
+				),
+				executionPlan: expect.objectContaining({
+					featureTasks: [
+						expect.objectContaining({
+							participantRef: "P-B",
+							workspacePolicy: "isolated_writable",
+						}),
+					],
+				}),
+				independentReviewRequired: true,
 			},
 		});
-		const alignmentDefinedHistory = `${alignedHistory} "id":"room-full-auto-alignment-define" "id":"room-full-auto-alignment-defined-state"`;
-		const alignmentEvidenceReads = calls(
-			projectCollaborationCanaryResponse(
-				collaborationContext(
-					alignmentTask,
-					["room_state", "room_define", "room_collaborate", ...nativeCodingTools],
+		const afterDefinition = projectCollaborationCanaryResponse(
+			collaborationContext(alignmentTask, ["room_state", "room_define"], {
+				history: `${alignedHistory} "id":"room-full-auto-alignment-define"`,
+				participants,
+				records: [
 					{
-						history: alignmentDefinedHistory,
-						participants,
-						acceptanceAliases: ["AC-1", "AC-2", "AC-3", "AC-4"],
-						evidenceRef: "definition:receipt",
-					},
-				),
-			),
-		);
-		expect(alignmentEvidenceReads.map((call) => call.id)).toEqual([
-			"room-full-auto-alignment-evidence-read-a",
-			"room-full-auto-alignment-evidence-read-b",
-			"room-full-auto-alignment-evidence-read-c",
-			"room-full-auto-alignment-evidence-read-d",
-		]);
-		const alignmentEvidenceHistory = `${alignmentDefinedHistory} ${alignmentEvidenceReads.map((call) => `"id":"${call.id}"`).join(" ")}`;
-		const alignmentCollaborate = calls(
-			projectCollaborationCanaryResponse(
-				collaborationContext(
-					alignmentTask,
-					["room_state", "room_define", "room_collaborate", ...nativeCodingTools],
-					{
-						history: alignmentEvidenceHistory,
-						participants,
-						acceptanceAliases: ["AC-1", "AC-2", "AC-3", "AC-4"],
-						evidenceRef: "definition:receipt",
-					},
-				),
-			),
-		)[0];
-		expect(alignmentCollaborate).toMatchObject({
-			name: "room_collaborate",
-			id: "room-full-auto-alignment-collaborate",
-			arguments: {
-				targetParticipantRef: "P-B",
-				intent: "execute",
-				workspacePolicy: "isolated_writable",
-				acceptance: ["AC-1"],
-			},
-		});
-		const alignmentWait = calls(
-			projectCollaborationCanaryResponse(
-				collaborationContext(
-					alignmentTask,
-					["room_state", "room_define", "room_collaborate", "room_commit", ...nativeCodingTools],
-					{
-						history: `${alignmentEvidenceHistory} "id":"room-full-auto-alignment-collaborate"`,
-						participants,
-						acceptanceAliases: ["AC-1", "AC-2", "AC-3", "AC-4"],
-						evidenceRef: "definition:receipt",
-					},
-				),
-			),
-		)[0];
-		expect(alignmentWait).toMatchObject({
-			name: "room_commit",
-			id: "room-full-auto-alignment-wait-child",
-			arguments: {
-				decision: "wait",
-				waitingFor: "participant",
-				waitingForParticipantRef: "P-B",
-				resumeCondition: expect.any(String),
-				evidence: [
-					{
-						acceptance: "AC-1",
-						refs: ["execution:invoke:room-full-auto-alignment-evidence-read-a"],
-					},
-					{
-						acceptance: "AC-2",
-						refs: ["execution:invoke:room-full-auto-alignment-evidence-read-b"],
-					},
-					{
-						acceptance: "AC-3",
-						refs: ["execution:invoke:room-full-auto-alignment-evidence-read-c"],
-					},
-					{
-						acceptance: "AC-4",
-						refs: ["execution:invoke:room-full-auto-alignment-evidence-read-d"],
+						role: "toolResult",
+						toolCallId: "room-full-auto-alignment-define",
+						toolName: "room_define",
+						isError: false,
 					},
 				],
-			},
-		});
-		const alignmentStopsForChild = calls(
-			projectCollaborationCanaryResponse(
-				collaborationContext(
-					alignmentTask,
-					["room_state", "room_define", "room_collaborate", "room_commit", ...nativeCodingTools],
-					{
-						history:
-							`${alignmentEvidenceHistory} ` +
-							'"id":"room-full-auto-alignment-collaborate" ' +
-							'"id":"room-full-auto-alignment-wait-child"',
-						participants,
-						acceptanceAliases: ["AC-1", "AC-2", "AC-3", "AC-4"],
-						pendingIntegrations: [],
-					},
-				),
-			),
+			}),
 		);
-		expect(alignmentStopsForChild).toEqual([]);
-		const resumedIntegrationState = calls(
-			projectCollaborationCanaryResponse(
-				collaborationContext(alignmentTask, ["room_state", "room_integrate"], {
-					history:
-						`${alignmentEvidenceHistory} ` +
-						'"id":"room-full-auto-alignment-collaborate" ' +
-						'"id":"room-full-auto-alignment-wait-child" 这是恢复轮次',
-					participants,
-					acceptanceAliases: ["AC-1", "AC-2", "AC-3", "AC-4"],
-					childTaskId: "task:room-full-auto-child",
-					pendingIntegrations: [],
-				}),
-			),
-		)[0];
-		expect(resumedIntegrationState).toMatchObject({
-			name: "room_state",
-			id: "room-full-auto-integration-state",
-		});
+		expect(calls(afterDefinition)).toEqual([]);
+		expect(afterDefinition.content).toEqual([
+			expect.objectContaining({ type: "text", text: expect.stringContaining("开始行动") }),
+		]);
 
 		const childTask = [
 			"当前任务：",
@@ -870,7 +820,7 @@ describe("deterministic context epoch Provider", () => {
 			id: "room-full-auto-integration-integrated-shell",
 		});
 
-		const integrationHandoffReview = calls(
+		const integrationCommit = calls(
 			projectCollaborationCanaryResponse(
 				collaborationContext(integrationTask, integrationTools, {
 					...integrationBase,
@@ -889,13 +839,11 @@ describe("deterministic context epoch Provider", () => {
 				}),
 			),
 		)[0];
-		expect(integrationHandoffReview).toMatchObject({
+		expect(integrationCommit).toMatchObject({
 			name: "room_commit",
-			id: "room-full-auto-integration-handoff-review",
+			id: "room-full-auto-integration-commit",
 			arguments: {
-				decision: "handoff",
-				targetParticipantRef: "P-C",
-				intent: "review",
+				decision: "deliver",
 				evidence: expect.arrayContaining([
 					{
 						acceptance: "AC-1",
@@ -903,41 +851,6 @@ describe("deterministic context epoch Provider", () => {
 					},
 				]),
 			},
-		});
-		const integrationStopsAfterHandoff = calls(
-			projectCollaborationCanaryResponse(
-				collaborationContext(integrationTask, integrationTools, {
-					...integrationBase,
-					history: [
-						'"id":"room-full-auto-alignment-wait-child"',
-						'"id":"room-full-auto-integration-state"',
-						'"id":"room-full-auto-integration-integrate"',
-						'"id":"room-full-auto-integration-integrated-state"',
-						'"id":"room-full-auto-integration-read-integrated-a"',
-						'"id":"room-full-auto-integration-read-integrated-b"',
-						'"id":"room-full-auto-integration-read-integrated-c"',
-						'"id":"room-full-auto-integration-integrated-shell"',
-						'"id":"room-full-auto-integration-handoff-review"',
-					].join(" "),
-				}),
-			),
-		);
-		expect(integrationStopsAfterHandoff).toEqual([]);
-		const resumedAfterReviewHandoff = calls(
-			projectCollaborationCanaryResponse(
-				collaborationContext(integrationTask, integrationTools, {
-					...integrationBase,
-					history: [
-						'"id":"room-full-auto-alignment-wait-child"',
-						'"id":"room-full-auto-integration-handoff-review"',
-						"这是恢复轮次",
-					].join(" "),
-				}),
-			),
-		)[0];
-		expect(resumedAfterReviewHandoff).toMatchObject({
-			name: "room_state",
-			id: "room-full-auto-await-review-state",
 		});
 
 		const reviewTask = [
@@ -1044,11 +957,7 @@ describe("deterministic context epoch Provider", () => {
 		const finalDelivery = calls(
 			projectCollaborationCanaryResponse(
 				collaborationContext(finalTask, ["room_state", "room_commit"], {
-					history: [
-						'"id":"room-full-auto-integration-handoff-review"',
-						'"id":"room-full-auto-review-commit"',
-						'"id":"room-full-auto-await-review-state"',
-					].join(" "),
+					history: ['"id":"room-full-auto-review-commit"', '"id":"room-full-auto-await-review-state"'].join(" "),
 					records: [
 						{
 							schemaVersion: "wisdom-weasel.room-state-tool.v1",
@@ -1070,11 +979,374 @@ describe("deterministic context epoch Provider", () => {
 		});
 	});
 
+	it("uses the current report projection instead of stale integration history", () => {
+		const task = [
+			"原始需求（不可改写）：",
+			"- 写 TUI",
+			"当前任务：",
+			"- 目标：结合已经完成的工作、验收证据和复核结论，向用户给出最终回复。",
+			"验收条件（提交证据时使用 AC 编号）：",
+			"- AC-1 | 待验收 | 唯一最终交付",
+		].join("\n");
+		const value = collaborationContext(task, ["room_state", "room_commit"], {
+			history: '"id":"room-full-auto-integration-commit"',
+			records: [
+				{
+					currentResponsibility: {
+						taskKind: "work",
+						planTaskKind: "integration",
+					},
+				},
+			],
+		});
+		value.systemPrompt +=
+			'\n<pi-context provider="paw.room-recovery">' +
+			'{"authoritativeProjectionRef":{"taskId":"room-report-task:current"}}' +
+			"</pi-context>";
+
+		expect(calls(projectCollaborationCanaryResponse(value))).toEqual([
+			expect.objectContaining({
+				name: "room_state",
+				id: "room-full-auto-await-review-state",
+			}),
+		]);
+	});
+
+	it("uses the current integration projection instead of stale alignment history", () => {
+		const task = [
+			"原始需求（不可改写）：",
+			"- 写 TUI",
+			"当前任务：",
+			"- 目标：合入已完成的界面功能后，重新运行验证并核对共享结果。",
+			"验收条件（提交证据时使用 AC 编号）：",
+			"- AC-1 | 待验收 | 集成实现结果",
+		].join("\n");
+		const participants = [
+			{ participantRef: "P-A", capabilitySummary: "coordinator" },
+			{ participantRef: "P-B", capabilitySummary: "implementer" },
+			{ participantRef: "P-C", capabilitySummary: "reviewer" },
+		];
+		const oldAlignmentState = {
+			currentResponsibility: {
+				taskKind: "work",
+				planTaskKind: "",
+			},
+		};
+		const successfulDefinition = {
+			role: "toolResult",
+			toolCallId: "room-full-auto-alignment-define",
+			toolName: "room_define",
+			isError: false,
+		};
+		const history = [
+			'"id":"room-full-auto-alignment-state"',
+			'"id":"room-full-auto-alignment-define"',
+			"先做一个最小可运行的终端界面：有清晰的标题、输入区和结果区；不用安装新依赖，启动后能直接使用。",
+			"优先保证键盘操作、状态反馈和基本错误提示，先不加入网络同步或复杂主题。",
+			"交付时保留现有项目约定，只改实现所需内容，并给出可复现的验证结果。",
+		].join(" ");
+		const currentProjection = (records: Record<string, unknown>[], currentHistory = history): Context => {
+			const value = collaborationContext(task, ["room_state", "room_define", "room_integrate"], {
+				history: currentHistory,
+				participants,
+				acceptanceAliases: ["AC-1"],
+				records,
+			});
+			value.systemPrompt +=
+				'\n<pi-context provider="paw.room-recovery">' +
+				'{"authoritativeProjectionRef":{"taskId":"room-task:integration:current"}}' +
+				"</pi-context>";
+			return value;
+		};
+
+		expect(
+			calls(projectCollaborationCanaryResponse(currentProjection([oldAlignmentState, successfulDefinition]))),
+		).toEqual([
+			expect.objectContaining({
+				name: "room_state",
+				id: "room-full-auto-integration-state",
+			}),
+		]);
+
+		const integrationState = {
+			currentResponsibility: {
+				taskKind: "work",
+				planTaskKind: "integration",
+			},
+			childTaskId: "room-task:feature:delivered",
+		};
+		const afterState = currentProjection(
+			[oldAlignmentState, successfulDefinition, integrationState],
+			`${history} "id":"room-full-auto-integration-state"`,
+		);
+		expect(calls(projectCollaborationCanaryResponse(afterState))).toEqual([
+			expect.objectContaining({
+				name: "room_integrate",
+				id: "room-full-auto-integration-integrate",
+				arguments: { childTaskId: "room-task:feature:delivered" },
+			}),
+		]);
+	});
+
+	it("binds every implementation acceptance item to its own verification receipt", () => {
+		const participants = [
+			{ participantRef: "P-A", capabilitySummary: "coordinator" },
+			{ participantRef: "P-B", capabilitySummary: "implementer" },
+			{ participantRef: "P-C", capabilitySummary: "reviewer" },
+		];
+		const task = [
+			"当前任务：",
+			"- 目标：ROOM-FULL-AUTO-CHILD",
+			"验收条件（提交证据时使用 AC 编号）：",
+			"- AC-1 | 待验收 | 基础行为",
+			"- AC-2 | 待验收 | 边界行为",
+			"- AC-3 | 待验收 | 空输入行为",
+			"- AC-4 | 待验收 | 完整回归",
+		].join("\n");
+		const tools = ["room_state", "read", "edit", "bash", "room_commit"];
+		const base = {
+			participants,
+			acceptanceAliases: ["AC-1", "AC-2", "AC-3", "AC-4"],
+			mutationApplied: true,
+			exitCode: 0,
+		};
+		const prefix = [
+			'"id":"room-full-auto-child-state"',
+			'"id":"room-full-auto-child-read"',
+			'"id":"room-full-auto-child-patch"',
+		];
+		const responseFor = (history: string[]) =>
+			calls(
+				projectCollaborationCanaryResponse(
+					collaborationContext(task, tools, { ...base, history: history.join(" ") }),
+				),
+			)[0];
+
+		expect(responseFor(prefix)).toMatchObject({
+			name: "bash",
+			id: "room-full-auto-child-test",
+			arguments: { command: "/usr/bin/python3 -m unittest -v" },
+		});
+		expect(() =>
+			projectCollaborationCanaryResponse(
+				collaborationContext(task, tools, {
+					...base,
+					history: [...prefix, '"id":"room-full-auto-child-test"'].join(" "),
+					records: [
+						{
+							executionReceiptId: "execution:invoke:session-child:dispatch-child:room-full-auto-child-test",
+							status: "failed",
+						},
+					],
+				}),
+			),
+		).toThrow("implementation child verification failed");
+		expect(responseFor([...prefix, '"id":"room-full-auto-child-test"'])).toMatchObject({
+			name: "bash",
+			id: "room-full-auto-child-verify-2",
+			arguments: { command: "/usr/bin/python3 -m unittest -v" },
+		});
+		expect(
+			responseFor([...prefix, '"id":"room-full-auto-child-test"', '"id":"room-full-auto-child-verify-2"']),
+		).toMatchObject({
+			name: "bash",
+			id: "room-full-auto-child-verify-3",
+			arguments: { command: "/usr/bin/python3 -m unittest -v" },
+		});
+		expect(
+			responseFor([
+				...prefix,
+				'"id":"room-full-auto-child-test"',
+				'"id":"room-full-auto-child-verify-2"',
+				'"id":"room-full-auto-child-verify-3"',
+			]),
+		).toMatchObject({
+			name: "bash",
+			id: "room-full-auto-child-verify-4",
+			arguments: { command: "/usr/bin/python3 -m unittest -v" },
+		});
+
+		const commit = responseFor([
+			...prefix,
+			'"id":"room-full-auto-child-test"',
+			'"id":"room-full-auto-child-verify-2"',
+			'"id":"room-full-auto-child-verify-3"',
+			'"id":"room-full-auto-child-verify-4"',
+		]);
+		expect(commit).toMatchObject({
+			name: "room_commit",
+			id: "room-full-auto-child-commit",
+			arguments: {
+				decision: "deliver",
+				evidence: [
+					{ acceptance: "AC-1", refs: ["execution:invoke:room-full-auto-child-test"] },
+					{ acceptance: "AC-2", refs: ["execution:invoke:room-full-auto-child-verify-2"] },
+					{ acceptance: "AC-3", refs: ["execution:invoke:room-full-auto-child-verify-3"] },
+					{ acceptance: "AC-4", refs: ["execution:invoke:room-full-auto-child-verify-4"] },
+				],
+			},
+		});
+
+		const repairHistory = [
+			...prefix,
+			'"id":"room-full-auto-child-test"',
+			'"id":"room-full-auto-child-verify-2"',
+			'"id":"room-full-auto-child-verify-3"',
+			'"id":"room-full-auto-child-verify-4"',
+			'"id":"room-full-auto-child-commit"',
+			'<room-work-follow-up source="system" kind="repair_commit">重新提交验收证据。</room-work-follow-up>',
+		];
+		const receiptRecords = [
+			{
+				evidenceRef: "execution:invoke:session-child:dispatch-child:room-full-auto-child-verify-4",
+			},
+		];
+		const repairedState = calls(
+			projectCollaborationCanaryResponse(
+				collaborationContext(task, tools, {
+					...base,
+					history: repairHistory.join(" "),
+					records: receiptRecords,
+				}),
+			),
+		)[0];
+		expect(repairedState).toMatchObject({
+			name: "room_state",
+			id: "room-full-auto-child-repair-state",
+		});
+		const repairedCommit = calls(
+			projectCollaborationCanaryResponse(
+				collaborationContext(task, tools, {
+					...base,
+					history: [...repairHistory, '"id":"room-full-auto-child-repair-state"'].join(" "),
+					records: receiptRecords,
+				}),
+			),
+		)[0];
+		expect(repairedCommit).toMatchObject({
+			name: "room_commit",
+			id: "room-full-auto-child-repair-commit",
+			arguments: {
+				evidence: [
+					{
+						acceptance: "AC-1",
+						refs: ["execution:invoke:session-child:dispatch-child:room-full-auto-child-test"],
+					},
+					{
+						acceptance: "AC-2",
+						refs: ["execution:invoke:session-child:dispatch-child:room-full-auto-child-verify-2"],
+					},
+					{
+						acceptance: "AC-3",
+						refs: ["execution:invoke:session-child:dispatch-child:room-full-auto-child-verify-3"],
+					},
+					{
+						acceptance: "AC-4",
+						refs: ["execution:invoke:session-child:dispatch-child:room-full-auto-child-verify-4"],
+					},
+				],
+			},
+		});
+	});
+
+	it("retries a rejected Room definition instead of advancing to workspace work", () => {
+		const participants = [
+			{ participantRef: "P-A", capabilitySummary: "coordinator" },
+			{ participantRef: "P-B", capabilitySummary: "implementer" },
+			{ participantRef: "P-C", capabilitySummary: "reviewer" },
+		];
+		const alignmentTask = [
+			"原始需求（不可改写）：",
+			"- 写 TUI",
+			"当前任务：",
+			"- 目标：写 TUI",
+			"验收条件（提交证据时使用 AC 编号）：",
+			"- AC-1 | 待验收 | 完成需求对齐",
+		].join("\n");
+		const answers = [
+			"先做一个最小可运行的终端界面：有清晰的标题、输入区和结果区；不用安装新依赖，启动后能直接使用。",
+			"优先保证键盘操作、状态反馈和基本错误提示，先不加入网络同步或复杂主题。",
+			"交付时保留现有项目约定，只改实现所需内容，并给出可复现的验证结果。",
+		].join(" ");
+		const rejectedDefinitionResponse = projectCollaborationCanaryResponse(
+			collaborationContext(alignmentTask, ["room_state", "room_define"], {
+				history:
+					answers +
+					' "id":"room-full-auto-alignment-state" ' +
+					'"id":"room-full-auto-alignment-definition-state" ' +
+					'"id":"room-full-auto-alignment-define" ' +
+					'"id":"room-full-auto-alignment-defined-state"',
+				participants,
+				definitionRequirements: [
+					{ requirementRef: "requirement:tui", statement: "写 TUI" },
+					{ requirementRef: "requirement:layout", statement: "显示标题、输入区和结果区" },
+					{ requirementRef: "requirement:feedback", statement: "提供键盘操作、状态与错误反馈" },
+					{ requirementRef: "requirement:verification", statement: "提供可重复执行的验证结果" },
+				],
+				records: [
+					{
+						role: "toolResult",
+						toolCallId: "room-full-auto-alignment-define",
+						toolName: "room_define",
+						isError: true,
+					},
+				],
+			}),
+		);
+
+		expect(calls(rejectedDefinitionResponse)).toEqual([
+			expect.objectContaining({
+				name: "room_state",
+				id: "room-full-auto-alignment-definition-retry-state",
+			}),
+		]);
+
+		const retriedDefinition = calls(
+			projectCollaborationCanaryResponse(
+				collaborationContext(alignmentTask, ["room_state", "room_define"], {
+					history:
+						answers +
+						' "id":"room-full-auto-alignment-state" ' +
+						'"id":"room-full-auto-alignment-definition-state" ' +
+						'"id":"room-full-auto-alignment-define" ' +
+						'"id":"room-full-auto-alignment-definition-retry-state"',
+					participants,
+					definitionRequirements: [
+						{ requirementRef: "requirement:tui", statement: "写 TUI" },
+						{ requirementRef: "requirement:layout", statement: "显示标题、输入区和结果区" },
+						{ requirementRef: "requirement:feedback", statement: "提供键盘操作、状态与错误反馈" },
+						{ requirementRef: "requirement:verification", statement: "提供可重复执行的验证结果" },
+					],
+					records: [
+						{
+							role: "toolResult",
+							toolCallId: "room-full-auto-alignment-define",
+							toolName: "room_define",
+							isError: true,
+						},
+					],
+				}),
+			),
+		)[0];
+		expect(retriedDefinition).toMatchObject({
+			name: "room_define",
+			id: "room-full-auto-alignment-define",
+			arguments: expect.objectContaining({
+				entrySurface: expect.any(String),
+				primaryInteraction: expect.any(String),
+				observableCompletion: expect.any(String),
+				executionPlan: expect.any(Object),
+				independentReviewRequired: true,
+			}),
+		});
+	});
+
 	it("summarizes and recovers an ordinary Agent Session without tools", () => {
 		const summary = agentSessionCanaryResponse(
 			agentContext(
 				[],
-				"The messages above are a conversation to summarize. Create a structured context checkpoint summary.",
+				"This is the PREFIX of a turn that was too large to keep. The SUFFIX (recent work) is retained.",
+				"You are a context summarization assistant. Your task is to read a conversation between a user and an AI assistant, then produce a structured summary following the exact format specified.",
 			),
 		);
 		expect(summary.content).toEqual([

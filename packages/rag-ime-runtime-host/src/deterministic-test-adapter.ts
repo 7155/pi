@@ -19,7 +19,8 @@ const THRESHOLD_CONTINUATION_SCENARIO = "threshold-continuation";
 const AGENT_SESSION_TASK_MARKER = "AGENT-SESSION-RESILIENCE";
 const AGENT_SESSION_FINAL_MARKER = "AGENT-SESSION-CANARY-OK";
 const AGENT_SESSION_RECOVERY_MARKER = "AGENT-SESSION-RECOVERY-OK";
-const AGENT_SESSION_SKILL = "test-driven-implementation";
+const AGENT_SESSION_SKILL = "implementation-execution";
+const AGENT_SESSION_TODO_TASKS = ["运行失败基线测试", "精确修改 normalize_scores", "运行回归测试并交付"] as const;
 const PROJECT_TOOL_RECOVERY_MARKER = "PROJECT-TOOL-RECOVERY-CANARY";
 
 // Coding tools are resident Pi tools. Their hidden governed targets are bound
@@ -100,6 +101,67 @@ function parsedContextRecords(context: Context): Array<Record<string, unknown>> 
 	return values.flatMap(recordsIn);
 }
 
+function toolCallSucceeded(context: Context, toolCallId: string, toolName: string): boolean {
+	return parsedContextRecords(context).some((record) => {
+		if (
+			String(record.toolCallId ?? "") !== toolCallId ||
+			String(record.toolName ?? "") !== toolName ||
+			record.isError === true
+		) {
+			return false;
+		}
+		return record.role === "toolResult" || (record.status === "completed" && Object.hasOwn(record, "result"));
+	});
+}
+
+function toolCallFailed(context: Context, toolCallId: string, toolName: string): boolean {
+	const receiptSuffix = `:${toolCallId}`;
+	return parsedContextRecords(context).some((record) => {
+		const failedToolResult =
+			String(record.toolCallId ?? "") === toolCallId &&
+			String(record.toolName ?? "") === toolName &&
+			record.isError === true;
+		const failedExecutionReceipt =
+			record.status === "failed" &&
+			[String(record.executionReceiptId ?? ""), String(record.invocationReceiptId ?? "")].some((receiptId) =>
+				receiptId.endsWith(receiptSuffix),
+			);
+		return failedToolResult || failedExecutionReceipt;
+	});
+}
+
+function projectedPlanTaskKind(context: Context): string {
+	const recoveryContext = (context.systemPrompt ?? "").match(
+		/<pi-context provider="paw\.room-recovery"[^>]*>([\s\S]*?)<\/pi-context>/u,
+	)?.[1];
+	if (!recoveryContext) return "";
+	try {
+		const recovery = JSON.parse(recoveryContext) as Record<string, unknown>;
+		const projection = recovery.authoritativeProjectionRef;
+		if (typeof projection !== "object" || projection === null || Array.isArray(projection)) return "";
+		const taskId = String((projection as Record<string, unknown>).taskId ?? "");
+		if (taskId.startsWith("room-report-task:")) return "report";
+		return taskId.match(/^room-task:(feature|integration|review):/u)?.[1] ?? "";
+	} catch {
+		return "";
+	}
+}
+
+function currentTaskKinds(context: Context): { taskKind: string; planTaskKind: string } {
+	const projectedKind = projectedPlanTaskKind(context);
+	for (const record of parsedContextRecords(context).reverse()) {
+		const responsibility = record.currentResponsibility;
+		const value =
+			typeof responsibility === "object" && responsibility !== null && !Array.isArray(responsibility)
+				? (responsibility as Record<string, unknown>)
+				: record;
+		const taskKind = String(value.taskKind ?? "").trim();
+		const planTaskKind = String(value.planTaskKind ?? "").trim();
+		if (taskKind || planTaskKind) return { taskKind, planTaskKind: projectedKind || planTaskKind };
+	}
+	return { taskKind: "", planTaskKind: projectedKind };
+}
+
 function latestWorkspaceReadReceipt(context: Context, fileName: string): Record<string, unknown> | undefined {
 	return parsedContextRecords(context)
 		.filter((record) => {
@@ -166,6 +228,22 @@ function currentAcceptanceAliases(context: Context, task: string): string[] {
 	return acceptanceAliases(task);
 }
 
+function activeDefinitionRequirementRefs(context: Context): string[] {
+	for (const record of parsedContextRecords(context).reverse()) {
+		const rawRequirements = record.definitionRequirements;
+		if (!Array.isArray(rawRequirements)) continue;
+		const refs = rawRequirements
+			.map((item) =>
+				typeof item === "object" && item !== null && !Array.isArray(item)
+					? String((item as Record<string, unknown>).requirementRef ?? "").trim()
+					: "",
+			)
+			.filter((value, index, values) => value.length > 0 && values.indexOf(value) === index);
+		if (refs.length > 0) return refs;
+	}
+	throw new Error("The alignment room_state is missing active definition requirement refs");
+}
+
 function runtimeEvidenceRefs(context: Context, limit = 2): string[] {
 	return parsedContextRecords(context)
 		.map((record) => {
@@ -176,6 +254,23 @@ function runtimeEvidenceRefs(context: Context, limit = 2): string[] {
 		})
 		.filter((value, index, values) => value.length > 0 && values.indexOf(value) === index)
 		.slice(-limit);
+}
+
+function runtimeEvidenceRefForToolCall(context: Context, toolCallId: string): string {
+	const suffix = `:${toolCallId}`;
+	let currentInvocationScope = "";
+	for (const record of parsedContextRecords(context).reverse()) {
+		const evidenceRef = String(record.evidenceRef ?? "").trim();
+		if (evidenceRef.endsWith(suffix)) return evidenceRef;
+		if (!currentInvocationScope && evidenceRef.startsWith("execution:invoke:")) {
+			const separator = evidenceRef.lastIndexOf(":");
+			if (separator > "execution:invoke:".length) {
+				currentInvocationScope = evidenceRef.slice(0, separator + 1);
+			}
+		}
+	}
+	if (currentInvocationScope) return `${currentInvocationScope}${toolCallId}`;
+	return `execution:invoke:${toolCallId}`;
 }
 
 function evidenceProposal(aliases: string[], evidenceRefs: string[]): Array<Record<string, unknown>> {
@@ -423,22 +518,20 @@ export function projectCollaborationCanaryResponse(context: Context): AssistantM
 		["这是恢复轮次", '<room-work-follow-up source="system"'].some(
 			(marker) => serialized.lastIndexOf(marker) > waitChildIndex,
 		);
-	const reviewHandoffIndex = serialized.lastIndexOf("room-full-auto-integration-handoff-review");
-	const resumedAfterReviewHandoff =
-		reviewHandoffIndex >= 0 &&
-		["这是恢复轮次", '<room-work-follow-up source="system"'].some(
-			(marker) => serialized.lastIndexOf(marker) > reviewHandoffIndex,
-		);
-	const taskPhase = currentTask.includes("ROOM-FULL-AUTO-REVIEW")
-		? "review"
-		: currentTask.includes("ROOM-FULL-AUTO-CHILD")
-			? "child"
-			: "";
+	const { taskKind, planTaskKind } = currentTaskKinds(context);
+	const taskPhase =
+		currentTask.includes("ROOM-FULL-AUTO-REVIEW") || taskKind === "review" || planTaskKind === "review"
+			? "review"
+			: currentTask.includes("ROOM-FULL-AUTO-CHILD") || planTaskKind === "feature"
+				? "child"
+				: "";
 	const phase =
 		taskPhase ||
-		(reviewerResult || resumedAfterReviewHandoff
+		(taskKind === "report" || planTaskKind === "report" || reviewerResult
 			? "await-review"
-			: serialized.includes("room-full-auto-alignment-wait-child") && (pendingIntegrationReady || resumedAfterWait)
+			: planTaskKind === "integration" ||
+					(serialized.includes("room-full-auto-alignment-wait-child") &&
+						(pendingIntegrationReady || resumedAfterWait))
 				? "integration"
 				: "alignment");
 	const prefix = `room-full-auto-${phase}`;
@@ -446,29 +539,6 @@ export function projectCollaborationCanaryResponse(context: Context): AssistantM
 	const aliases = (): string[] => {
 		const current = currentAcceptanceAliases(context, task);
 		return current.length > 0 ? current : ["AC-1", "AC-2", "AC-3", "AC-4"];
-	};
-	const settlementEvidence = (
-		currentAliases: string[],
-		currentToolCallId: string,
-		includeCurrent = true,
-	): Array<Record<string, unknown>> => {
-		const referenceSet = new Set(runtimeEvidenceRefs(context, 64));
-		for (const record of parsedContextRecords(context)) {
-			for (const key of ["contextEvidenceRefs", "evidenceRefs", "acceptedEvidenceRefs"]) {
-				const values = record[key];
-				if (!Array.isArray(values)) continue;
-				for (const value of values) {
-					const reference = String(value ?? "").trim();
-					if (reference) referenceSet.add(reference);
-				}
-			}
-		}
-		const references = [...referenceSet];
-		const fallback = `execution:invoke:${currentToolCallId}`;
-		return currentAliases.map((acceptance) => ({
-			acceptance,
-			refs: includeCurrent ? references : references.length > 0 ? references : [fallback],
-		}));
 	};
 	const distinctRuntimeEvidence = (
 		currentAliases: string[],
@@ -479,7 +549,7 @@ export function projectCollaborationCanaryResponse(context: Context): AssistantM
 		}
 		return currentAliases.map((acceptance, index) => ({
 			acceptance,
-			refs: [`execution:invoke:${toolCallIds[index]}`],
+			refs: [runtimeEvidenceRefForToolCall(context, toolCallIds[index])],
 		}));
 	};
 	const acceptedEvidence = (currentAliases: string[]): Array<Record<string, unknown>> => {
@@ -540,6 +610,7 @@ export function projectCollaborationCanaryResponse(context: Context): AssistantM
 						evidence: [],
 						residualRisks: [],
 						waitingFor: "user",
+						questionKind: "bounded",
 						question:
 							waitIndex === 0
 								? "终端界面的最小版本需要包含哪些可见区域和启动行为？"
@@ -547,8 +618,17 @@ export function projectCollaborationCanaryResponse(context: Context): AssistantM
 									? "交互、状态反馈和错误提示中，哪一项需要优先保证？"
 									: "交付边界和验证方式有哪些必须遵守的限制？",
 						questionOptions: [
-							{ value: "minimum", label: "先完成最小可用界面", recommended: true },
-							{ value: "polish", label: "先做完整视觉和主题" },
+							{
+								value: "minimum",
+								label: "先完成最小可用界面",
+								description: "先交付标题、输入区和结果区，优先保证可以直接启动和键盘操作。",
+								recommended: true,
+							},
+							{
+								value: "polish",
+								label: "先做完整视觉和主题",
+								description: "在最小界面之外，同时安排视觉主题和更多交互细节，因此实现范围会更大。",
+							},
 						],
 						resumeCondition: "收到用户对当前问题的一条普通自然语言回答后继续需求对齐。",
 					},
@@ -571,122 +651,91 @@ export function projectCollaborationCanaryResponse(context: Context): AssistantM
 				);
 			}
 		}
-		if (!serialized.includes(callId("define"))) {
+		if (!toolCallSucceeded(context, callId("define"), "room_define")) {
+			const definitionStateId = toolCallFailed(context, callId("define"), "room_define")
+				? callId("definition-retry-state")
+				: callId("definition-state");
+			if (!serialized.includes(definitionStateId)) return state(definitionStateId);
+			const definitionRequirementRefs = activeDefinitionRequirementRefs(context);
+			const criterionTemplates = [
+				{
+					statement: "启动后出现清晰标题、输入区和结果区，并可直接使用。",
+					kind: "user_journey",
+					fullNameZh: "启动后显示并可使用最小界面",
+				},
+				{
+					statement: "键盘操作、状态反馈和基本错误提示可观察且行为一致。",
+					kind: "requirement",
+					fullNameZh: "交互与错误反馈可观察",
+				},
+				{
+					statement: "实现遵守现有项目约定，不引入网络同步或复杂主题。",
+					kind: "requirement",
+					fullNameZh: "实现边界保持最小",
+				},
+				{
+					statement: "交付提供可重复执行的验证结果和清楚的边界说明。",
+					kind: "requirement",
+					fullNameZh: "验证结果可复现",
+				},
+			];
+			const definitionCriteria = definitionRequirementRefs.map((requirementRef, index) => ({
+				...(criterionTemplates[index] ?? {
+					statement: "已确认的补充要求可以通过启动、操作和重复验证明确核对。",
+					kind: "requirement",
+					fullNameZh: "补充要求可验证",
+				}),
+				requirementRef,
+				expectedReceiptTypes: ["evidence"],
+			}));
+			const definitionAliases = definitionCriteria.map((_, index) => `AC-${index + 1}`);
 			return fauxAssistantMessage(
 				fauxToolCall(
 					"room_define",
 					{
 						objective: "交付一个最小可运行的终端界面，满足已确认的输入、结果展示和反馈边界。",
 						expectedOutput: "可直接启动、可键盘操作、带状态反馈和基本错误提示的可验证实现。",
+						entrySurface: "在当前项目目录启动终端程序后进入最小界面。",
+						primaryInteraction: "用户通过键盘完成输入，查看结果和状态提示，并在输入无效时看到明确说明。",
+						observableCompletion:
+							"启动后可见标题、输入区和结果区；键盘操作、结果和错误提示都能通过重复运行核对。",
 						requirements: [
 							"启动后显示清晰标题、输入区和结果区，并能直接进入可用状态。",
 							"键盘操作、状态反馈和基本错误提示保持明确且可复现。",
 							"保留现有项目约定，只修改实现所需内容，不加入网络同步或复杂主题。",
 							"交付包含可重复执行的验证结果，说明已验证范围与未验证边界。",
 						],
-						acceptanceCriteria: [
-							{
-								statement: "启动后出现清晰标题、输入区和结果区，并可直接使用。",
-								kind: "user_journey",
-								expectedReceiptTypes: ["evidence"],
-								fullNameZh: "启动后显示并可使用最小界面",
-							},
-							{
-								statement: "键盘操作、状态反馈和基本错误提示可观察且行为一致。",
-								kind: "requirement",
-								expectedReceiptTypes: ["evidence"],
-								fullNameZh: "交互与错误反馈可观察",
-							},
-							{
-								statement: "实现遵守现有项目约定，不引入网络同步或复杂主题。",
-								kind: "requirement",
-								expectedReceiptTypes: ["evidence"],
-								fullNameZh: "实现边界保持最小",
-							},
-							{
-								statement: "交付提供可重复执行的验证结果和清楚的边界说明。",
-								kind: "requirement",
-								expectedReceiptTypes: ["evidence"],
-								fullNameZh: "验证结果可复现",
-							},
-						],
+						acceptanceCriteria: definitionCriteria,
 						implementationParticipantRef: participantRefForRole(context, "implementer"),
+						executionPlan: {
+							sharedContracts: [
+								"所有输入、结果和提示都在同一个最小终端界面中呈现，启动方式和验证方式保持一致。",
+							],
+							featureTasks: [
+								{
+									title: "最小终端界面与反馈",
+									participantRef: participantRefForRole(context, "implementer"),
+									userOutcome: "用户可以启动界面、用键盘输入并看到结果、状态和基本错误提示。",
+									dependencies: [],
+									writeBoundary: "只完成最小终端界面、键盘交互、结果展示和基本错误提示。",
+									workspacePolicy: "isolated_writable",
+									acceptance: definitionAliases,
+								},
+							],
+							integrationPlan: "合入已完成的界面功能后，重新运行验证并核对共享结果。",
+							integrationParticipantRef: participantRefForRole(context, "coordinator"),
+							acceptancePlan: ["从启动、键盘输入、结果展示和错误提示走完整流程，并保留可重复的验证记录。"],
+							continuityPlan:
+								"开始后先登记本次任务唯一的工作文档，分别记录用户原话与愿景、确认范围、执行分工、进度证据、失败路径和下一步；任何交接或恢复都先读这份文档。",
+						},
+						independentReviewRequired: true,
 					},
 					{ id: callId("define") },
 				),
 				{ stopReason: "toolUse" },
 			);
 		}
-		if (!serialized.includes(callId("defined-state"))) return state(callId("defined-state"));
-		requireResidentNativeCodingTools(tools, ["read"]);
-		if (!serialized.includes(callId("evidence-read"))) {
-			return fauxAssistantMessage(
-				[
-					fauxToolCall("read", { path: "README.md", offset: 0, limit: 16_384 }, { id: callId("evidence-read-a") }),
-					fauxToolCall(
-						"read",
-						{ path: "calculator.py", offset: 0, limit: 16_384 },
-						{ id: callId("evidence-read-b") },
-					),
-					fauxToolCall(
-						"read",
-						{ path: "test_calculator.py", offset: 0, limit: 16_384 },
-						{ id: callId("evidence-read-c") },
-					),
-					fauxToolCall("read", { path: "README.md", offset: 0, limit: 16_384 }, { id: callId("evidence-read-d") }),
-				],
-				{ stopReason: "toolUse" },
-			);
-		}
-		if (!tools.has("room_collaborate")) {
-			return fauxAssistantMessage(
-				fauxToolCall("tool_load", { name: "room_collaborate" }, { id: callId("load-collaborate") }),
-				{ stopReason: "toolUse" },
-			);
-		}
-		if (!serialized.includes(callId("collaborate"))) {
-			const currentAliases = aliases();
-			return fauxAssistantMessage(
-				fauxToolCall(
-					"room_collaborate",
-					{
-						targetParticipantRef: participantRefForRole(context, "implementer"),
-						intent: "execute",
-						workspacePolicy: "isolated_writable",
-						objective:
-							"ROOM-FULL-AUTO-CHILD：在隔离工作区完成已确认终端界面的最小实现，" +
-							"只修改 calculator.py，不修改测试文件或其他路径。",
-						expectedOutput: "隔离工作区中的最小实现和可复现回归验证结果。",
-						acceptance: currentAliases.slice(0, 1),
-						evidenceRefs: runtimeEvidenceRefs(context, 8),
-					},
-					{ id: callId("collaborate") },
-				),
-				{ stopReason: "toolUse" },
-			);
-		}
-		if (!serialized.includes(callId("wait-child"))) {
-			const currentAliases = aliases();
-			return commit(
-				{
-					decision: "wait",
-					summary: "已邀请实施伙伴在隔离工作区完成有界实现，等待其返回结果后由协调者集成。",
-					publicSummary: "实施伙伴正在独立工作区完成有界实现，完成后由协调者合入并验证。",
-					evidence: distinctRuntimeEvidence(currentAliases, [
-						callId("evidence-read-a"),
-						callId("evidence-read-b"),
-						callId("evidence-read-c"),
-						callId("evidence-read-d"),
-					]),
-					residualRisks: ["隔离工作区结果尚未合入权威工作区。"],
-					waitingFor: "participant",
-					waitingForParticipantRef: participantRefForRole(context, "implementer"),
-					resumeCondition: "实施伙伴已返回隔离工作区结果，Facilitator 可以继续集成。",
-				},
-				callId("wait-child"),
-			);
-		}
-		return fauxAssistantMessage("等待实施伙伴返回隔离工作区结果。");
+		return fauxAssistantMessage("我明白了。方案已准备好；请确认后点击“开始行动”。");
 	}
 
 	if (phase === "integration") {
@@ -753,32 +802,25 @@ export function projectCollaborationCanaryResponse(context: Context): AssistantM
 				{ stopReason: "toolUse" },
 			);
 		}
-		if (!serialized.includes(callId("handoff-review"))) {
+		if (!serialized.includes(callId("commit"))) {
 			const currentAliases = aliases();
 			return commit(
 				{
-					decision: "handoff",
-					summary: "集成工作区已完成验证，交由独立 Reviewer 按全部验收条件复核。",
-					publicSummary: "集成结果已验证，下一步交由独立 Reviewer 复核后由协调者收口。",
+					decision: "deliver",
+					summary: "集成工作区已完成验证，计划内的独立复核任务可以按依赖自动释放。",
+					publicSummary: "界面功能已经合入并通过完整验证，接下来按已确认计划进入独立复核。",
 					evidence: distinctRuntimeEvidence(currentAliases, [
 						callId("read-integrated-a"),
 						callId("integrated-shell"),
 						callId("read-integrated-b"),
 						callId("read-integrated-c"),
 					]),
-					residualRisks: ["独立复核尚未返回。"],
-					targetParticipantRef: participantRefForRole(context, "reviewer"),
-					intent: "review",
-					nextTask:
-						"ROOM-FULL-AUTO-REVIEW：只读复核 Facilitator 集成后的完整结果和全部验收条件，" +
-						"不得修改任何文件，也不得替实施者修复问题。",
-					expectedOutput: "独立 Reviewer 的验收覆盖、证据和可交付建议。",
-					acceptanceAliases: currentAliases,
+					residualRisks: [],
 				},
-				callId("handoff-review"),
+				callId("commit"),
 			);
 		}
-		return fauxAssistantMessage("等待独立 Reviewer 返回复核结果。");
+		return fauxAssistantMessage("集成结果已提交，等待计划内独立复核开始。");
 	}
 
 	if (phase === "await-review") {
@@ -840,24 +882,40 @@ export function projectCollaborationCanaryResponse(context: Context): AssistantM
 		if (!contextHasJsonField(context, "mutationApplied", true)) {
 			throw new Error("The bounded implementation child did not produce an applied edit receipt");
 		}
-		if (!serialized.includes(callId("test"))) {
+		const childAliases = aliases();
+		const childVerifications = childAliases.map((_, index) => ({
+			id: index === 0 ? callId("test") : callId(`verify-${index + 1}`),
+			command: "/usr/bin/python3 -m unittest -v",
+		}));
+		const repairingCommit = serialized.lastIndexOf("repair_commit") > serialized.lastIndexOf(callId("commit"));
+		const commitId = repairingCommit ? callId("repair-commit") : callId("commit");
+		if (repairingCommit && !serialized.includes(callId("repair-state"))) {
+			return state(callId("repair-state"));
+		}
+		if (childVerifications.some((verification) => toolCallFailed(context, verification.id, "bash"))) {
+			throw new Error("The bounded implementation child verification failed");
+		}
+		const pendingVerification = childVerifications.find((verification) => !serialized.includes(verification.id));
+		if (pendingVerification) {
 			return fauxAssistantMessage(
-				fauxToolCall("bash", { command: "/usr/bin/python3 -m unittest -v", timeout: 30 }, { id: callId("test") }),
+				fauxToolCall("bash", { command: pendingVerification.command, timeout: 30 }, { id: pendingVerification.id }),
 				{ stopReason: "toolUse" },
 			);
 		}
 		if (contextHasNonzeroExitCode(context)) throw new Error("The bounded implementation child verification failed");
-		if (!serialized.includes(callId("commit"))) {
-			const childAliases = aliases();
+		if (!serialized.includes(commitId)) {
 			return commit(
 				{
 					decision: "deliver",
 					summary: "隔离工作区中的有界实现和回归验证已完成，未修改测试文件。",
 					publicSummary: "实施伙伴已返回隔离工作区结果和可复现验证证据，等待协调者合入。",
-					evidence: settlementEvidence(childAliases.length > 0 ? childAliases : ["AC-1"], callId("test")),
+					evidence: distinctRuntimeEvidence(
+						childAliases,
+						childVerifications.map((verification) => verification.id),
+					),
 					residualRisks: [],
 				},
-				callId("commit"),
+				commitId,
 			);
 		}
 		return fauxAssistantMessage("隔离实现结果已返回协调者。");
@@ -919,7 +977,7 @@ export function projectCollaborationCanaryResponse(context: Context): AssistantM
 /** Drive an ordinary Agent Session through failure, planning, approvals, repair and recovery. */
 export function agentSessionCanaryResponse(context: Context): AssistantMessage {
 	const serialized = contextText(context);
-	if (serialized.includes("structured context checkpoint summary")) {
+	if ((context.systemPrompt ?? "").startsWith("You are a context summarization assistant.")) {
 		return fauxAssistantMessage(
 			`${AGENT_SESSION_TASK_MARKER} completed. Preserve the failed read, failed baseline test, ` +
 				"approved repair, passing regression test, loaded Skill and Tool receipts, and final delivery state.",
@@ -1020,39 +1078,23 @@ export function agentSessionCanaryResponse(context: Context): AssistantMessage {
 		throw new Error("read ended before the boundary fixture was fully consumed");
 	}
 
-	if (!tools.has("agent_plan")) {
-		return fauxAssistantMessage(fauxToolCall("tool_load", { name: "agent_plan" }, { id: "agent-load-plan" }), {
-			stopReason: "toolUse",
-		});
-	}
-	for (const [id, itemId, title] of [
-		["agent-plan-baseline", "agent-plan-item-baseline", "运行失败基线测试"],
-		["agent-plan-patch", "agent-plan-item-patch", "精确修改 normalize_scores"],
-		["agent-plan-regression", "agent-plan-item-regression", "运行回归测试并交付"],
-	] as const) {
-		if (!serialized.includes(id)) {
-			return fauxAssistantMessage(
-				fauxToolCall("agent_plan", { op: "update", itemId, title, status: "pending" }, { id }),
-				{
-					stopReason: "toolUse",
-				},
-			);
-		}
-	}
-	if (!serialized.includes("agent-plan-review")) {
+	if (!tools.has("todo")) throw new Error("The canonical Session Todo tool must be resident");
+	if (!serialized.includes("agent-todo-init")) {
 		return fauxAssistantMessage(
 			fauxToolCall(
-				"agent_plan",
-				{ op: "submit_review", note: "写入与 Shell 前请原生控制中心审阅" },
-				{ id: "agent-plan-review" },
+				"todo",
+				{ op: "init", list: [{ phase: "实现与验证", items: [...AGENT_SESSION_TODO_TASKS] }] },
+				{ id: "agent-todo-init" },
 			),
 			{ stopReason: "toolUse" },
 		);
 	}
-	if (!serialized.includes("原生控制中心已经批准当前执行计划")) {
-		return fauxAssistantMessage("执行计划已提交审阅，等待原生控制中心批准。");
+	if (!serialized.includes("agent-todo-baseline-start")) {
+		return fauxAssistantMessage(
+			fauxToolCall("todo", { op: "start", task: AGENT_SESSION_TODO_TASKS[0] }, { id: "agent-todo-baseline-start" }),
+			{ stopReason: "toolUse" },
+		);
 	}
-
 	if (!serialized.includes("agent-baseline-shell")) {
 		return fauxAssistantMessage(
 			fauxToolCall(
@@ -1063,13 +1105,18 @@ export function agentSessionCanaryResponse(context: Context): AssistantMessage {
 			{ stopReason: "toolUse" },
 		);
 	}
-	if (!serialized.includes("agent-plan-baseline-done")) {
+	if (!toolCallFailed(context, "agent-baseline-shell", "bash") && !contextHasNonzeroExitCode(context)) {
+		throw new Error("The Agent Session baseline command did not fail as expected");
+	}
+	if (!serialized.includes("agent-todo-baseline-done")) {
 		return fauxAssistantMessage(
-			fauxToolCall(
-				"agent_plan",
-				{ op: "update", itemId: "agent-plan-item-baseline", status: "completed" },
-				{ id: "agent-plan-baseline-done" },
-			),
+			fauxToolCall("todo", { op: "done", task: AGENT_SESSION_TODO_TASKS[0] }, { id: "agent-todo-baseline-done" }),
+			{ stopReason: "toolUse" },
+		);
+	}
+	if (!serialized.includes("agent-todo-patch-start")) {
+		return fauxAssistantMessage(
+			fauxToolCall("todo", { op: "start", task: AGENT_SESSION_TODO_TASKS[1] }, { id: "agent-todo-patch-start" }),
 			{ stopReason: "toolUse" },
 		);
 	}
@@ -1095,12 +1142,18 @@ export function agentSessionCanaryResponse(context: Context): AssistantMessage {
 	if (!contextHasJsonField(context, "mutationApplied", true)) {
 		throw new Error("The approved Agent Session patch did not produce an applied receipt");
 	}
-	if (!serialized.includes("agent-plan-patch-done")) {
+	if (!serialized.includes("agent-todo-patch-done")) {
+		return fauxAssistantMessage(
+			fauxToolCall("todo", { op: "done", task: AGENT_SESSION_TODO_TASKS[1] }, { id: "agent-todo-patch-done" }),
+			{ stopReason: "toolUse" },
+		);
+	}
+	if (!serialized.includes("agent-todo-regression-start")) {
 		return fauxAssistantMessage(
 			fauxToolCall(
-				"agent_plan",
-				{ op: "update", itemId: "agent-plan-item-patch", status: "completed" },
-				{ id: "agent-plan-patch-done" },
+				"todo",
+				{ op: "start", task: AGENT_SESSION_TODO_TASKS[2] },
+				{ id: "agent-todo-regression-start" },
 			),
 			{ stopReason: "toolUse" },
 		);
@@ -1118,19 +1171,24 @@ export function agentSessionCanaryResponse(context: Context): AssistantMessage {
 	if (!contextHasJsonField(context, "exitCode", 0)) {
 		throw new Error("The Agent Session regression command did not pass");
 	}
-	if (!serialized.includes("agent-plan-regression-done")) {
+	if (!serialized.includes("agent-todo-regression-checkpoint")) {
 		return fauxAssistantMessage(
 			fauxToolCall(
-				"agent_plan",
-				{ op: "update", itemId: "agent-plan-item-regression", status: "completed" },
-				{ id: "agent-plan-regression-done" },
+				"todo",
+				{
+					op: "checkpoint",
+					task: AGENT_SESSION_TODO_TASKS[2],
+					checkpoint: "回归测试通过，准备交付",
+					references: [{ kind: "test", label: "普通 Session 回归", reference: "test_calculator.py" }],
+				},
+				{ id: "agent-todo-regression-checkpoint" },
 			),
 			{ stopReason: "toolUse" },
 		);
 	}
-	if (!serialized.includes("agent-plan-complete")) {
+	if (!serialized.includes("agent-todo-regression-done")) {
 		return fauxAssistantMessage(
-			fauxToolCall("agent_plan", { op: "complete", note: "全部计划项和验收已完成" }, { id: "agent-plan-complete" }),
+			fauxToolCall("todo", { op: "done", task: AGENT_SESSION_TODO_TASKS[2] }, { id: "agent-todo-regression-done" }),
 			{ stopReason: "toolUse" },
 		);
 	}
