@@ -1,7 +1,13 @@
 import { type AssistantMessage, type AssistantMessageEvent, EventStream, getModel } from "@earendil-works/pi-ai/compat";
 import { Type } from "typebox";
 import { describe, expect, it } from "vitest";
-import { Agent, type AgentEvent, type AgentTool, type AgentToolUpdateCallback } from "../src/index.ts";
+import {
+	Agent,
+	type AgentContinuation,
+	type AgentEvent,
+	type AgentTool,
+	type AgentToolUpdateCallback,
+} from "../src/index.ts";
 
 // Mock stream that mimics AssistantMessageEventStream
 class MockAssistantStream extends EventStream<AssistantMessageEvent, AssistantMessage> {
@@ -551,6 +557,43 @@ describe("Agent", () => {
 				expect.objectContaining({ id: "current", state: "completed", attempt: 1 }),
 			]),
 		);
+	});
+
+	it("restores an unstarted continuation lease without exhausting its retry budget", () => {
+		const agent = new Agent();
+		const payload = {
+			role: "user" as const,
+			content: [{ type: "text" as const, text: "resume after restart" }],
+			timestamp: Date.now(),
+		};
+		const continuation: AgentContinuation = {
+			id: "restored-continuation",
+			correlationId: "restored-root",
+			origin: "room_recovery",
+			kind: "follow_up",
+			payload,
+			idempotencyKey: "restored-dispatch",
+			cancelGeneration: 0,
+			createdAt: Date.now(),
+			priority: 0,
+			attempt: 1,
+			maxAttempts: 1,
+			state: "leased",
+			leaseId: "abandoned-lease",
+			leasedAt: Date.now(),
+		};
+
+		agent.restoreContinuationState(0, [continuation]);
+
+		expect(agent.listContinuations()).toContainEqual(
+			expect.objectContaining({
+				id: "restored-continuation",
+				state: "pending",
+				attempt: 0,
+				lastFailure: "runtime_restarted",
+			}),
+		);
+		expect(agent.cancelContinuation({ id: continuation.id }, "test_cleanup").cancelledIds).toEqual([continuation.id]);
 	});
 
 	it("should handle abort controller", () => {

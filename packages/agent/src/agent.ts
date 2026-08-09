@@ -240,7 +240,12 @@ class PendingMessageQueue {
 				items: items.map((item) => ({ ...item })),
 			},
 		});
-		this.queue.recoverExpiredLeases({ now: Date.now(), leaseTimeoutMs: 0, reason: "runtime_restarted" });
+		this.queue.recoverExpiredLeases({
+			now: Date.now(),
+			leaseTimeoutMs: 0,
+			reason: "runtime_restarted",
+			consumeAttempt: false,
+		});
 	}
 
 	resume(): void {

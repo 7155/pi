@@ -1,11 +1,16 @@
 #!/usr/bin/env node
 import { createInterface } from "node:readline";
 import { createDeterministicTestModelRuntime } from "./deterministic-test-adapter.ts";
+import { SerializedJsonlOutput } from "./protocol-output.ts";
 import { RuntimeRequestDispatcher } from "./request-dispatcher.ts";
 import { RagImeRuntimeHost, runtimeHostOptionsFromEnvironment } from "./runtime-host.ts";
 
+const protocolOutput = new SerializedJsonlOutput(
+	process.stdout.write.bind(process.stdout) as (record: string, callback: (error?: Error | null) => void) => boolean,
+);
+
 function output(value: unknown): void {
-	process.stdout.write(`${JSON.stringify(value)}\n`);
+	protocolOutput.emit(value);
 }
 
 async function main(): Promise<void> {
@@ -25,6 +30,7 @@ async function main(): Promise<void> {
 	});
 	await dispatcher.settle();
 	await host.dispose();
+	await protocolOutput.settle();
 }
 
 void main().catch((error) => {

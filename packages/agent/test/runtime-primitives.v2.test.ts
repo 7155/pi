@@ -63,6 +63,32 @@ describe("ContinuationQueue v2 leases", () => {
 		expect(restored.snapshot().items[0]?.state).toBe("pending");
 	});
 
+	it("recovers an unstarted lease without consuming its only attempt", () => {
+		const original = new ContinuationQueue<string>({ createLeaseId: () => "lease-1", now: () => 100 });
+		original.enqueue(continuation({ maxAttempts: 1 }));
+		original.drain({ now: 100, cancelGeneration: 0, limit: 1 });
+
+		const restored = new ContinuationQueue<string>({ snapshot: original.snapshot(), now: () => 1000 });
+		expect(
+			restored.recoverExpiredLeases({
+				now: 1000,
+				leaseTimeoutMs: 0,
+				reason: "runtime_restarted",
+				consumeAttempt: false,
+			}),
+		).toEqual(["continuation-1"]);
+		expect(restored.snapshot().items[0]).toMatchObject({
+			state: "pending",
+			attempt: 0,
+			lastFailure: "runtime_restarted",
+		});
+		expect(restored.drain({ now: 1001, cancelGeneration: 0, limit: 1 })[0]).toMatchObject({
+			id: "continuation-1",
+			state: "leased",
+			attempt: 1,
+		});
+	});
+
 	it("distinguishes scheduled work from work that is ready now", () => {
 		const queue = new ContinuationQueue<string>();
 		queue.enqueue(continuation({ notBefore: 500 }));

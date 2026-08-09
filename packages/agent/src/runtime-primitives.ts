@@ -51,6 +51,11 @@ export interface ContinuationReleaseReceipt {
 	state?: ContinuationState;
 }
 
+export interface ContinuationReleaseOptions {
+	/** Set false only when the lease owner disappeared before execution began. */
+	consumeAttempt?: boolean;
+}
+
 export interface ContinuationQueueOptions<TPayload> {
 	snapshot?: Pick<ContinuationQueueSnapshot<TPayload>, "items">;
 	createLeaseId?: () => string;
@@ -223,7 +228,12 @@ export class ContinuationQueue<TPayload = unknown> {
 	 * The continuation returns to pending while budget remains; otherwise it
 	 * becomes terminally failed. The same idempotency key remains authoritative.
 	 */
-	release(id: string, leaseId: string, reason: string): ContinuationReleaseReceipt {
+	release(
+		id: string,
+		leaseId: string,
+		reason: string,
+		options: ContinuationReleaseOptions = {},
+	): ContinuationReleaseReceipt {
 		if (!leaseId?.trim()) throw new Error("leaseId must be a non-empty string");
 		if (!reason.trim()) throw new Error("release reason must be a non-empty string");
 		const item = this.items.get(id);
@@ -233,6 +243,7 @@ export class ContinuationQueue<TPayload = unknown> {
 		item.lastFailure = reason;
 		item.leaseId = undefined;
 		item.leasedAt = undefined;
+		if (options.consumeAttempt === false) item.attempt = Math.max(0, item.attempt - 1);
 		if (item.attempt >= item.maxAttempts) {
 			item.state = "failed";
 			item.terminalReason = "attempts_exhausted";
@@ -244,7 +255,12 @@ export class ContinuationQueue<TPayload = unknown> {
 	}
 
 	/** Recover leases from a persisted snapshot after their owner disappeared. */
-	recoverExpiredLeases(options: { now: number; leaseTimeoutMs: number; reason?: string }): string[] {
+	recoverExpiredLeases(options: {
+		now: number;
+		leaseTimeoutMs: number;
+		reason?: string;
+		consumeAttempt?: boolean;
+	}): string[] {
 		if (!Number.isFinite(options.now) || options.now < 0) throw new Error("now must be non-negative");
 		if (!Number.isFinite(options.leaseTimeoutMs) || options.leaseTimeoutMs < 0) {
 			throw new Error("leaseTimeoutMs must be non-negative");
@@ -253,7 +269,11 @@ export class ContinuationQueue<TPayload = unknown> {
 		for (const item of this.items.values()) {
 			if (item.state !== "leased" || item.leasedAt === undefined || !item.leaseId) continue;
 			if (item.leasedAt + options.leaseTimeoutMs > options.now) continue;
-			if (this.release(item.id, item.leaseId, options.reason ?? "lease_owner_lost").released) {
+			if (
+				this.release(item.id, item.leaseId, options.reason ?? "lease_owner_lost", {
+					consumeAttempt: options.consumeAttempt,
+				}).released
+			) {
 				recovered.push(item.id);
 			}
 		}
