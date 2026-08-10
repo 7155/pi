@@ -1,23 +1,19 @@
 import {
 	createBashToolDefinition,
-	createEditToolDefinition,
 	createFindToolDefinition,
 	createGrepToolDefinition,
 	createLsToolDefinition,
 	createReadToolDefinition,
-	createWriteToolDefinition,
 	type InlineExtension,
 	type ToolDefinition,
 } from "@earendil-works/pi-coding-agent";
 import {
+	AGENT_NATIVE_WORKSPACE_TOOL_NAMES,
 	BASH_TOOL_NAME,
-	EDIT_TOOL_NAME,
 	FIND_TOOL_NAME,
 	GREP_TOOL_NAME,
 	LS_TOOL_NAME,
-	NATIVE_WORKSPACE_TOOL_NAMES,
 	READ_TOOL_NAME,
-	WRITE_TOOL_NAME,
 } from "./runtime-tool-names.ts";
 import { ToolArtifactBuffer } from "./tool-artifact-buffer.ts";
 import {
@@ -35,8 +31,6 @@ interface RuntimeProjectionTarget {
 
 const PROJECTED_TOOL_LIFECYCLE_LABELS: Readonly<Record<string, string>> = {
 	[READ_TOOL_NAME]: "读取文件",
-	[EDIT_TOOL_NAME]: "编辑文件",
-	[WRITE_TOOL_NAME]: "写入文件",
 	[BASH_TOOL_NAME]: "运行命令",
 };
 
@@ -67,7 +61,7 @@ function projectionTarget(
 }
 
 function nativeWorkspaceTargets(options: BackendToolBridgeOptions): string[] {
-	const nativeNames = new Set<string>(NATIVE_WORKSPACE_TOOL_NAMES);
+	const nativeNames = new Set<string>(AGENT_NATIVE_WORKSPACE_TOOL_NAMES);
 	return options.registry
 		.list()
 		.filter(
@@ -176,18 +170,6 @@ function formatLsResult(details: Record<string, unknown>): string {
 	return entries.join("\n");
 }
 
-function formatMutationResult(details: Record<string, unknown>): Record<string, unknown> {
-	const receipt = resultReceipt(details);
-	return {
-		summary: text(receipt.summary) || "Workspace mutation completed",
-		mutationApplied: receipt.mutationApplied === true,
-		path: text(receipt.path),
-		preimageSha256: text(receipt.preimageSha256),
-		postimageSha256: text(receipt.postimageSha256),
-		approvalState: text(details.approvalState),
-	};
-}
-
 function formatBashResult(details: Record<string, unknown>): string {
 	const receipt = resultReceipt(details);
 	const combinedOutput = text(receipt.output);
@@ -222,42 +204,6 @@ function projected(
 		},
 		artifacts,
 	);
-}
-
-function withReadRevisionTracking(
-	definition: ToolDefinition<any, any, any>,
-	revisions: Map<string, string>,
-): ToolDefinition<any, any, any> {
-	const execute = definition.execute.bind(definition);
-	return {
-		...definition,
-		execute: async (toolCallId, params, signal, onUpdate, context) => {
-			const result = await execute(toolCallId, params, signal, onUpdate, context);
-			const details = record(result.details);
-			const revision = text(details.resourceRevision);
-			if (/^sha256:[0-9a-f]{64}$/u.test(revision)) {
-				const input = inputRecord(params);
-				for (const path of [text(input.path), text(details.relativePath), text(details.path)]) {
-					if (path) revisions.set(path, revision);
-				}
-			}
-			return result;
-		},
-	};
-}
-
-function requiredResourceRevision(
-	input: Record<string, unknown>,
-	revisions: Map<string, string>,
-	allowMissing = false,
-): string {
-	const path = text(input.path);
-	const revision = revisions.get(path);
-	if (!revision) {
-		if (allowMissing) return "missing";
-		throw new Error(`Native workspace mutation requires a successful read receipt for ${path || "the target path"}`);
-	}
-	return revision;
 }
 
 function withEvidenceRead(
@@ -323,29 +269,25 @@ export function createNativeWorkspaceToolsExtension(
 ): Extract<InlineExtension, { name: string }> {
 	const artifacts = new ToolArtifactBuffer();
 	const definitions: ToolDefinition<any, any, any>[] = [];
-	const resourceRevisions = new Map<string, string>();
 	const read = projectionTarget(options.registry, READ_TOOL_NAME);
 	if (read) {
 		definitions.push(
 			withEvidenceRead(
 				options,
-				withReadRevisionTracking(
-					projected(
-						options,
-						createReadToolDefinition(options.cwd),
-						read,
-						(input) => ({
-							path: input.path,
-							// Pi's native read contract is line-based and 1-indexed.
-							// Normalize malformed model input at the adapter boundary,
-							// then preserve Pi's own 2,000-line truncation ceiling.
-							lineOffset: boundedLimit(input.offset, 1, Number.MAX_SAFE_INTEGER),
-							lineLimit: boundedLimit(input.limit, 2_000, 2_000),
-						}),
-						formatReadResult,
-						artifacts,
-					),
-					resourceRevisions,
+				projected(
+					options,
+					createReadToolDefinition(options.cwd),
+					read,
+					(input) => ({
+						path: input.path,
+						// Pi's native read contract is line-based and 1-indexed.
+						// Normalize malformed model input at the adapter boundary,
+						// then preserve Pi's own 2,000-line truncation ceiling.
+						lineOffset: boundedLimit(input.offset, 1, Number.MAX_SAFE_INTEGER),
+						lineLimit: boundedLimit(input.limit, 2_000, 2_000),
+					}),
+					formatReadResult,
+					artifacts,
 				),
 			),
 		);
@@ -405,40 +347,6 @@ export function createNativeWorkspaceToolsExtension(
 					limit: boundedLimit(input.limit, 300, 300),
 				}),
 				formatLsResult,
-				artifacts,
-			),
-		);
-	}
-	const edit = projectionTarget(options.registry, EDIT_TOOL_NAME);
-	if (edit) {
-		definitions.push(
-			projected(
-				options,
-				createEditToolDefinition(options.cwd),
-				edit,
-				(input) => ({
-					path: input.path,
-					resourceRevision: requiredResourceRevision(input, resourceRevisions),
-					edits: input.edits,
-				}),
-				formatMutationResult,
-				artifacts,
-			),
-		);
-	}
-	const write = projectionTarget(options.registry, WRITE_TOOL_NAME);
-	if (write) {
-		definitions.push(
-			projected(
-				options,
-				createWriteToolDefinition(options.cwd),
-				write,
-				(input) => ({
-					path: input.path,
-					resourceRevision: requiredResourceRevision(input, resourceRevisions, true),
-					content: input.content,
-				}),
-				formatMutationResult,
 				artifacts,
 			),
 		);

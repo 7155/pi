@@ -26,7 +26,19 @@ const PROJECT_TOOL_RECOVERY_MARKER = "PROJECT-TOOL-RECOVERY-CANARY";
 // Coding tools are resident Pi tools. Their hidden governed targets are bound
 // during runtime bootstrap, so a model must never spend turns loading the
 // backend-only workspace_* names.
-const NATIVE_CODING_TOOL_NAMES = ["ls", "find", "grep", "read", "edit", "bash"] as const;
+const NATIVE_CODING_TOOL_NAMES = ["ls", "find", "grep", "read", "bash"] as const;
+const CALCULATOR_PATCH_COMMAND = [
+	"/usr/bin/python3 - <<'PY'",
+	"from pathlib import Path",
+	'path = Path("calculator.py")',
+	"source = path.read_text()",
+	"old = '    raise NotImplementedError(\"ROOM_PROJECT_TASK\")'",
+	'new = "    if not values:\\n        return []\\n    minimum = min(values)\\n    return [value - minimum for value in values]"',
+	"if old not in source:",
+	'    raise SystemExit("expected calculator placeholder was not found")',
+	"path.write_text(source.replace(old, new, 1))",
+	"PY",
+].join("\n");
 
 function contextText(context: Context): string {
 	return JSON.stringify({ systemPrompt: context.systemPrompt ?? "", messages: context.messages });
@@ -351,7 +363,7 @@ export function contextEpochCanaryResponse(context: Context): AssistantMessage {
 	return fauxAssistantMessage(`CANARY-${epoch}-OK`);
 }
 
-/** Drive an approved read, edit, test, publish and settle task in an isolated project. */
+/** Drive an approved read, shell patch, test, publish and settle task in an isolated project. */
 export function projectTaskCanaryResponse(context: Context): AssistantMessage {
 	const task = currentRoomTask(context);
 	const recovery = task?.includes(PROJECT_TOOL_RECOVERY_MARKER) === true;
@@ -423,25 +435,12 @@ export function projectTaskCanaryResponse(context: Context): AssistantMessage {
 	}
 	if (!serialized.includes("project-patch")) {
 		return fauxAssistantMessage(
-			fauxToolCall(
-				"edit",
-				{
-					path: "calculator.py",
-					edits: [
-						{
-							oldText: '    raise NotImplementedError("ROOM_PROJECT_TASK")',
-							newText:
-								"    if not values:\n        return []\n    minimum = min(values)\n    return [value - minimum for value in values]",
-						},
-					],
-				},
-				{ id: "project-patch" },
-			),
+			fauxToolCall("bash", { command: CALCULATOR_PATCH_COMMAND, timeout: 30 }, { id: "project-patch" }),
 			{ stopReason: "toolUse" },
 		);
 	}
-	if (!contextHasJsonField(context, "mutationApplied", true)) {
-		throw new Error("The approved project patch did not produce an applied receipt");
+	if (!toolCallSucceeded(context, "project-patch", "bash")) {
+		throw new Error("The approved project shell patch did not produce a successful receipt");
 	}
 	if (!serialized.includes("project-test")) {
 		return fauxAssistantMessage(
@@ -853,7 +852,7 @@ export function projectCollaborationCanaryResponse(context: Context): AssistantM
 			});
 		}
 		if (!serialized.includes(callId("state"))) return state(callId("state"));
-		requireResidentNativeCodingTools(tools, ["read", "edit", "bash"]);
+		requireResidentNativeCodingTools(tools, ["read", "bash"]);
 		if (!serialized.includes(callId("read"))) {
 			return fauxAssistantMessage(
 				fauxToolCall("read", { path: "calculator.py", offset: 0, limit: 16_384 }, { id: callId("read") }),
@@ -862,25 +861,12 @@ export function projectCollaborationCanaryResponse(context: Context): AssistantM
 		}
 		if (!serialized.includes(callId("patch"))) {
 			return fauxAssistantMessage(
-				fauxToolCall(
-					"edit",
-					{
-						path: "calculator.py",
-						edits: [
-							{
-								oldText: '    raise NotImplementedError("ROOM_PROJECT_TASK")',
-								newText:
-									"    if not values:\n        return []\n    minimum = min(values)\n    return [value - minimum for value in values]",
-							},
-						],
-					},
-					{ id: callId("patch") },
-				),
+				fauxToolCall("bash", { command: CALCULATOR_PATCH_COMMAND, timeout: 30 }, { id: callId("patch") }),
 				{ stopReason: "toolUse" },
 			);
 		}
-		if (!contextHasJsonField(context, "mutationApplied", true)) {
-			throw new Error("The bounded implementation child did not produce an applied edit receipt");
+		if (!toolCallSucceeded(context, callId("patch"), "bash")) {
+			throw new Error("The bounded implementation child did not produce a successful shell patch receipt");
 		}
 		const childAliases = aliases();
 		const childVerifications = childAliases.map((_, index) => ({
@@ -1122,25 +1108,12 @@ export function agentSessionCanaryResponse(context: Context): AssistantMessage {
 	}
 	if (!serialized.includes("agent-patch")) {
 		return fauxAssistantMessage(
-			fauxToolCall(
-				"edit",
-				{
-					path: "calculator.py",
-					edits: [
-						{
-							oldText: '    raise NotImplementedError("ROOM_PROJECT_TASK")',
-							newText:
-								"    if not values:\n        return []\n    minimum = min(values)\n    return [value - minimum for value in values]",
-						},
-					],
-				},
-				{ id: "agent-patch" },
-			),
+			fauxToolCall("bash", { command: CALCULATOR_PATCH_COMMAND, timeout: 30 }, { id: "agent-patch" }),
 			{ stopReason: "toolUse" },
 		);
 	}
-	if (!contextHasJsonField(context, "mutationApplied", true)) {
-		throw new Error("The approved Agent Session patch did not produce an applied receipt");
+	if (!toolCallSucceeded(context, "agent-patch", "bash")) {
+		throw new Error("The approved Agent Session shell patch did not produce a successful receipt");
 	}
 	if (!serialized.includes("agent-todo-patch-done")) {
 		return fauxAssistantMessage(

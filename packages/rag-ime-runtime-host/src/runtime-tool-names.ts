@@ -22,6 +22,15 @@ export const NATIVE_WORKSPACE_TOOL_NAMES = [
 	BASH_TOOL_NAME,
 ] as const;
 
+/** The only native workspace schemas disclosed to the Agent model. */
+export const AGENT_NATIVE_WORKSPACE_TOOL_NAMES = [
+	READ_TOOL_NAME,
+	GREP_TOOL_NAME,
+	FIND_TOOL_NAME,
+	LS_TOOL_NAME,
+	BASH_TOOL_NAME,
+] as const;
+
 export const RESERVED_RUNTIME_TOOL_NAMES = new Set([
 	SKILL_SEARCH_TOOL_NAME,
 	SKILL_LOAD_TOOL_NAME,

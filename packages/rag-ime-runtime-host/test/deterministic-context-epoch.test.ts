@@ -13,7 +13,7 @@ const tool = (name: string): Tool => ({
 	parameters: { type: "object" },
 });
 
-const nativeCodingTools = ["read", "grep", "find", "ls", "edit", "write", "bash"];
+const nativeCodingTools = ["read", "grep", "find", "ls", "bash"];
 
 const taskPrompt = `<room-fact kind="dispatch_state">## Room 任务
 当前任务：
@@ -54,10 +54,18 @@ const projectTaskPrompt = `<room-fact kind="dispatch_state">## Room 任务
 	- AC-2 | 待验收 | 公开结果并提交
 </room-fact>`;
 
-function projectContext(tools: string[], history = "", marker = "PROJECT-TASK-CANARY"): Context {
+function projectContext(
+	tools: string[],
+	history: string | Record<string, unknown> = "",
+	marker = "PROJECT-TASK-CANARY",
+): Context {
 	return {
 		systemPrompt: projectTaskPrompt.replaceAll("PROJECT-TASK-CANARY", marker),
-		messages: history ? ([{ role: "user", content: history, timestamp: 1 }] as Context["messages"]) : [],
+		messages: history
+			? ([
+					{ role: "user", content: typeof history === "string" ? history : JSON.stringify(history), timestamp: 1 },
+				] as Context["messages"])
+			: [],
 		tools: tools.map(tool),
 	};
 }
@@ -195,33 +203,36 @@ describe("deterministic context epoch Provider", () => {
 
 		const inspected = '"id":"project-list" "id":"project-find" "id":"project-search" "id":"project-read-app"';
 		expect(calls(projectTaskCanaryResponse(projectContext(discoveryTools, inspected)))).toEqual([
-			expect.objectContaining({ name: "edit", id: "project-patch" }),
+			expect.objectContaining({ name: "bash", id: "project-patch" }),
 		]);
 
-		const patched = JSON.stringify({ history: `${inspected} project-patch`, mutationApplied: true });
+		const patched = {
+			history: `${inspected} project-patch`,
+			role: "toolResult",
+			toolCallId: "project-patch",
+			toolName: "bash",
+			isError: false,
+		};
 		expect(calls(projectTaskCanaryResponse(projectContext(discoveryTools, patched)))).toEqual([
 			expect.objectContaining({ name: "bash", id: "project-test" }),
 		]);
 
-		const tested = JSON.stringify({
-			history: `${patched} project-test`,
-			mutationApplied: true,
+		const tested = {
+			history: `${JSON.stringify(patched)} project-test`,
+			patchResult: patched,
 			exitCode: 0,
-		});
+		};
 		const roomTools = [...discoveryTools, "room_post", "room_commit"];
 		expect(calls(projectTaskCanaryResponse(projectContext(roomTools, tested)))).toEqual([
 			expect.objectContaining({ name: "room_post", id: "project-post" }),
 		]);
 		const commit = calls(
 			projectTaskCanaryResponse(
-				projectContext(
-					roomTools,
-					JSON.stringify({
-						history: `${tested} project-post`,
-						mutationApplied: true,
-						exitCode: 0,
-					}),
-				),
+				projectContext(roomTools, {
+					history: `${JSON.stringify(tested)} project-post`,
+					patchResult: patched,
+					exitCode: 0,
+				}),
 			),
 		)[0];
 		expect(commit).toMatchObject({
@@ -276,14 +287,17 @@ describe("deterministic context epoch Provider", () => {
 			exitCode: 1,
 		});
 		const repair = calls(projectTaskCanaryResponse(projectContext(tools, failedBaseline, recoveryMarker)));
-		expect(repair).toEqual([expect.objectContaining({ name: "edit", id: "project-patch" })]);
+		expect(repair).toEqual([expect.objectContaining({ name: "bash", id: "project-patch" })]);
 		expect(repair.some((call) => call.id === "project-missing-read")).toBe(false);
 
-		const patched = JSON.stringify({
+		const patched = {
 			history: `${failedBaseline} "id":"project-patch"`,
-			mutationApplied: true,
+			role: "toolResult",
+			toolCallId: "project-patch",
+			toolName: "bash",
+			isError: false,
 			exitCode: 1,
-		});
+		};
 		expect(calls(projectTaskCanaryResponse(projectContext(tools, patched, recoveryMarker)))).toEqual([
 			expect.objectContaining({ name: "bash", id: "project-test" }),
 		]);
@@ -420,7 +434,12 @@ describe("deterministic context epoch Provider", () => {
 			...completeBoundaryReceipt(
 				`${baseHistory} "id":"agent-todo-baseline-done" "id":"agent-todo-patch-start" "id":"agent-patch"`,
 			),
-			mutationApplied: true,
+			patchResult: {
+				role: "toolResult",
+				toolCallId: "agent-patch",
+				toolName: "bash",
+				isError: false,
+			},
 			exitCode: 1,
 		};
 		expect(calls(agentSessionCanaryResponse(agentReceiptContext(shellTools, patchedReceipt, loadedSkill)))).toEqual([
@@ -438,7 +457,7 @@ describe("deterministic context epoch Provider", () => {
 			...completeBoundaryReceipt(
 				`${JSON.stringify(patchedReceipt)} "id":"agent-todo-patch-done" "id":"agent-todo-regression-start" "id":"agent-regression-shell"`,
 			),
-			mutationApplied: true,
+			patchResult: patchedReceipt.patchResult,
 			exitCode: 0,
 			baselineFailure: {
 				toolCallId: "agent-baseline-shell",
@@ -461,7 +480,7 @@ describe("deterministic context epoch Provider", () => {
 
 		const completedItems = {
 			...completeBoundaryReceipt(`${JSON.stringify(testedReceipt)} "id":"agent-todo-regression-checkpoint"`),
-			mutationApplied: true,
+			patchResult: patchedReceipt.patchResult,
 			exitCode: 0,
 			baselineFailure: {
 				toolCallId: "agent-baseline-shell",
@@ -640,7 +659,7 @@ describe("deterministic context epoch Provider", () => {
 			"验收条件（提交证据时使用 AC 编号）：",
 			"- AC-1 | 待验收 | 有界实现",
 		].join("\n");
-		const childTools = ["room_state", "read", "edit", "bash", "room_commit"];
+		const childTools = ["room_state", "read", "bash", "room_commit"];
 		const childStateHistory = '"id":"room-full-auto-child-state"';
 		const childRead = calls(
 			projectCollaborationCanaryResponse(
@@ -669,9 +688,9 @@ describe("deterministic context epoch Provider", () => {
 			),
 		)[0];
 		expect(childPatch).toMatchObject({
-			name: "edit",
+			name: "bash",
 			id: "room-full-auto-child-patch",
-			arguments: { path: "calculator.py" },
+			arguments: { command: expect.stringContaining('Path("calculator.py")') },
 		});
 
 		const childTest = calls(
@@ -680,7 +699,14 @@ describe("deterministic context epoch Provider", () => {
 					history: `${childStateHistory} "id":"room-full-auto-child-read" "id":"room-full-auto-child-patch"`,
 					participants,
 					acceptanceAliases: ["AC-1"],
-					mutationApplied: true,
+					records: [
+						{
+							role: "toolResult",
+							toolCallId: "room-full-auto-child-patch",
+							toolName: "bash",
+							isError: false,
+						},
+					],
 					evidenceRef: "child:patch",
 				}),
 			),
@@ -702,7 +728,14 @@ describe("deterministic context epoch Provider", () => {
 					].join(" "),
 					participants,
 					acceptanceAliases: ["AC-1"],
-					mutationApplied: true,
+					records: [
+						{
+							role: "toolResult",
+							toolCallId: "room-full-auto-child-patch",
+							toolName: "bash",
+							isError: false,
+						},
+					],
 					exitCode: 0,
 					evidenceRef: "execution:invoke:room-full-auto-child-test",
 				}),
@@ -1103,11 +1136,18 @@ describe("deterministic context epoch Provider", () => {
 			"- AC-3 | 待验收 | 空输入行为",
 			"- AC-4 | 待验收 | 完整回归",
 		].join("\n");
-		const tools = ["room_state", "read", "edit", "bash", "room_commit"];
+		const tools = ["room_state", "read", "bash", "room_commit"];
 		const base = {
 			participants,
 			acceptanceAliases: ["AC-1", "AC-2", "AC-3", "AC-4"],
-			mutationApplied: true,
+			records: [
+				{
+					role: "toolResult",
+					toolCallId: "room-full-auto-child-patch",
+					toolName: "bash",
+					isError: false,
+				},
+			],
 			exitCode: 0,
 		};
 		const prefix = [
@@ -1133,6 +1173,12 @@ describe("deterministic context epoch Provider", () => {
 					...base,
 					history: [...prefix, '"id":"room-full-auto-child-test"'].join(" "),
 					records: [
+						{
+							role: "toolResult",
+							toolCallId: "room-full-auto-child-patch",
+							toolName: "bash",
+							isError: false,
+						},
 						{
 							executionReceiptId: "execution:invoke:session-child:dispatch-child:room-full-auto-child-test",
 							status: "failed",
@@ -1197,6 +1243,12 @@ describe("deterministic context epoch Provider", () => {
 			'<room-work-follow-up source="system" kind="repair_commit">重新提交验收证据。</room-work-follow-up>',
 		];
 		const receiptRecords = [
+			{
+				role: "toolResult",
+				toolCallId: "room-full-auto-child-patch",
+				toolName: "bash",
+				isError: false,
+			},
 			{
 				evidenceRef: "execution:invoke:session-child:dispatch-child:room-full-auto-child-verify-4",
 			},

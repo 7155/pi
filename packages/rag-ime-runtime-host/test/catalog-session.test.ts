@@ -213,6 +213,81 @@ describe("PiProductSession catalog updates", () => {
 		}
 	});
 
+	it("keeps edit and write out of the complete Agent tool registry", async () => {
+		const root = await mkdtemp(join(tmpdir(), "pi-runtime-five-native-tools-"));
+		const agentDir = join(root, "agent");
+		const sessionDir = join(root, "sessions");
+		const activePluginDir = join(root, "plugins", "active");
+		await Promise.all([
+			mkdir(agentDir, { recursive: true }),
+			mkdir(sessionDir, { recursive: true }),
+			mkdir(activePluginDir, { recursive: true }),
+		]);
+		const modelRuntime = await ModelRuntime.create({
+			authPath: join(root, "auth.json"),
+			modelsPath: null,
+			allowModelNetwork: false,
+		});
+		const target = (name: string, runtimeProjections: Array<{ name: string; operation: string }>) => ({
+			name,
+			description: `Run ${name}.`,
+			parameters: {
+				type: "object",
+				oneOf: runtimeProjections.map(({ operation }) => ({
+					type: "object",
+					properties: { op: { const: operation } },
+					required: ["op"],
+				})),
+			},
+			modelVisible: false,
+			runtimeProjections,
+		});
+		const productSession = await PiProductSession.create({
+			externalSessionId: "five-native-tools-session",
+			cwd: root,
+			sessionDir,
+			agentDir,
+			activePluginDir,
+			skillPaths: [],
+			piSkillPaths: [],
+			codexSkillPaths: [],
+			modelRuntime,
+			toolManifest: [
+				target("workspace_read", [{ name: "read", operation: "read" }]),
+				target("workspace_search", [
+					{ name: "grep", operation: "search" },
+					{ name: "find", operation: "search" },
+				]),
+				target("workspace_list", [{ name: "ls", operation: "list" }]),
+				target("workspace_edit", [{ name: "edit", operation: "apply" }]),
+				target("workspace_write", [{ name: "write", operation: "apply" }]),
+				target("workspace_shell", [{ name: "bash", operation: "run" }]),
+			],
+			toolGatewayUrl: "http://127.0.0.1:8766/api/agent/tool/execute",
+			noContextFiles: true,
+			emitEvent() {},
+		});
+
+		try {
+			const tools = new Map(productSession.listTools().map((tool) => [String(tool.name), tool]));
+			expect(["read", "grep", "find", "ls", "bash"].map((name) => tools.get(name)?.active)).toEqual([
+				true,
+				true,
+				true,
+				true,
+				true,
+			]);
+			expect(tools.get("edit")?.active).toBe(false);
+			expect(tools.get("write")?.active).toBe(false);
+			expect(productSession.snapshot().activeBackendTools).not.toEqual(
+				expect.arrayContaining(["workspace_edit", "workspace_write"]),
+			);
+		} finally {
+			productSession.dispose();
+			await rm(root, { recursive: true, force: true });
+		}
+	});
+
 	it("loads product Skills always and Pi/Codex Skills only through their independent settings", async () => {
 		const root = await mkdtemp(join(tmpdir(), "pi-runtime-product-skills-"));
 		const agentDir = join(root, "agent");

@@ -1,5 +1,5 @@
 const TOOL_FOCUS_BY_STAGE: Readonly<Record<string, readonly string[]>> = {
-	// `read`, `grep`, `find`, `ls`, `edit`, `write`, and `bash` are resident
+	// `read`, `grep`, `find`, `ls`, and `bash` are resident
 	// native coding tools. They are deliberately absent here: this projection
 	// is only for deferred product-tool discovery, and advertising native
 	// tools again makes the model search for or load capabilities it already
