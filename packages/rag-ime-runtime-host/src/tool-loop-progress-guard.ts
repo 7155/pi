@@ -8,11 +8,12 @@ export interface ToolLoopProgressTurn {
 export interface ToolLoopProgressGuardOptions {
 	maxConsecutiveAllErrorTurns?: number;
 	maxRepeatedFailureSignature?: number;
+	maxRecoveryWaitMs?: number;
 }
 
 export interface ToolLoopProgressStopReceipt {
 	schemaVersion: "rag-ime.tool-loop-progress-stop.v1";
-	reason: "consecutive_all_error_turns" | "repeated_failure_signature";
+	reason: "consecutive_all_error_turns" | "repeated_failure_signature" | "all_error_recovery_timeout";
 	consecutiveAllErrorTurns: number;
 	repeatedFailureSignature: number;
 	toolNames: string[];
@@ -20,6 +21,7 @@ export interface ToolLoopProgressStopReceipt {
 
 const DEFAULT_MAX_CONSECUTIVE_ALL_ERROR_TURNS = 8;
 const DEFAULT_MAX_REPEATED_FAILURE_SIGNATURE = 3;
+const DEFAULT_MAX_RECOVERY_WAIT_MS = 300_000;
 
 /**
  * Stops only a provider/tool loop that is demonstrably making no progress.
@@ -31,10 +33,13 @@ const DEFAULT_MAX_REPEATED_FAILURE_SIGNATURE = 3;
 export class ToolLoopProgressGuard {
 	private readonly maxConsecutiveAllErrorTurns: number;
 	private readonly maxRepeatedFailureSignature: number;
+	private readonly maxRecoveryWaitMs: number;
 	private consecutiveAllErrorTurns = 0;
 	private repeatedFailureSignature = 0;
 	private previousFailureSignature = "";
+	private latestFailureToolNames: string[] = [];
 	private latestStopReceipt: ToolLoopProgressStopReceipt | undefined;
+	private recoveryTimer: ReturnType<typeof setTimeout> | undefined;
 
 	constructor(options: ToolLoopProgressGuardOptions = {}) {
 		this.maxConsecutiveAllErrorTurns = positiveInteger(
@@ -45,12 +50,15 @@ export class ToolLoopProgressGuard {
 			options.maxRepeatedFailureSignature,
 			DEFAULT_MAX_REPEATED_FAILURE_SIGNATURE,
 		);
+		this.maxRecoveryWaitMs = positiveInteger(options.maxRecoveryWaitMs, DEFAULT_MAX_RECOVERY_WAIT_MS);
 	}
 
 	reset(): void {
+		this.clearRecoveryTimeout();
 		this.consecutiveAllErrorTurns = 0;
 		this.repeatedFailureSignature = 0;
 		this.previousFailureSignature = "";
+		this.latestFailureToolNames = [];
 		this.latestStopReceipt = undefined;
 	}
 
@@ -62,6 +70,7 @@ export class ToolLoopProgressGuard {
 		}
 
 		this.consecutiveAllErrorTurns += 1;
+		this.latestFailureToolNames = toolNames(turn.message);
 		const signature = failureSignature(turn);
 		if (signature === this.previousFailureSignature) {
 			this.repeatedFailureSignature += 1;
@@ -79,13 +88,36 @@ export class ToolLoopProgressGuard {
 			reason: repeated ? "repeated_failure_signature" : "consecutive_all_error_turns",
 			consecutiveAllErrorTurns: this.consecutiveAllErrorTurns,
 			repeatedFailureSignature: this.repeatedFailureSignature,
-			toolNames: toolNames(turn.message),
+			toolNames: [...this.latestFailureToolNames],
 		};
+		return true;
+	}
+
+	armRecoveryTimeout(onTimeout: (receipt: ToolLoopProgressStopReceipt) => void): boolean {
+		if (this.consecutiveAllErrorTurns < 1 || this.latestFailureToolNames.length < 1) return false;
+		this.clearRecoveryTimeout();
+		this.recoveryTimer = setTimeout(() => {
+			this.recoveryTimer = undefined;
+			const receipt: ToolLoopProgressStopReceipt = {
+				schemaVersion: "rag-ime.tool-loop-progress-stop.v1",
+				reason: "all_error_recovery_timeout",
+				consecutiveAllErrorTurns: this.consecutiveAllErrorTurns,
+				repeatedFailureSignature: this.repeatedFailureSignature,
+				toolNames: [...this.latestFailureToolNames],
+			};
+			this.latestStopReceipt = receipt;
+			onTimeout(structuredClone(receipt));
+		}, this.maxRecoveryWaitMs);
 		return true;
 	}
 
 	stopReceipt(): ToolLoopProgressStopReceipt | undefined {
 		return this.latestStopReceipt ? structuredClone(this.latestStopReceipt) : undefined;
+	}
+
+	private clearRecoveryTimeout(): void {
+		if (this.recoveryTimer !== undefined) clearTimeout(this.recoveryTimer);
+		this.recoveryTimer = undefined;
 	}
 }
 

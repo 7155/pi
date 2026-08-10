@@ -1,8 +1,12 @@
 import type { AssistantMessage, ToolResultMessage } from "@earendil-works/pi-ai";
-import { describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { ToolLoopProgressGuard } from "../src/tool-loop-progress-guard.ts";
 
 describe("ToolLoopProgressGuard", () => {
+	afterEach(() => {
+		vi.useRealTimers();
+	});
+
 	it("does not cap a long loop that keeps producing successful tool evidence", () => {
 		const guard = new ToolLoopProgressGuard({
 			maxConsecutiveAllErrorTurns: 2,
@@ -61,6 +65,35 @@ describe("ToolLoopProgressGuard", () => {
 		guard.reset();
 		expect(guard.shouldStop(turn(2, true, "same failure"))).toBe(false);
 		expect(guard.stopReceipt()).toBeUndefined();
+	});
+
+	it("aborts a managed recovery provider call that never settles after an all-error turn", async () => {
+		vi.useFakeTimers();
+		const guard = new ToolLoopProgressGuard({ maxRecoveryWaitMs: 1_000 });
+		const onTimeout = vi.fn();
+
+		expect(guard.shouldStop(turn(1, true, "invalid room_commit payload"))).toBe(false);
+		guard.armRecoveryTimeout(onTimeout);
+		await vi.advanceTimersByTimeAsync(999);
+		expect(onTimeout).not.toHaveBeenCalled();
+		await vi.advanceTimersByTimeAsync(1);
+		expect(onTimeout).toHaveBeenCalledOnce();
+		expect(guard.stopReceipt()).toMatchObject({
+			reason: "all_error_recovery_timeout",
+			toolNames: ["read"],
+		});
+	});
+
+	it("clears the recovery deadline as soon as a later turn completes", async () => {
+		vi.useFakeTimers();
+		const guard = new ToolLoopProgressGuard({ maxRecoveryWaitMs: 1_000 });
+		const onTimeout = vi.fn();
+
+		expect(guard.shouldStop(turn(1, true, "invalid room_commit payload"))).toBe(false);
+		guard.armRecoveryTimeout(onTimeout);
+		expect(guard.shouldStop(turn(2, false, "recovered"))).toBe(false);
+		await vi.advanceTimersByTimeAsync(1_000);
+		expect(onTimeout).not.toHaveBeenCalled();
 	});
 });
 

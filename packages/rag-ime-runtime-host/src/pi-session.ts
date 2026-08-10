@@ -528,24 +528,7 @@ export class PiProductSession implements PooledSession {
 		const inheritedStopPolicy = session.agent.shouldStopAfterTurn;
 		session.agent.shouldStopAfterTurn = async (context) => {
 			if ((await inheritedStopPolicy?.(context)) === true) return true;
-			const shouldStop = this.progressGuard().shouldStop(context);
-			if (shouldStop) {
-				const receipt = this.progressGuard().stopReceipt();
-				this.emitEvent({
-					protocolVersion: PROTOCOL_VERSION,
-					event: "agent.event",
-					sessionId: this.externalSessionId,
-					turnId: this.activeTurn?.turnId,
-					clientMessageId: this.activeTurn?.clientMessageId,
-					sequence: ++this.sequence,
-					payload: {
-						type: "tool_loop_no_progress",
-						message: "Tool Loop 连续未产生成功结果，已按受管无进展策略停止。请检查最后一项未完成原因后再重试。",
-						...receipt,
-					},
-				});
-			}
-			return shouldStop;
+			return this.observeToolLoopTurn(context);
 		};
 		this.unsubscribe = session.subscribe((event) => this.onSessionEvent(event));
 	}
@@ -553,6 +536,45 @@ export class PiProductSession implements PooledSession {
 	private progressGuard(): ToolLoopProgressGuard {
 		this.toolLoopProgressGuard ??= new ToolLoopProgressGuard();
 		return this.toolLoopProgressGuard;
+	}
+
+	private observeToolLoopTurn(context: Parameters<ToolLoopProgressGuard["shouldStop"]>[0]): boolean {
+		const guard = this.progressGuard();
+		const shouldStop = guard.shouldStop(context);
+		if (shouldStop) {
+			this.emitToolLoopNoProgress(guard.stopReceipt());
+			return true;
+		}
+		const expectedTurnId = this.activeTurn?.turnId;
+		const expectedDispatchId = this.activeRoom?.dispatchId;
+		if (!expectedTurnId || !expectedDispatchId) return false;
+		guard.armRecoveryTimeout((receipt) => {
+			if (this.activeTurn?.turnId !== expectedTurnId || this.activeRoom?.dispatchId !== expectedDispatchId) {
+				return;
+			}
+			this.emitToolLoopNoProgress(receipt);
+			// AgentSession.abort() signals the exact active Provider operation before
+			// waiting for lifecycle drain. Do not await that drain inside the timer;
+			// the ordinary settlement path remains the durable terminal owner.
+			void this.session.abort().catch(() => undefined);
+		});
+		return false;
+	}
+
+	private emitToolLoopNoProgress(receipt: ReturnType<ToolLoopProgressGuard["stopReceipt"]>): void {
+		this.emitEvent({
+			protocolVersion: PROTOCOL_VERSION,
+			event: "agent.event",
+			sessionId: this.externalSessionId,
+			turnId: this.activeTurn?.turnId,
+			clientMessageId: this.activeTurn?.clientMessageId,
+			sequence: ++this.sequence,
+			payload: {
+				type: "tool_loop_no_progress",
+				message: "Tool Loop 未能从失败结果恢复，已按受管无进展策略停止。请检查最后一项未完成原因后再重试。",
+				...receipt,
+			},
+		});
 	}
 
 	private refreshBackendToolDisclosure(roomBound = this.roomCapability !== undefined): void {
@@ -1169,6 +1191,7 @@ export class PiProductSession implements PooledSession {
 			(event.type === "agent_settled" && event.receipt?.disposition !== "suspended") ||
 			event.type === "agent_settle_failed"
 		) {
+			this.progressGuard().reset();
 			this.activeTurn = undefined;
 			this.activeRoom = undefined;
 			this.roomUsageBaseline = undefined;
@@ -1865,6 +1888,7 @@ export class PiProductSession implements PooledSession {
 	}
 
 	private beginRoomDispatch(options: ActiveRoomDispatch & { roomResourceLimits?: RoomResourceLimits }): void {
+		this.progressGuard().reset();
 		const stats = this.session.getSessionStats();
 		this.activeRoom = {
 			dispatchId: options.dispatchId,
@@ -2093,6 +2117,7 @@ export class PiProductSession implements PooledSession {
 	}
 
 	dispose(): void {
+		this.progressGuard().reset();
 		this.turnSettlements.dispose();
 		for (const pending of this.pendingUIRequests.values()) pending.cancel();
 		this.pendingUIRequests.clear();

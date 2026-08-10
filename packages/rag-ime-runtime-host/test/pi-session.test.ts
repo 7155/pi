@@ -12,6 +12,7 @@ import {
 } from "../src/pi-session.ts";
 import { ProductContextProvider } from "../src/product-context-provider.ts";
 import { ProviderContextJournal } from "../src/provider-context-journal.ts";
+import { ToolLoopProgressGuard } from "../src/tool-loop-progress-guard.ts";
 
 function testProductContextProvider(
 	mutable: Record<string, any>,
@@ -1055,6 +1056,94 @@ describe("managed Room cancellation lineage", () => {
 });
 
 describe("managed Room optional per-dispatch limits", () => {
+	it("aborts the exact Room turn when Provider recovery stalls after an all-error tool turn", async () => {
+		vi.useFakeTimers();
+		try {
+			const abort = vi.fn(async () => undefined);
+			const events: Array<Record<string, any>> = [];
+			const productSession = Object.create(PiProductSession.prototype) as PiProductSession;
+			const mutable = productSession as unknown as Record<string, any>;
+			Object.assign(mutable, {
+				activeTurn: { turnId: "turn:review", clientMessageId: "message:review" },
+				activeRoom: { dispatchId: "dispatch:review" },
+				emitEvent: (event: Record<string, any>) => events.push(event),
+				sequence: 0,
+				session: { abort },
+				toolLoopProgressGuard: new ToolLoopProgressGuard({ maxRecoveryWaitMs: 1_000 }),
+			});
+			const message = assistantWith(
+				[{ type: "toolCall", id: "call:commit", name: "room_commit", arguments: { decision: "handoff" } }],
+				1,
+				{ stopReason: "toolUse" },
+			);
+			const shouldStop = mutable.observeToolLoopTurn({
+				message,
+				toolResults: [
+					{
+						role: "toolResult",
+						toolCallId: "call:commit",
+						toolName: "room_commit",
+						content: [{ type: "text", text: "must omit resumeCondition" }],
+						details: {},
+						isError: true,
+						timestamp: 1,
+					},
+				],
+			});
+
+			expect(shouldStop).toBe(false);
+			await vi.advanceTimersByTimeAsync(1_000);
+			expect(abort).toHaveBeenCalledOnce();
+			expect(events).toContainEqual(
+				expect.objectContaining({
+					turnId: "turn:review",
+					payload: expect.objectContaining({ reason: "all_error_recovery_timeout" }),
+				}),
+			);
+		} finally {
+			vi.useRealTimers();
+		}
+	});
+
+	it("does not let an expired recovery timer abort a newer Room Dispatch", async () => {
+		vi.useFakeTimers();
+		try {
+			const abort = vi.fn(async () => undefined);
+			const productSession = Object.create(PiProductSession.prototype) as PiProductSession;
+			const mutable = productSession as unknown as Record<string, any>;
+			Object.assign(mutable, {
+				activeTurn: { turnId: "turn:review" },
+				activeRoom: { dispatchId: "dispatch:review" },
+				emitEvent: () => undefined,
+				sequence: 0,
+				session: { abort },
+				toolLoopProgressGuard: new ToolLoopProgressGuard({ maxRecoveryWaitMs: 1_000 }),
+			});
+			mutable.observeToolLoopTurn({
+				message: assistantWith([{ type: "toolCall", id: "call:commit", name: "room_commit", arguments: {} }], 1, {
+					stopReason: "toolUse",
+				}),
+				toolResults: [
+					{
+						role: "toolResult",
+						toolCallId: "call:commit",
+						toolName: "room_commit",
+						content: [{ type: "text", text: "invalid" }],
+						details: {},
+						isError: true,
+						timestamp: 1,
+					},
+				],
+			});
+			mutable.activeRoom = { dispatchId: "dispatch:newer" };
+
+			await vi.advanceTimersByTimeAsync(1_000);
+			expect(abort).not.toHaveBeenCalled();
+		} finally {
+			vi.useRealTimers();
+		}
+	});
+
 	it("does not impose fixed input-token or tool-call caps when they are omitted", () => {
 		const productSession = Object.create(PiProductSession.prototype) as PiProductSession;
 		const mutable = productSession as unknown as Record<string, any>;
