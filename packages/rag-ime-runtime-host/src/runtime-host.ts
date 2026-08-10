@@ -12,7 +12,7 @@ import {
 } from "@earendil-works/pi-ai";
 import { configureHttpDispatcher, ModelRuntime, RunScope } from "@earendil-works/pi-coding-agent";
 import { pendingRoomCancellationSurfaces, roomCancellationSurfaces } from "./cancellation-receipts.ts";
-import { PiProductSession } from "./pi-session.ts";
+import { PiProductSession, type PiSessionAbortReceipt } from "./pi-session.ts";
 import { ManagedPluginManager } from "./plugin-manager.ts";
 import {
 	PROTOCOL_NAME,
@@ -85,7 +85,17 @@ interface RoomCancelOperation {
 	cancelled?: { cancelledIds: string[]; abortRequired: boolean };
 	receipt?: Record<string, unknown>;
 	inFlight?: Promise<Record<string, unknown>>;
+	abortAttempt?: RoomAbortAttempt;
 }
+
+interface RoomAbortAttempt {
+	status: "pending" | "settled" | "failed";
+	completion: Promise<void>;
+	receipt?: PiSessionAbortReceipt;
+	error?: unknown;
+}
+
+const ROOM_CANCEL_ACK_TIMEOUT_MS = 1_000;
 
 function roomCancelFenceKey(lineage: Pick<RoomCancelParams, "sessionId" | "rootId" | "dispatchId">): string {
 	return `${lineage.sessionId}\u001f${lineage.rootId}\u001f${lineage.dispatchId}`;
@@ -386,8 +396,45 @@ export class RagImeRuntimeHost {
 		target: PiProductSession,
 	): Promise<Record<string, unknown>> {
 		operation.cancelled ??= target.cancelRoom(lineage);
-		const abortReceipt = operation.cancelled.abortRequired ? await target.abortRoom(lineage) : undefined;
+		let abortAttempt = operation.abortAttempt;
+		if (operation.cancelled.abortRequired && !abortAttempt) {
+			abortAttempt = {
+				status: "pending",
+				completion: Promise.resolve(),
+			};
+			const activeAttempt = abortAttempt;
+			activeAttempt.completion = target.abortRoom(lineage).then(
+				(receipt) => {
+					activeAttempt.receipt = receipt;
+					activeAttempt.status = "settled";
+				},
+				(error: unknown) => {
+					activeAttempt.error = error;
+					activeAttempt.status = "failed";
+				},
+			);
+			operation.abortAttempt = activeAttempt;
+		}
+		if (abortAttempt?.status === "pending") {
+			let timeout: ReturnType<typeof setTimeout> | undefined;
+			try {
+				await Promise.race([
+					abortAttempt.completion,
+					new Promise<void>((resolve) => {
+						timeout = setTimeout(resolve, ROOM_CANCEL_ACK_TIMEOUT_MS);
+					}),
+				]);
+			} finally {
+				if (timeout) clearTimeout(timeout);
+			}
+		}
+		if (abortAttempt?.status === "failed") {
+			operation.abortAttempt = undefined;
+			throw abortAttempt.error;
+		}
+		const abortReceipt = abortAttempt?.status === "settled" ? abortAttempt.receipt : undefined;
 		if (abortReceipt && abortReceipt.turnId !== lineage.turnId) {
+			operation.abortAttempt = undefined;
 			throw new RuntimeProtocolError(
 				"ROOM_CANCEL_LINEAGE_MISMATCH",
 				"Room abort receipt does not match the requested active turn",
@@ -398,6 +445,9 @@ export class RagImeRuntimeHost {
 			operation.cancelled.cancelledIds,
 			abortReceipt,
 		);
+		if (operation.cancelled.abortRequired && abortAttempt?.status === "pending") {
+			for (const proof of Object.values(cancellationSurfaces)) proof.state = "requested";
+		}
 		const pendingTargets = pendingRoomCancellationSurfaces(cancellationSurfaces);
 		const receipt = {
 			schemaVersion: "wisdom-weasel.room-runtime-receipt.v1",
@@ -417,6 +467,7 @@ export class RagImeRuntimeHost {
 			sessionAbortReceipt: abortReceipt,
 		};
 		operation.receipt = receipt;
+		if (abortAttempt?.status === "settled") operation.abortAttempt = undefined;
 		if (pendingTargets.length === 0) target.finishRoomCancel(lineage.rootId, lineage.generation, lineage.cancelId);
 		return receipt;
 	}

@@ -454,6 +454,15 @@ describe("Room runtime RPC", () => {
 				idle: true,
 			},
 		};
+		const pendingAbort = {
+			...terminalAbort,
+			lifecycle: {
+				...terminalAbort.lifecycle,
+				pendingOperations: [{ operationId: "compaction:1", kind: "manual_compaction", registeredAt: 1 }],
+				drained: false,
+				idle: false,
+			},
+		};
 		const abortRoom = vi
 			.fn()
 			.mockImplementationOnce(() => firstAbort)
@@ -509,17 +518,30 @@ describe("Room runtime RPC", () => {
 				),
 			).rejects.toMatchObject({ code: "ROOM_DISPATCH_CANCELLED" });
 			expect(target.dispatchRoom).toHaveBeenCalledOnce();
-			resolveFirstAbort({
-				...terminalAbort,
-				lifecycle: {
-					...terminalAbort.lifecycle,
-					pendingOperations: [{ operationId: "compaction:1", kind: "manual_compaction", registeredAt: 1 }],
-					drained: false,
-					idle: false,
-				},
-			});
-			const [pending, samePending] = await Promise.all([first, concurrent]);
-			expect(samePending).toEqual(pending);
+			const acknowledged = await Promise.race([
+				Promise.all([first, concurrent]),
+				new Promise<"timed-out">((resolve) => setTimeout(() => resolve("timed-out"), 1_500)),
+			]);
+			expect(acknowledged).not.toBe("timed-out");
+			const [requested, sameRequested] = acknowledged as [Record<string, any>, Record<string, any>];
+			expect(sameRequested).toEqual(requested);
+			expect(requested.pendingTargets).toEqual([
+				"provider",
+				"tool",
+				"exec",
+				"retry",
+				"compaction",
+				"branch_summary",
+				"timer",
+				"continuation",
+				"session",
+			]);
+			expect(target.cancelRoom).toHaveBeenCalledOnce();
+			expect(abortRoom).toHaveBeenCalledOnce();
+
+			resolveFirstAbort(pendingAbort);
+			await firstAbort;
+			const pending = await host.handle(request("cancel:pending", "room.cancel", cancelLineage));
 			expect((pending as Record<string, any>).pendingTargets).toEqual(["compaction", "session"]);
 			expect(target.cancelRoom).toHaveBeenCalledOnce();
 			expect(target.finishRoomCancel).not.toHaveBeenCalled();
