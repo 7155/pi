@@ -341,6 +341,66 @@ describe("AgentSession concurrent prompt guard", () => {
 		await expect(session.prompt("Second message")).resolves.not.toThrow();
 	});
 
+	it("should abort while prompt context preflight is pending", async () => {
+		const model = getModel("anthropic", "claude-sonnet-4-5")!;
+		let preflightSignal: AbortSignal | undefined;
+		let providerCalls = 0;
+		const agent = new Agent({
+			getApiKey: () => "test-key",
+			initialState: { model, systemPrompt: "Test", tools: [] },
+			streamFn: () => {
+				providerCalls += 1;
+				const stream = new MockAssistantStream();
+				queueMicrotask(() => {
+					stream.push({ type: "start", partial: createAssistantMessage("") });
+					stream.push({ type: "done", reason: "stop", message: createAssistantMessage("Done") });
+				});
+				return stream;
+			},
+		});
+		const extensionsResult = await createTestExtensionsResult([
+			(pi) => {
+				pi.on("before_agent_start", async (_event, context) => {
+					preflightSignal = context.signal;
+					await new Promise<void>((_resolve, reject) => {
+						const signal = context.signal;
+						if (!signal || signal.aborted) {
+							reject(signal?.reason ?? new Error("Missing prompt preflight signal"));
+							return;
+						}
+						signal.addEventListener("abort", () => reject(signal.reason), { once: true });
+					});
+				});
+			},
+		]);
+		const sessionManager = SessionManager.inMemory();
+		const settingsManager = SettingsManager.create(tempDir, tempDir);
+		const authStorage = AuthStorage.create(join(tempDir, "auth.json"));
+		const modelRegistry = await createModelRegistry(authStorage, tempDir);
+		await authStorage.modify("anthropic", async () => ({ type: "api_key", key: "test-key" }));
+		session = new AgentSession({
+			agent,
+			sessionManager,
+			settingsManager,
+			cwd: tempDir,
+			modelRuntime: getModelRuntime(modelRegistry),
+			resourceLoader: createTestResourceLoader({ extensionsResult }),
+		});
+
+		const prompt = session.prompt("Stop during context assembly");
+		await expect.poll(() => preflightSignal).toBeDefined();
+		expect(session.isIdle).toBe(false);
+		const startedAt = Date.now();
+		const receipt = await session.abort();
+
+		await expect(prompt).rejects.toThrow("Prompt preflight aborted");
+		expect(Date.now() - startedAt).toBeLessThan(250);
+		expect(preflightSignal?.aborted).toBe(true);
+		expect(providerCalls).toBe(0);
+		expect(receipt).toMatchObject({ idle: true, drained: true });
+		expect(session.isIdle).toBe(true);
+	});
+
 	it("should wait for queued agent events before emitting tool_call", async () => {
 		const model = getModel("anthropic", "claude-sonnet-4-5")!;
 		const tool = {

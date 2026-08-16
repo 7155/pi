@@ -775,8 +775,8 @@ export class PiProductSession implements PooledSession {
 				lifecycleHooks.extension,
 				createContextProviderJournalExtension(
 					providerContextJournal,
-					async ({ prompt }) =>
-						(await productContextProvider.assemble({ stage: "turn_start", queryText: prompt })).assembly,
+					async ({ prompt, signal }) =>
+						(await productContextProvider.assemble({ stage: "turn_start", queryText: prompt, signal })).assembly,
 				),
 				{ name: "rag-ime-debug-context", factory: debugContextRecorder.extension() },
 			],

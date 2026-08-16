@@ -341,6 +341,7 @@ export class AgentSession {
 	private _unsubscribeAgent?: () => void;
 	private _eventListeners: AgentSessionEventListener[] = [];
 	private _isAgentRunActive = false;
+	private _promptPreflightAbortController: AbortController | undefined;
 	private _settlementEmissionPending = false;
 	private _idleWaitPromise: Promise<void> | undefined;
 	private _resolveIdleWait: (() => void) | undefined;
@@ -1062,6 +1063,7 @@ export class AgentSession {
 	 */
 	dispose(): void {
 		try {
+			this._promptPreflightAbortController?.abort(new Error("Prompt preflight aborted"));
 			this.abortRetry();
 			this.abortCompaction();
 			this.abortBranchSummary();
@@ -1103,9 +1105,13 @@ export class AgentSession {
 		return this._isAgentRunActive;
 	}
 
-	/** Whether the session has no active agent run, retry, auto-compaction, or queued continuation. */
+	/** Whether the session has no prompt preflight, active agent run, or queued continuation. */
 	get isIdle(): boolean {
-		return !this._isAgentRunActive && !this.agent.hasQueuedMessages();
+		return (
+			this._promptPreflightAbortController === undefined &&
+			!this._isAgentRunActive &&
+			!this.agent.hasQueuedMessages()
+		);
 	}
 
 	/** Current effective system prompt (includes any per-turn extension modifications) */
@@ -1508,6 +1514,12 @@ export class AgentSession {
 	 */
 	async prompt(text: string, options?: PromptOptions): Promise<void> {
 		this._assertSettlementAdmissionOpen();
+		if (this._promptPreflightAbortController) {
+			throw new Error("Agent prompt preflight is already active");
+		}
+		const preflightAbortController = new AbortController();
+		const assertPreflightActive = () => preflightAbortController.signal.throwIfAborted();
+		this._promptPreflightAbortController = preflightAbortController;
 		const expandPromptTemplates = options?.expandPromptTemplates ?? true;
 		const preflightResult = options?.preflightResult;
 		let messages: AgentMessage[] | undefined;
@@ -1517,6 +1529,7 @@ export class AgentSession {
 			// Extension commands manage their own LLM interaction via pi.sendMessage()
 			if (expandPromptTemplates && text.startsWith("/")) {
 				const handled = await this._tryExecuteExtensionCommand(text);
+				assertPreflightActive();
 				if (handled) {
 					// Extension command executed, no prompt to send
 					preflightResult?.(true);
@@ -1534,6 +1547,7 @@ export class AgentSession {
 					options?.source ?? "interactive",
 					this.isStreaming ? options?.streamingBehavior : undefined,
 				);
+				assertPreflightActive();
 				if (inputResult.action === "handled") {
 					preflightResult?.(true);
 					return;
@@ -1563,6 +1577,7 @@ export class AgentSession {
 				} else {
 					await this._queueSteer(expandedText, currentImages);
 				}
+				assertPreflightActive();
 				preflightResult?.(true);
 				return;
 			}
@@ -1589,6 +1604,7 @@ export class AgentSession {
 				this.agent.streamFn !== streamSimple ||
 				this._modelRuntime.hasConfiguredAuth(this.model.provider) ||
 				(await this._modelRuntime.checkAuth(this.model.provider)) !== undefined;
+			assertPreflightActive();
 			if (!hasConfiguredAuth) {
 				const isOAuth = this._modelRuntime.isUsingOAuth(this.model.provider);
 				if (isOAuth) {
@@ -1606,6 +1622,7 @@ export class AgentSession {
 			const lastAssistant = this._findLastAssistantMessage();
 			if (lastAssistant) {
 				await this._checkCompaction(lastAssistant, false, false);
+				assertPreflightActive();
 			}
 
 			// Build messages array (custom message if any, then user message)
@@ -1635,6 +1652,7 @@ export class AgentSession {
 				this._baseSystemPrompt,
 				this._baseSystemPromptOptions,
 			);
+			assertPreflightActive();
 			// Add all custom messages from extensions
 			if (result?.messages) {
 				for (const msg of result.messages) {
@@ -1661,6 +1679,11 @@ export class AgentSession {
 		} catch (error) {
 			preflightResult?.(false);
 			throw error;
+		} finally {
+			if (this._promptPreflightAbortController === preflightAbortController) {
+				this._promptPreflightAbortController = undefined;
+			}
+			this._resolveIdleWaitIfIdle();
 		}
 
 		if (!messages) {
@@ -2058,6 +2081,7 @@ export class AgentSession {
 	 * Abort current operation and wait for agent to become idle.
 	 */
 	async abort(): Promise<AgentAbortReceipt> {
+		this._promptPreflightAbortController?.abort(new Error("Prompt preflight aborted"));
 		const scope = this._cancelScope;
 		const operations = scope ? flattenRunScopeOperations(scope.snapshot()) : [];
 		const cancellation: CancelReceipt = scope
@@ -3048,7 +3072,7 @@ export class AgentSession {
 				getModel: () => this.model,
 				isIdle: () => this.isIdle,
 				isProjectTrusted: () => this.settingsManager.isProjectTrusted(),
-				getSignal: () => this.agent.signal,
+				getSignal: () => this._promptPreflightAbortController?.signal ?? this.agent.signal,
 				abort: () => {
 					if (this._extensionAbortHandler) {
 						this._extensionAbortHandler();

@@ -167,11 +167,11 @@ export function createProviderContextJournalExtension(
 /** Preferred extension for deterministic, provenance-bearing ContextProviders. */
 export function createContextProviderJournalExtension(
 	journal: ProviderContextJournal,
-	assemble: (input: { prompt: string }) => Promise<ContextAssembly>,
+	assemble: (input: { prompt: string; signal?: AbortSignal }) => Promise<ContextAssembly>,
 ): ExtensionFactory {
 	return (pi) => {
-		pi.on("before_agent_start", async (event) => {
-			const assembly = await assemble({ prompt: event.prompt });
+		pi.on("before_agent_start", async (event, context) => {
+			const assembly = await assemble({ prompt: event.prompt, signal: context.signal });
 			const systemPrompt = journal.projectAssembly(event.systemPrompt, assembly);
 			return systemPrompt === event.systemPrompt ? undefined : { systemPrompt };
 		});
