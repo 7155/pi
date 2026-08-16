@@ -1524,12 +1524,20 @@ export class PiProductSession implements PooledSession {
 	}
 
 	listCommands(): Array<Record<string, unknown>> {
-		return this.resourceLoader.getSkills().skills.map((skill) => ({
-			name: `skill:${skill.name}`,
-			description: skill.description,
-			source: "skill",
-			location: skill.sourceInfo?.scope ?? "runtime",
-		}));
+		return [
+			...this.resourceLoader.getPrompts().prompts.map((prompt) => ({
+				name: prompt.name,
+				description: prompt.description,
+				source: "prompt",
+				location: prompt.sourceInfo?.scope ?? "runtime",
+			})),
+			...this.resourceLoader.getSkills().skills.map((skill) => ({
+				name: `skill:${skill.name}`,
+				description: skill.description,
+				source: "skill",
+				location: skill.sourceInfo?.scope ?? "runtime",
+			})),
+		];
 	}
 
 	forkCandidates(): PublicPiForkCandidate[] {

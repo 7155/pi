@@ -293,6 +293,7 @@ describe("PiProductSession catalog updates", () => {
 		const agentDir = join(root, "agent");
 		const sessionDir = join(root, "sessions");
 		const activePluginDir = join(root, "plugins", "active");
+		const promptDir = join(agentDir, "prompts");
 		const ambientSkillDir = join(agentDir, "skills", "ambient-workspace-skill");
 		const productSkillDir = join(root, "product-skills", "rag-ime-product-skill");
 		const piSkillDir = join(root, "pi-skills", "pi-user-skill");
@@ -300,12 +301,17 @@ describe("PiProductSession catalog updates", () => {
 		await Promise.all([
 			mkdir(sessionDir, { recursive: true }),
 			mkdir(activePluginDir, { recursive: true }),
+			mkdir(promptDir, { recursive: true }),
 			mkdir(ambientSkillDir, { recursive: true }),
 			mkdir(productSkillDir, { recursive: true }),
 			mkdir(piSkillDir, { recursive: true }),
 			mkdir(codexSkillDir, { recursive: true }),
 		]);
 		await Promise.all([
+			writeFile(
+				join(promptDir, "init.md"),
+				"---\ndescription: Initialize project instructions.\n---\nCreate or update AGENTS.md.\n",
+			),
 			writeFile(
 				join(ambientSkillDir, "SKILL.md"),
 				"---\nname: ambient-workspace-skill\ndescription: Must remain outside the product catalog.\n---\n",
@@ -343,6 +349,7 @@ describe("PiProductSession catalog updates", () => {
 
 		try {
 			expect(productSession.listCommands()).toEqual([
+				expect.objectContaining({ name: "init", source: "prompt" }),
 				expect.objectContaining({ name: "skill:rag-ime-product-skill" }),
 			]);
 			expect(productSession.snapshot()).toMatchObject({
@@ -363,6 +370,7 @@ describe("PiProductSession catalog updates", () => {
 		});
 		try {
 			expect(piSession.listCommands().map((command) => command.name)).toEqual([
+				"init",
 				"skill:rag-ime-product-skill",
 				"skill:pi-user-skill",
 			]);
@@ -378,6 +386,7 @@ describe("PiProductSession catalog updates", () => {
 		});
 		try {
 			expect(codexSession.listCommands().map((command) => command.name)).toEqual([
+				"init",
 				"skill:rag-ime-product-skill",
 				"skill:codex-user-skill",
 			]);
