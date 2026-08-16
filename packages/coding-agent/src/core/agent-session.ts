@@ -319,6 +319,31 @@ function estimateMessagesTokens(messages: AgentMessage[]): number {
 	return tokens;
 }
 
+function awaitPromptPreflight<T>(operation: Promise<T>, signal: AbortSignal): Promise<T> {
+	return new Promise<T>((resolve, reject) => {
+		const onAbort = () => {
+			cleanup();
+			reject(signal.reason ?? new Error("Prompt preflight aborted"));
+		};
+		const cleanup = () => signal.removeEventListener("abort", onAbort);
+		if (signal.aborted) {
+			onAbort();
+			return;
+		}
+		signal.addEventListener("abort", onAbort, { once: true });
+		void operation.then(
+			(value) => {
+				cleanup();
+				resolve(value);
+			},
+			(error) => {
+				cleanup();
+				reject(error);
+			},
+		);
+	});
+}
+
 // ============================================================================
 // Constants
 // ============================================================================
@@ -1528,7 +1553,10 @@ export class AgentSession {
 			// Handle extension commands first (execute immediately, even during streaming)
 			// Extension commands manage their own LLM interaction via pi.sendMessage()
 			if (expandPromptTemplates && text.startsWith("/")) {
-				const handled = await this._tryExecuteExtensionCommand(text);
+				const handled = await awaitPromptPreflight(
+					this._tryExecuteExtensionCommand(text),
+					preflightAbortController.signal,
+				);
 				assertPreflightActive();
 				if (handled) {
 					// Extension command executed, no prompt to send
@@ -1541,11 +1569,14 @@ export class AgentSession {
 			let currentText = text;
 			let currentImages = options?.images;
 			if (this._extensionRunner.hasHandlers("input")) {
-				const inputResult = await this._extensionRunner.emitInput(
-					currentText,
-					currentImages,
-					options?.source ?? "interactive",
-					this.isStreaming ? options?.streamingBehavior : undefined,
+				const inputResult = await awaitPromptPreflight(
+					this._extensionRunner.emitInput(
+						currentText,
+						currentImages,
+						options?.source ?? "interactive",
+						this.isStreaming ? options?.streamingBehavior : undefined,
+					),
+					preflightAbortController.signal,
 				);
 				assertPreflightActive();
 				if (inputResult.action === "handled") {
@@ -1573,9 +1604,15 @@ export class AgentSession {
 					);
 				}
 				if (options.streamingBehavior === "followUp") {
-					await this._queueFollowUp(expandedText, currentImages);
+					await awaitPromptPreflight(
+						this._queueFollowUp(expandedText, currentImages),
+						preflightAbortController.signal,
+					);
 				} else {
-					await this._queueSteer(expandedText, currentImages);
+					await awaitPromptPreflight(
+						this._queueSteer(expandedText, currentImages),
+						preflightAbortController.signal,
+					);
 				}
 				assertPreflightActive();
 				preflightResult?.(true);
@@ -1603,7 +1640,10 @@ export class AgentSession {
 			const hasConfiguredAuth =
 				this.agent.streamFn !== streamSimple ||
 				this._modelRuntime.hasConfiguredAuth(this.model.provider) ||
-				(await this._modelRuntime.checkAuth(this.model.provider)) !== undefined;
+				(await awaitPromptPreflight(
+					this._modelRuntime.checkAuth(this.model.provider),
+					preflightAbortController.signal,
+				)) !== undefined;
 			assertPreflightActive();
 			if (!hasConfiguredAuth) {
 				const isOAuth = this._modelRuntime.isUsingOAuth(this.model.provider);
@@ -1621,7 +1661,10 @@ export class AgentSession {
 			// The user's new prompt is sent below, so do not call agent.continue() here.
 			const lastAssistant = this._findLastAssistantMessage();
 			if (lastAssistant) {
-				await this._checkCompaction(lastAssistant, false, false);
+				await awaitPromptPreflight(
+					this._checkCompaction(lastAssistant, false, false),
+					preflightAbortController.signal,
+				);
 				assertPreflightActive();
 			}
 
@@ -1646,11 +1689,14 @@ export class AgentSession {
 			this._pendingNextTurnMessages = [];
 
 			// Emit before_agent_start extension event
-			const result = await this._extensionRunner.emitBeforeAgentStart(
-				expandedText,
-				currentImages,
-				this._baseSystemPrompt,
-				this._baseSystemPromptOptions,
+			const result = await awaitPromptPreflight(
+				this._extensionRunner.emitBeforeAgentStart(
+					expandedText,
+					currentImages,
+					this._baseSystemPrompt,
+					this._baseSystemPromptOptions,
+				),
+				preflightAbortController.signal,
 			);
 			assertPreflightActive();
 			// Add all custom messages from extensions
@@ -2082,6 +2128,7 @@ export class AgentSession {
 	 */
 	async abort(): Promise<AgentAbortReceipt> {
 		this._promptPreflightAbortController?.abort(new Error("Prompt preflight aborted"));
+		this.abortCompaction();
 		const scope = this._cancelScope;
 		const operations = scope ? flattenRunScopeOperations(scope.snapshot()) : [];
 		const cancellation: CancelReceipt = scope
