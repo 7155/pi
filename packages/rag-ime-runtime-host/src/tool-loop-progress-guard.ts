@@ -22,13 +22,15 @@ export interface ToolLoopProgressStopReceipt {
 const DEFAULT_MAX_CONSECUTIVE_ALL_ERROR_TURNS = 8;
 const DEFAULT_MAX_REPEATED_FAILURE_SIGNATURE = 3;
 const DEFAULT_MAX_RECOVERY_WAIT_MS = 300_000;
+const MAX_TRACKED_FAILURE_FAMILIES = 256;
 
 /**
  * Stops only a provider/tool loop that is demonstrably making no progress.
  *
- * A successful tool result resets the complete guard. Ordinary long research
- * loops therefore remain unbounded by call count, while repeated governed
- * failures cannot consume the session forever.
+ * Successful tool results clear consecutive-error state, so ordinary long
+ * research loops remain unbounded by call count. A recurring failure family
+ * remains visible until the external prompt settles, preventing a trivial
+ * successful read from hiding the same broken write attempt forever.
  */
 export class ToolLoopProgressGuard {
 	private readonly maxConsecutiveAllErrorTurns: number;
@@ -36,7 +38,7 @@ export class ToolLoopProgressGuard {
 	private readonly maxRecoveryWaitMs: number;
 	private consecutiveAllErrorTurns = 0;
 	private repeatedFailureSignature = 0;
-	private previousFailureSignature = "";
+	private readonly failureFamilyCounts = new Map<string, number>();
 	private latestFailureToolNames: string[] = [];
 	private latestStopReceipt: ToolLoopProgressStopReceipt | undefined;
 	private recoveryTimer: ReturnType<typeof setTimeout> | undefined;
@@ -57,7 +59,7 @@ export class ToolLoopProgressGuard {
 		this.clearRecoveryTimeout();
 		this.consecutiveAllErrorTurns = 0;
 		this.repeatedFailureSignature = 0;
-		this.previousFailureSignature = "";
+		this.failureFamilyCounts.clear();
 		this.latestFailureToolNames = [];
 		this.latestStopReceipt = undefined;
 	}
@@ -65,19 +67,23 @@ export class ToolLoopProgressGuard {
 	shouldStop(turn: ToolLoopProgressTurn): boolean {
 		const results = turn.toolResults;
 		if (results.length === 0 || results.some((result) => result.isError !== true)) {
-			this.reset();
+			this.clearRecoveryTimeout();
+			this.consecutiveAllErrorTurns = 0;
+			this.repeatedFailureSignature = 0;
+			this.latestFailureToolNames = [];
+			this.latestStopReceipt = undefined;
 			return false;
 		}
 
 		this.consecutiveAllErrorTurns += 1;
 		this.latestFailureToolNames = toolNames(turn.message);
-		const signature = failureSignature(turn);
-		if (signature === this.previousFailureSignature) {
-			this.repeatedFailureSignature += 1;
-		} else {
-			this.previousFailureSignature = signature;
-			this.repeatedFailureSignature = 1;
+		const signature = failureFamilySignature(turn);
+		if (!this.failureFamilyCounts.has(signature) && this.failureFamilyCounts.size >= MAX_TRACKED_FAILURE_FAMILIES) {
+			const oldest = this.failureFamilyCounts.keys().next().value;
+			if (oldest !== undefined) this.failureFamilyCounts.delete(oldest);
 		}
+		this.repeatedFailureSignature = (this.failureFamilyCounts.get(signature) ?? 0) + 1;
+		this.failureFamilyCounts.set(signature, this.repeatedFailureSignature);
 
 		const repeated = this.repeatedFailureSignature >= this.maxRepeatedFailureSignature;
 		const exhausted = this.consecutiveAllErrorTurns >= this.maxConsecutiveAllErrorTurns;
@@ -138,23 +144,13 @@ function toolNames(message: AssistantMessage): string[] {
 	].sort();
 }
 
-function failureSignature(turn: ToolLoopProgressTurn): string {
-	const calls = new Map(
-		turn.message.content
-			.filter(
-				(block): block is Extract<AssistantMessage["content"][number], { type: "toolCall" }> =>
-					block.type === "toolCall",
-			)
-			.map((block) => [block.id, block]),
-	);
-	const failures = turn.toolResults.map((result) => {
-		const call = calls.get(result.toolCallId);
-		return {
+function failureFamilySignature(turn: ToolLoopProgressTurn): string {
+	const failures = turn.toolResults
+		.map((result) => ({
 			toolName: result.toolName,
-			arguments: canonicalValue(call?.arguments),
 			error: normalizeErrorText(result.content),
-		};
-	});
+		}))
+		.sort((left, right) => left.toolName.localeCompare(right.toolName) || left.error.localeCompare(right.error));
 	return JSON.stringify(failures);
 }
 
@@ -171,14 +167,4 @@ function normalizeErrorText(content: ToolResultMessage["content"]): string {
 		.replace(/\s+/gu, " ")
 		.trim()
 		.slice(0, 1_000);
-}
-
-function canonicalValue(value: unknown): unknown {
-	if (Array.isArray(value)) return value.map(canonicalValue);
-	if (typeof value !== "object" || value === null) return value;
-	return Object.fromEntries(
-		Object.entries(value as Record<string, unknown>)
-			.sort(([left], [right]) => left.localeCompare(right))
-			.map(([key, child]) => [key, canonicalValue(child)]),
-	);
 }

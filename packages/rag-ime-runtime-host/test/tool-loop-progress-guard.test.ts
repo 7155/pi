@@ -41,7 +41,7 @@ describe("ToolLoopProgressGuard", () => {
 		});
 	});
 
-	it("bounds varied all-error turns and resets after any successful tool result", () => {
+	it("bounds varied all-error turns and resets the consecutive count after success", () => {
 		const guard = new ToolLoopProgressGuard({
 			maxConsecutiveAllErrorTurns: 4,
 			maxRepeatedFailureSignature: 3,
@@ -54,6 +54,43 @@ describe("ToolLoopProgressGuard", () => {
 		expect(guard.shouldStop(turn(6, true, "sixth failure"))).toBe(false);
 		expect(guard.shouldStop(turn(7, true, "seventh failure"))).toBe(true);
 		expect(guard.stopReceipt()?.reason).toBe("consecutive_all_error_turns");
+	});
+
+	it("stops one recurring failure family across unrelated successful calls", () => {
+		const guard = new ToolLoopProgressGuard({
+			maxConsecutiveAllErrorTurns: 8,
+			maxRepeatedFailureSignature: 3,
+		});
+		expect(
+			guard.shouldStop(
+				turn(1, true, "workspace command is malformed or too long", {
+					command: "cat > first.py <<'PY'",
+				}),
+			),
+		).toBe(false);
+		expect(guard.shouldStop(turn(2, false, "read succeeded"))).toBe(false);
+		expect(
+			guard.shouldStop(
+				turn(3, true, "workspace command is malformed or too long", {
+					command: "cat > second.py <<'PY'",
+				}),
+			),
+		).toBe(false);
+		expect(guard.shouldStop(turn(4, false, "another read succeeded"))).toBe(false);
+		expect(
+			guard.shouldStop(
+				turn(5, true, "workspace command is malformed or too long", {
+					command: "cat > third.py <<'PY'",
+				}),
+			),
+		).toBe(true);
+		expect(guard.stopReceipt()).toEqual({
+			schemaVersion: "rag-ime.tool-loop-progress-stop.v1",
+			reason: "repeated_failure_signature",
+			consecutiveAllErrorTurns: 1,
+			repeatedFailureSignature: 3,
+			toolNames: ["read"],
+		});
 	});
 
 	it("resets between externally accepted prompts", () => {
@@ -97,11 +134,11 @@ describe("ToolLoopProgressGuard", () => {
 	});
 });
 
-function turn(index: number, isError: boolean, text: string) {
+function turn(index: number, isError: boolean, text: string, args: Record<string, unknown> = { path: "/tmp/missing" }) {
 	const toolCallId = `call-${index}`;
 	const message: AssistantMessage = {
 		role: "assistant",
-		content: [{ type: "toolCall", id: toolCallId, name: "read", arguments: { path: "/tmp/missing" } }],
+		content: [{ type: "toolCall", id: toolCallId, name: "read", arguments: args }],
 		api: "openai-responses",
 		provider: "openai-codex",
 		model: "test",
