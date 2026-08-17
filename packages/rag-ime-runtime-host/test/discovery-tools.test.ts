@@ -536,8 +536,8 @@ describe("runtime discovery tools", () => {
 	it("renders capability families plus current-stage cards while excluding active Tool schemas", () => {
 		const tools: BackendToolManifest[] = [
 			{
-				name: "room_state",
-				description: "Read Room state.",
+				name: "room_partner",
+				description: "Coordinate the active Room directly.",
 				parameters: { type: "object", properties: {} },
 			},
 			{
@@ -553,10 +553,10 @@ describe("runtime discovery tools", () => {
 		];
 
 		const prompt = formatBackendToolRouteCatalog(tools, "revision", {
-			activeNames: ["room_state"],
+			activeNames: ["room_partner"],
 			focusNames: ["workspace_read"],
 		});
-		const search = searchBackendTools(tools, { query: "" }, "revision", ["room_state"]);
+		const search = searchBackendTools(tools, { query: "" }, "revision", ["room_partner"]);
 
 		expect(prompt).toContain('<product_tool_capability_families format="family-jsonl">');
 		expect(prompt).toContain(
@@ -564,10 +564,10 @@ describe("runtime discovery tools", () => {
 		);
 		expect(prompt).toContain('"name":"workspace_read"');
 		expect(prompt).not.toContain('"name":"workspace_shell"');
-		expect(prompt).not.toContain("room_state");
+		expect(prompt).not.toContain("room_partner");
 		expect(search).toMatchObject({
 			items: [{ name: "workspace_read" }, { name: "workspace_shell" }],
-			activeDirectCalls: ["room_state"],
+			activeDirectCalls: ["room_partner"],
 		});
 	});
 
@@ -575,8 +575,8 @@ describe("runtime discovery tools", () => {
 		const prompt = formatBackendToolRouteCatalog(
 			[
 				{
-					name: "room_state",
-					description: "Read Room state directly.",
+					name: "room_partner",
+					description: "Coordinate the active Room directly.",
 					parameters: { type: "object", properties: {} },
 					alwaysAvailable: true,
 				},
@@ -590,7 +590,7 @@ describe("runtime discovery tools", () => {
 		);
 
 		expect(prompt).toContain('"name":"workspace_read"');
-		expect(prompt).not.toContain('"name":"room_state"');
+		expect(prompt).not.toContain('"name":"room_partner"');
 	});
 
 	it("classifies product-prefixed tools by capability instead of treating every ime tool as input", () => {
@@ -953,8 +953,8 @@ describe("runtime discovery tools", () => {
 		const registry = new BackendToolRegistry();
 		registry.sync([
 			{
-				name: "room_state",
-				description: "Read Room state.",
+				name: "room_partner",
+				description: "Coordinate the active Room.",
 				parameters: { type: "object", properties: {} },
 			},
 			{
@@ -963,7 +963,7 @@ describe("runtime discovery tools", () => {
 				parameters: { type: "object", properties: {} },
 			},
 		]);
-		registry.disclose("room_state");
+		registry.disclose("room_partner");
 		const registered = new Map<string, ToolDefinition>();
 		const extension = createDiscoveryToolsExtension({
 			getResourceLoader: () =>
@@ -985,7 +985,7 @@ describe("runtime discovery tools", () => {
 				registered.set(toolDefinition.name, toolDefinition);
 			},
 			getActiveTools() {
-				return ["tool_load", "room_state"];
+				return ["tool_load", "room_partner"];
 			},
 			setActiveTools() {},
 		} as never);
@@ -995,12 +995,12 @@ describe("runtime discovery tools", () => {
 			const loadTool = registered.get(TOOL_LOAD_TOOL_NAME);
 			if (!loadTool) throw new Error("tool_load was not registered");
 			await expect(
-				loadTool.execute("load-active", { name: "room_state" } as never, undefined, undefined, {} as never),
+				loadTool.execute("load-active", { name: "room_partner" } as never, undefined, undefined, {} as never),
 			).rejects.toThrow("Tool schema is already active");
 			await expect(
 				loadTool.execute(
 					"load-mixed",
-					{ names: ["workspace_read", "room_state"] } as never,
+					{ names: ["workspace_read", "room_partner"] } as never,
 					undefined,
 					undefined,
 					{} as never,

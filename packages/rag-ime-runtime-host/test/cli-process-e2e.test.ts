@@ -13,9 +13,9 @@ const protocolVersion = "2";
 const children: ChildProcessWithoutNullStreams[] = [];
 const servers: Server[] = [];
 
-async function startHost(slow = false, settleStates: string[] = ["committed"], scenario?: string) {
+async function startHost(slow = false, scenario?: string) {
 	const stateRoot = await mkdtemp(join(tmpdir(), "rag-ime-real-host-e2e-"));
-	const settleRequests: Record<string, unknown>[] = [];
+	const toolRequests: Array<Record<string, unknown> & { path: string }> = [];
 	const gateway = createServer((request, response) => {
 		let body = "";
 		request.setEncoding("utf8");
@@ -24,25 +24,30 @@ async function startHost(slow = false, settleStates: string[] = ["committed"], s
 		});
 		request.on("end", () => {
 			const payload = JSON.parse(body) as Record<string, unknown>;
-			const isSettle = request.url?.endsWith("/room-settle") === true;
-			if (isSettle) settleRequests.push(payload);
-			const settleState =
-				settleStates[Math.min(Math.max(0, settleRequests.length - 1), settleStates.length - 1)] ?? "committed";
-			const result = request.url?.endsWith("/tool/load")
+			const path = request.url ?? "";
+			toolRequests.push({ path, ...payload });
+			const args =
+				typeof payload.args === "object" && payload.args !== null ? (payload.args as Record<string, unknown>) : {};
+			const result = path.endsWith("/tool/load")
 				? { receiptId: `receipt:${String(payload.toolName ?? "")}` }
-				: {
-						state: isSettle ? settleState : "committed",
-						dispatchId: payload.dispatchId,
-						...(isSettle && settleState !== "committed" && settleState !== "blocked"
+				: payload.tool === "room_partner" && args.op === "list"
+					? {
+							operation: "list",
+							partners: [{ participantId: "participant:partner", displayName: "伙伴" }],
+						}
+					: payload.tool === "room_partner" && args.op === "delegate"
+						? {
+								operation: "delegate",
+								status: "completed",
+								content: "LIGHT-ROOM-PARTNER-OK",
+							}
+						: payload.tool === "room_partner" && args.op === "post"
 							? {
-									message:
-										'<managed-task-follow-up origin="room-kernel" kind="continue">' +
-										"继续完成尚未满足的验收项。" +
-										"</managed-task-follow-up>",
-									followUpKey: `follow-up:${settleRequests.length}`,
+									operation: "post",
+									kind: args.kind,
+									postId: "room-post:test",
 								}
-							: {}),
-					};
+							: { accepted: true };
 			response.writeHead(200, { "Content-Type": "application/json" });
 			response.end(
 				JSON.stringify({
@@ -119,7 +124,7 @@ async function startHost(slow = false, settleStates: string[] = ["committed"], s
 		await new Promise<void>((accept) => gateway.close(() => accept()));
 		await rm(stateRoot, { recursive: true, force: true });
 	};
-	return { child, messages, settleRequests, waitFor, request, close };
+	return { child, messages, toolRequests, waitFor, request, close };
 }
 
 async function openSession(host: Awaited<ReturnType<typeof startHost>>) {
@@ -132,9 +137,12 @@ async function openSession(host: Awaited<ReturnType<typeof startHost>>) {
 		noContextFiles: true,
 		toolManifest: [
 			{ name: "product_probe", description: "test manifest", parameters: { type: "object" } },
-			{ name: "room_state", description: "read Room state", parameters: { type: "object" } },
-			{ name: "room_post", description: "publish Room post", parameters: { type: "object" } },
-			{ name: "room_commit", description: "settle Room work", parameters: { type: "object" } },
+			{
+				name: "room_partner",
+				description: "Coordinate one light Room.",
+				parameters: { type: "object" },
+				alwaysAvailable: true,
+			},
 		],
 		roomCapability: {
 			manifestId: "manifest:test",
@@ -142,7 +150,7 @@ async function openSession(host: Awaited<ReturnType<typeof startHost>>) {
 			capabilityEpoch: 1,
 			promptCompileReceiptId: "receipt:test",
 			promptPlanHash: hash,
-			toolNames: ["room_state", "room_post", "room_commit"],
+			toolNames: ["room_partner"],
 		},
 	});
 }
@@ -158,7 +166,7 @@ afterEach(() => {
 
 describe("runtime host real JSONL process", () => {
 	it("continues the same run once after native threshold compaction", async () => {
-		const host = await startHost(false, ["committed"], "threshold-continuation");
+		const host = await startHost(false, "threshold-continuation");
 		const opened = await openSession(host);
 		expect(opened.result.snapshot.telemetry.context).toMatchObject({
 			contextWindow: 64_000,
@@ -214,7 +222,7 @@ describe("runtime host real JSONL process", () => {
 				method: "session.prompt",
 				params: {
 					sessionId: "session:e2e",
-					message: `THRESHOLD-COMPACTION-ORIGINAL-TASK\n${"current-task-evidence ".repeat(2_180)}`,
+					message: `THRESHOLD-COMPACTION-ORIGINAL-TASK\n${"current-task-evidence ".repeat(2_200)}`,
 					clientMessageId: "threshold-continuation-e2e",
 				},
 			})}\n`,
@@ -277,7 +285,7 @@ describe("runtime host real JSONL process", () => {
 	}, 30_000);
 
 	it("stops an installed-style deterministic all-error Tool loop after three identical turns", async () => {
-		const host = await startHost(false, ["committed"], "no-progress");
+		const host = await startHost(false, "no-progress");
 		await openSession(host);
 
 		const accepted = await host.request("prompt", "session.prompt", {
@@ -313,14 +321,14 @@ describe("runtime host real JSONL process", () => {
 		await host.close();
 	});
 
-	it("opens a real Pi Session, preserves manifest/prompt receipts, runs a tool, and settles", async () => {
+	it("opens a real Pi Session, preserves manifest receipts, and completes without a Room settle hook", async () => {
 		const host = await startHost();
 		const opened = await openSession(host);
 		expect(opened.ok).toBe(true);
 		expect(opened.result.snapshot.roomCapability).toMatchObject({
 			manifestId: "manifest:test",
 			promptCompileReceiptId: "receipt:test",
-			toolNames: ["room_state", "room_post", "room_commit"],
+			toolNames: ["room_partner"],
 		});
 		expect(opened.result.snapshot.toolManifest).toEqual(
 			expect.arrayContaining([expect.objectContaining({ name: "product_probe" })]),
@@ -348,7 +356,7 @@ describe("runtime host real JSONL process", () => {
 			capabilityEpoch: 1,
 			dispatchAttempt: 1,
 			idempotencyKey: "root:e2e/task/participant",
-			message: "Inspect package.json and settle.",
+			message: "Inspect package.json and finish normally.",
 		});
 		expect(receipt.result).toMatchObject({ delivery: "prompt", receiptKind: "dispatch_accepted" });
 		await host.waitFor(
@@ -359,19 +367,12 @@ describe("runtime host real JSONL process", () => {
 		);
 		await host.waitFor((message) => message.event === "agent.event" && message.payload?.type === "agent_settled");
 		expect(host.messages.some((message) => message.payload?.toolName === "read")).toBe(true);
-		expect(host.settleRequests).toEqual([
-			expect.objectContaining({
-				dispatchId: "dispatch:e2e",
-				rootId: "root:e2e",
-				capabilityEpoch: 1,
-				settleAttempt: 1,
-			}),
-		]);
+		expect(host.toolRequests.some((request) => request.path.endsWith("/room-settle"))).toBe(false);
 		await host.close();
 	});
 
-	it("feeds a governed continuation back into the same Pi run before settling", async () => {
-		const host = await startHost(false, ["continue", "committed"]);
+	it("runs direct light Room collaboration through list, delegate, and one result post", async () => {
+		const host = await startHost(false, "light-room");
 		await openSession(host);
 
 		await host.request("dispatch", "room.dispatch", {
@@ -381,18 +382,23 @@ describe("runtime host real JSONL process", () => {
 			generation: 1,
 			capabilityEpoch: 1,
 			dispatchAttempt: 1,
-			idempotencyKey: "root:e2e/goal-loop",
-			message: "Keep working until the governed acceptance is complete.",
+			idempotencyKey: "root:e2e/light-room",
+			message: "Run LIGHT-ROOM-CANARY and publish one final result.",
 		});
 		await host.waitFor((message) => message.event === "agent.event" && message.payload?.type === "agent_settled");
 
-		expect(host.settleRequests.map((request) => request.settleAttempt)).toEqual([1, 2]);
+		expect(
+			host.toolRequests
+				.filter((request) => request.tool === "room_partner")
+				.map((request) => (request.args as Record<string, unknown>).op),
+		).toEqual(["list", "delegate", "post"]);
 		expect(
 			host.messages.filter(
 				(message) => message.event === "agent.event" && message.payload?.type === "agent_settled",
 			),
 		).toHaveLength(1);
-		expect(JSON.stringify(host.messages)).toContain("继续完成尚未满足的验收项");
+		expect(JSON.stringify(host.messages)).toContain("LIGHT-ROOM-CANARY-OK");
+		expect(host.toolRequests.some((request) => request.path.endsWith("/room-settle"))).toBe(false);
 		await host.close();
 	});
 

@@ -55,13 +55,13 @@ export class ToolLoopProgressGuard {
 		this.maxRecoveryWaitMs = positiveInteger(options.maxRecoveryWaitMs, DEFAULT_MAX_RECOVERY_WAIT_MS);
 	}
 
-	reset(): void {
+	reset(options: { preserveStopReceipt?: boolean } = {}): void {
 		this.clearRecoveryTimeout();
 		this.consecutiveAllErrorTurns = 0;
 		this.repeatedFailureSignature = 0;
 		this.failureFamilyCounts.clear();
 		this.latestFailureToolNames = [];
-		this.latestStopReceipt = undefined;
+		if (options.preserveStopReceipt !== true) this.latestStopReceipt = undefined;
 	}
 
 	shouldStop(turn: ToolLoopProgressTurn): boolean {

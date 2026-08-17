@@ -39,8 +39,6 @@ import {
 import { createContextProviderJournalExtension, ProviderContextJournal } from "./provider-context-journal.ts";
 import { roomSkillPromptFocus, roomToolPromptFocus } from "./room-prompt-catalog.ts";
 import { createRoomResourceLimitExtension, type RoomResourceLimits } from "./room-resource-limits.ts";
-import { type ActiveRoomDispatch, createRoomSettleLifecycleExtension } from "./room-settle-lifecycle.ts";
-import { bootstrapRoomTools } from "./room-tool-bootstrap.ts";
 import { ASK_TOOL_NAME, TOOL_LOAD_TOOL_NAME } from "./runtime-tool-names.ts";
 import { createSessionContextRefreshExtension } from "./session-context-refresh.ts";
 import type { PooledSession } from "./session-pool.ts";
@@ -131,6 +129,15 @@ export interface RoomSkillLoadReceipt {
 	catalogRevision: string;
 	contentRevision: string;
 	loadReason: "stage_required";
+}
+
+interface ActiveRoomDispatch {
+	dispatchId: string;
+	rootId: string;
+	generation: number;
+	dispatchAttempt: number;
+	runtimeTurnId?: string;
+	capabilityEpoch: number;
 }
 
 const RAG_USER_QUERY_PATTERN = /<rag-ime-user-query>\s*([\s\S]*?)\s*<\/rag-ime-user-query>/i;
@@ -448,7 +455,6 @@ export class PiProductSession implements PooledSession {
 	private sequence = 0;
 	private activeTurn: ActiveTurn | undefined;
 	private activeRoom: ActiveRoomDispatch | undefined;
-	private roomUsageBaseline: { input: number; output: number } | undefined;
 	private roomContext = "";
 	private roomRecoveryContext = "";
 	private sessionContext = "";
@@ -458,7 +464,6 @@ export class PiProductSession implements PooledSession {
 	private roomResourceLimits?: RoomResourceLimits;
 	private roomToolCalls = 0;
 	private roomToolCost = 0;
-	private roomRetryCount = 0;
 	private latestCompaction: PublicCompactionState | undefined;
 	private toolLoopProgressGuard?: ToolLoopProgressGuard;
 	private readonly pendingDecisions = new Map<
@@ -767,11 +772,6 @@ export class PiProductSession implements PooledSession {
 				createRoomResourceLimitExtension(
 					() => productSession?.authorizeRoomToolCall() ?? { allowed: false, reason: "Room Session is not ready" },
 				),
-				createRoomSettleLifecycleExtension({
-					bridge: backendBridge,
-					getActiveRoom: () => productSession?.activeRoom,
-					getResourceUsage: () => productSession?.roomResourceUsage() ?? {},
-				}),
 				lifecycleHooks.extension,
 				createContextProviderJournalExtension(
 					providerContextJournal,
@@ -786,7 +786,6 @@ export class PiProductSession implements PooledSession {
 			systemPromptOverride: (base) => [base?.trim(), requiredSkillPrompt].filter(Boolean).join("\n\n") || undefined,
 		});
 		await resourceLoader.reload();
-		await bootstrapRoomTools(backendBridge);
 		await bootstrapNativeWorkspaceToolTargets(backendBridge);
 		await prepareGovernedMemoryCapture(backendBridge);
 		let roomSkillLoad: RoomSkillLoadReceipt | undefined;
@@ -1170,7 +1169,6 @@ export class PiProductSession implements PooledSession {
 				updatedAtMs: Date.now(),
 			};
 		} else if (event.type === "auto_retry_start" && this.activeRoom) {
-			this.roomRetryCount += 1;
 		}
 		this.emitEvent({
 			protocolVersion: PROTOCOL_VERSION,
@@ -1191,10 +1189,11 @@ export class PiProductSession implements PooledSession {
 			(event.type === "agent_settled" && event.receipt?.disposition !== "suspended") ||
 			event.type === "agent_settle_failed"
 		) {
-			this.progressGuard().reset();
+			// Keep the terminal no-progress receipt available in the idle
+			// snapshot. A new prompt/Dispatch clears it before the next run.
+			this.progressGuard().reset({ preserveStopReceipt: true });
 			this.activeTurn = undefined;
 			this.activeRoom = undefined;
-			this.roomUsageBaseline = undefined;
 			this.session.setRetryLimitOverride(undefined);
 			this.transientContext = "";
 			this.providerContextJournal.clearTurnContext();
@@ -1818,7 +1817,6 @@ export class PiProductSession implements PooledSession {
 		} catch (error) {
 			if (this.activeRoom?.dispatchId === options.dispatchId) {
 				this.activeRoom = undefined;
-				this.roomUsageBaseline = undefined;
 				this.session.setRetryLimitOverride(undefined);
 			}
 			throw error;
@@ -1843,7 +1841,6 @@ export class PiProductSession implements PooledSession {
 			} catch (error) {
 				if (this.activeRoom?.dispatchId === options.dispatchId) {
 					this.activeRoom = undefined;
-					this.roomUsageBaseline = undefined;
 					this.session.setRetryLimitOverride(undefined);
 				}
 				throw error;
@@ -1897,7 +1894,6 @@ export class PiProductSession implements PooledSession {
 
 	private beginRoomDispatch(options: ActiveRoomDispatch & { roomResourceLimits?: RoomResourceLimits }): void {
 		this.progressGuard().reset();
-		const stats = this.session.getSessionStats();
 		this.activeRoom = {
 			dispatchId: options.dispatchId,
 			rootId: options.rootId,
@@ -1906,28 +1902,11 @@ export class PiProductSession implements PooledSession {
 			runtimeTurnId: this.activeTurn?.turnId,
 			capabilityEpoch: options.capabilityEpoch,
 		};
-		this.roomUsageBaseline = {
-			input: stats.tokens.input,
-			output: stats.tokens.output,
-		};
 		this.roomToolCalls = 0;
 		this.roomToolCost = 0;
-		this.roomRetryCount = 0;
 		this.session.setRetryLimitOverride(
 			options.roomResourceLimits?.retryRemaining ?? this.roomResourceLimits?.retryRemaining,
 		);
-	}
-
-	private roomResourceUsage(): Record<string, number> {
-		const baseline = this.roomUsageBaseline;
-		const stats = this.session.getSessionStats();
-		return {
-			inputTokens: Math.max(0, stats.tokens.input - (baseline?.input ?? stats.tokens.input)),
-			outputTokens: Math.max(0, stats.tokens.output - (baseline?.output ?? stats.tokens.output)),
-			toolCalls: this.roomToolCalls,
-			toolCost: this.roomToolCost,
-			retryCount: this.roomRetryCount,
-		};
 	}
 
 	authorizeRoomToolCall(): { allowed: boolean; reason?: string } {
@@ -2007,7 +1986,6 @@ export class PiProductSession implements PooledSession {
 		if (this.activeRoom?.rootId !== rootId || this.activeRoom.generation > generation) return;
 		this.activeTurn = undefined;
 		this.activeRoom = undefined;
-		this.roomUsageBaseline = undefined;
 		this.transientContext = "";
 		this.providerContextJournal.clearTurnContext();
 	}

@@ -2,14 +2,14 @@ import { describe, expect, it } from "vitest";
 import { roomSkillPromptFocus, roomToolPromptFocus } from "../src/room-prompt-catalog.ts";
 
 describe("Room prompt catalog projection", () => {
-	it("selects no more than four exact Tool cards for the current stage", () => {
-		expect(roomToolPromptFocus({ stage: "implementation" })).toEqual(["room_collaborate"]);
-		expect(roomToolPromptFocus({ stage: "closure" })).toEqual(["room_collaborate"]);
+	it("does not advertise the direct room_partner schema as a deferred Tool card", () => {
+		expect(roomToolPromptFocus({ stage: "implementation" })).toEqual([]);
+		expect(roomToolPromptFocus({ stage: "closure" })).toEqual([]);
 		expect(roomToolPromptFocus({ stage: "unknown" })).toEqual([]);
 		expect(roomToolPromptFocus(undefined)).toBeUndefined();
 	});
 
-	it("never re-advertises resident native coding tools as deferred tools", () => {
+	it("never re-advertises retired Room or resident native tools as deferred tools", () => {
 		for (const stage of [
 			"requirements",
 			"solution",
@@ -24,7 +24,7 @@ describe("Room prompt catalog projection", () => {
 			"closure",
 		]) {
 			const focus = roomToolPromptFocus({ stage }) ?? [];
-			expect(focus).toEqual(["room_collaborate"]);
+			expect(focus).toEqual([]);
 			expect(focus.some((name) => name.startsWith("workspace_"))).toBe(false);
 		}
 	});

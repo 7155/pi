@@ -104,12 +104,27 @@ describe("ToolLoopProgressGuard", () => {
 		expect(guard.stopReceipt()).toBeUndefined();
 	});
 
+	it("keeps one terminal receipt through idle cleanup and clears it for the next prompt", () => {
+		const guard = new ToolLoopProgressGuard({
+			maxConsecutiveAllErrorTurns: 1,
+			maxRepeatedFailureSignature: 1,
+		});
+		expect(guard.shouldStop(turn(1, true, "same failure"))).toBe(true);
+		guard.reset({ preserveStopReceipt: true });
+		expect(guard.stopReceipt()).toMatchObject({
+			reason: "repeated_failure_signature",
+			repeatedFailureSignature: 1,
+		});
+		guard.reset();
+		expect(guard.stopReceipt()).toBeUndefined();
+	});
+
 	it("aborts a managed recovery provider call that never settles after an all-error turn", async () => {
 		vi.useFakeTimers();
 		const guard = new ToolLoopProgressGuard({ maxRecoveryWaitMs: 1_000 });
 		const onTimeout = vi.fn();
 
-		expect(guard.shouldStop(turn(1, true, "invalid room_commit payload"))).toBe(false);
+		expect(guard.shouldStop(turn(1, true, "invalid room_partner post payload"))).toBe(false);
 		guard.armRecoveryTimeout(onTimeout);
 		await vi.advanceTimersByTimeAsync(999);
 		expect(onTimeout).not.toHaveBeenCalled();
@@ -126,7 +141,7 @@ describe("ToolLoopProgressGuard", () => {
 		const guard = new ToolLoopProgressGuard({ maxRecoveryWaitMs: 1_000 });
 		const onTimeout = vi.fn();
 
-		expect(guard.shouldStop(turn(1, true, "invalid room_commit payload"))).toBe(false);
+		expect(guard.shouldStop(turn(1, true, "invalid room_partner post payload"))).toBe(false);
 		guard.armRecoveryTimeout(onTimeout);
 		expect(guard.shouldStop(turn(2, false, "recovered"))).toBe(false);
 		await vi.advanceTimersByTimeAsync(1_000);

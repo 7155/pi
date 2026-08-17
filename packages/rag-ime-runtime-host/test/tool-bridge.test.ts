@@ -140,13 +140,13 @@ describe("BackendToolRegistry", () => {
 				participants: [{ participantRef: "P1", displayName: "伙伴" }],
 			},
 			invocationReceipt: {
-				receiptId: "invoke:room-state",
+				receiptId: "invoke:room-partner",
 				canonicalCommand: { rootId: "root:private" },
 			},
 			executionReceipt: {
-				executionReceiptId: "execution:invoke:room-state",
+				executionReceiptId: "execution:invoke:room-partner",
 				sessionId: "session:private",
-				toolName: "room_state",
+				toolName: "room_partner",
 				status: "applied",
 			},
 		});
@@ -522,23 +522,22 @@ describe("BackendToolRegistry", () => {
 			expect(patchResult.details).toMatchObject({ agentBlocks: [block] });
 			expect(artifacts.size()).toBe(1);
 
-			const commitTool = createBackendToolDefinition(options, tool({ name: "room_commit" }), artifacts);
-			await commitTool.execute(
-				"call-commit",
+			const roomPartnerTool = createBackendToolDefinition(options, tool({ name: "room_partner" }), artifacts);
+			await roomPartnerTool.execute(
+				"call-room-result",
 				{
-					decision: "deliver",
-					summary: "完成",
-					evidence: [],
-					residualRisks: [],
+					op: "post",
+					kind: "result",
+					content: "完成",
 				} as never,
 				undefined,
 				undefined,
 				{} as never,
 			);
-			const commitRequest = JSON.parse(String(fetchMock.mock.calls[2]?.[1]?.body)) as {
+			const roomResultRequest = JSON.parse(String(fetchMock.mock.calls[2]?.[1]?.body)) as {
 				args: Record<string, unknown>;
 			};
-			expect(commitRequest.args.blocks).toEqual([block]);
+			expect(roomResultRequest.args.blocks).toEqual([block]);
 			expect(artifacts.size()).toBe(0);
 		} finally {
 			vi.unstubAllGlobals();
@@ -565,11 +564,17 @@ describe("BackendToolRegistry", () => {
 					registry: new BackendToolRegistry(),
 					gatewayUrl: "http://127.0.0.1:8768/api/agent/tool/execute",
 				},
-				tool({ name: "room_post" }),
+				tool({ name: "room_partner" }),
 				artifacts,
 			);
 			await expect(
-				definition.execute("call-post", { content: "交付" } as never, undefined, undefined, {} as never),
+				definition.execute(
+					"call-post",
+					{ op: "post", kind: "result", content: "交付" } as never,
+					undefined,
+					undefined,
+					{} as never,
+				),
 			).rejects.toThrow("gateway unavailable");
 			expect(artifacts.size()).toBe(1);
 		} finally {
@@ -637,10 +642,10 @@ describe("BackendToolRegistry", () => {
 		}
 	});
 
-	it("binds a governed Room invocation to the loaded manifest receipt", async () => {
+	it("binds a governed deferred Tool invocation to the loaded manifest receipt", async () => {
 		const registry = new BackendToolRegistry();
-		registry.sync([tool({ name: "room_post" })]);
-		registry.recordLoadReceipt("room_post", "load:room-post");
+		registry.sync([tool({ name: "ime_plugins" })]);
+		registry.recordLoadReceipt("ime_plugins", "load:plugins");
 		const fetchMock = vi.fn<typeof fetch>().mockResolvedValue(
 			new Response(JSON.stringify({ ok: true, result: { accepted: true } }), {
 				status: 200,
@@ -656,15 +661,15 @@ describe("BackendToolRegistry", () => {
 					gatewayUrl: "http://127.0.0.1:8766/api/agent/tool/execute",
 					roomCapability: { manifestId: "manifest:1", manifestHash: "a".repeat(64) },
 				},
-				tool({ name: "room_post" }),
+				tool({ name: "ime_plugins" }),
 			);
 			await definition.execute("call-room", { query: "done" } as never, undefined, undefined, {} as never);
 			const request = JSON.parse(String(fetchMock.mock.calls[0]?.[1]?.body)) as Record<string, unknown>;
 			expect(request).toMatchObject({
 				sessionId: "session-room",
-				tool: "room_post",
+				tool: "ime_plugins",
 				toolCallId: "call-room",
-				loadReceiptId: "load:room-post",
+				loadReceiptId: "load:plugins",
 				roomCapability: { manifestId: "manifest:1", manifestHash: "a".repeat(64) },
 			});
 		} finally {
@@ -674,9 +679,9 @@ describe("BackendToolRegistry", () => {
 
 	it("rebinds disclosed Tool receipts when the Room Dispatch manifest advances", async () => {
 		const registry = new BackendToolRegistry();
-		registry.sync([tool({ name: "room_post" })]);
-		registry.disclose("room_post");
-		registry.recordLoadReceipt("room_post", "load:old-dispatch");
+		registry.sync([tool({ name: "ime_plugins" })]);
+		registry.disclose("ime_plugins");
+		registry.recordLoadReceipt("ime_plugins", "load:old-dispatch");
 		const fetchMock = vi.fn<typeof fetch>().mockResolvedValue(
 			new Response(JSON.stringify({ ok: true, result: { receiptId: "load:new-dispatch" } }), {
 				status: 200,
@@ -695,14 +700,14 @@ describe("BackendToolRegistry", () => {
 				"dispatch:2",
 			);
 
-			expect(rebound).toEqual([{ name: "room_post", receiptId: "load:new-dispatch" }]);
-			expect(registry.loadReceipt("room_post")).toBe("load:new-dispatch");
-			expect(registry.disclosed().map((item) => item.name)).toEqual(["room_post"]);
+			expect(rebound).toEqual([{ name: "ime_plugins", receiptId: "load:new-dispatch" }]);
+			expect(registry.loadReceipt("ime_plugins")).toBe("load:new-dispatch");
+			expect(registry.disclosed().map((item) => item.name)).toEqual(["ime_plugins"]);
 			const request = JSON.parse(String(fetchMock.mock.calls[0]?.[1]?.body)) as Record<string, unknown>;
 			expect(request).toMatchObject({
 				sessionId: "session-room",
-				receiptId: "load:rebind:dispatch:2:room_post",
-				toolName: "room_post",
+				receiptId: "load:rebind:dispatch:2:ime_plugins",
+				toolName: "ime_plugins",
 			});
 		} finally {
 			vi.unstubAllGlobals();

@@ -6,14 +6,7 @@ export const MAX_MODEL_VISIBLE_TOOL_RESULT_BYTES = 50 * 1024;
 const MEDIA_ID_PATTERN = /^media_[A-Za-z0-9_-]{12,80}$/u;
 const SESSION_ID_PATTERN = /^[A-Za-z0-9._:-]{1,240}$/u;
 const SHA256_PATTERN = /^[0-9a-f]{64}$/u;
-const ROOM_DELIVERY_TOOLS: Record<string, true> = { room_post: true, room_commit: true };
-const ROOM_LIFECYCLE_TOOLS: Record<string, true> = {
-	room_state: true,
-	room_define: true,
-	room_post: true,
-	room_collaborate: true,
-	room_commit: true,
-};
+const ROOM_LIFECYCLE_TOOLS: Record<string, true> = { room_partner: true };
 const INTERNAL_ROOM_RECEIPT_KEYS = new Set([
 	"invocationReceipt",
 	"executionReceipt",
@@ -54,7 +47,7 @@ export class ToolArtifactBuffer {
 	}
 
 	prepare(toolName: string, args: unknown): PreparedToolArguments {
-		if (ROOM_DELIVERY_TOOLS[toolName] !== true || this.pending.size === 0 || !isRecord(args)) {
+		if (!isRoomDeliveryCall(toolName, args) || this.pending.size === 0 || !isRecord(args)) {
 			return { arguments: args, deliveryKeys: [] };
 		}
 		if (args.blocks !== undefined && (!Array.isArray(args.blocks) || args.blocks.some((block) => !isRecord(block)))) {
@@ -162,7 +155,7 @@ export function modelVisibleResult(
 
 /**
  * Keep governance receipts in ToolResult.details while giving the model only
- * the short successful evidence ref it may cite in room_commit.
+ * the short successful evidence ref it may cite in a Room result post.
  */
 export function modelVisibleToolGatewayResult(
 	value: unknown,
@@ -488,6 +481,10 @@ function artifactKey(value: Record<string, unknown>): string {
 	const mediaId = text(value.data.mediaId);
 	const sha256 = text(value.data.sha256).toLowerCase();
 	return MEDIA_ID_PATTERN.test(mediaId) && SHA256_PATTERN.test(sha256) ? `${mediaId}:${sha256}` : "";
+}
+
+function isRoomDeliveryCall(toolName: string, args: unknown): boolean {
+	return toolName === "room_partner" && isRecord(args) && text(args.op) === "post";
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {

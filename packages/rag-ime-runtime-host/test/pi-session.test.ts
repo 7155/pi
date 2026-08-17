@@ -430,7 +430,6 @@ describe("per-turn Provider context lifecycle", () => {
 		Object.assign(mutable, {
 			activeTurn: { turnId: "turn:1" },
 			activeRoom: undefined,
-			roomUsageBaseline: undefined,
 			transientContext: "current input and UI",
 			providerContextJournal,
 			sequence: 0,
@@ -639,7 +638,7 @@ describe("ordinary Session memory context epochs", () => {
 });
 
 describe("managed Room retry budget", () => {
-	it("caps the Agent lifecycle and reports each retry to Kernel settlement", () => {
+	it("caps Provider retries for one bounded Room Dispatch", () => {
 		const productSession = Object.create(PiProductSession.prototype) as PiProductSession;
 		const setRetryLimitOverride = vi.fn();
 		const mutable = productSession as unknown as Record<string, any>;
@@ -647,7 +646,6 @@ describe("managed Room retry budget", () => {
 			activeTurn: undefined,
 			activeRoom: undefined,
 			roomResourceLimits: { retryRemaining: 3 },
-			roomRetryCount: 0,
 			sequence: 0,
 			emitEvent: vi.fn(),
 			telemetry: vi.fn(() => ({})),
@@ -674,11 +672,6 @@ describe("managed Room retry budget", () => {
 		});
 
 		expect(setRetryLimitOverride).toHaveBeenCalledWith(1);
-		expect(mutable.roomResourceUsage()).toMatchObject({
-			inputTokens: 0,
-			outputTokens: 0,
-			retryCount: 1,
-		});
 	});
 });
 
@@ -819,7 +812,6 @@ describe("managed Room runtime turn identity", () => {
 				runtimeTurnId: "turn:failed",
 				capabilityEpoch: 1,
 			},
-			roomUsageBaseline: { input: 0, output: 0 },
 			roomContext: "",
 			roomRecoveryContext: "",
 			sessionContext: "",
@@ -860,7 +852,6 @@ describe("managed Room runtime turn identity", () => {
 
 		expect(mutable.activeTurn).toBeUndefined();
 		expect(mutable.activeRoom).toBeUndefined();
-		expect(mutable.roomUsageBaseline).toBeUndefined();
 		expect(mutable.transientContext).toBe("");
 		expect(setRetryLimitOverride).toHaveBeenCalledWith(undefined);
 		expect(providerContextJournal.snapshot().entryCount).toBe(0);
@@ -1072,7 +1063,7 @@ describe("managed Room optional per-dispatch limits", () => {
 				toolLoopProgressGuard: new ToolLoopProgressGuard({ maxRecoveryWaitMs: 1_000 }),
 			});
 			const message = assistantWith(
-				[{ type: "toolCall", id: "call:commit", name: "room_commit", arguments: { decision: "handoff" } }],
+				[{ type: "toolCall", id: "call:post", name: "room_partner", arguments: { op: "post", kind: "result" } }],
 				1,
 				{ stopReason: "toolUse" },
 			);
@@ -1081,8 +1072,8 @@ describe("managed Room optional per-dispatch limits", () => {
 				toolResults: [
 					{
 						role: "toolResult",
-						toolCallId: "call:commit",
-						toolName: "room_commit",
+						toolCallId: "call:post",
+						toolName: "room_partner",
 						content: [{ type: "text", text: "must omit resumeCondition" }],
 						details: {},
 						isError: true,
@@ -1120,14 +1111,18 @@ describe("managed Room optional per-dispatch limits", () => {
 				toolLoopProgressGuard: new ToolLoopProgressGuard({ maxRecoveryWaitMs: 1_000 }),
 			});
 			mutable.observeToolLoopTurn({
-				message: assistantWith([{ type: "toolCall", id: "call:commit", name: "room_commit", arguments: {} }], 1, {
-					stopReason: "toolUse",
-				}),
+				message: assistantWith(
+					[{ type: "toolCall", id: "call:post", name: "room_partner", arguments: { op: "post" } }],
+					1,
+					{
+						stopReason: "toolUse",
+					},
+				),
 				toolResults: [
 					{
 						role: "toolResult",
-						toolCallId: "call:commit",
-						toolName: "room_commit",
+						toolCallId: "call:post",
+						toolName: "room_partner",
 						content: [{ type: "text", text: "invalid" }],
 						details: {},
 						isError: true,

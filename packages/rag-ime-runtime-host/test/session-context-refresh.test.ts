@@ -96,7 +96,7 @@ describe("session context refresh", () => {
 			}),
 			getRoomToolRecovery: () => ({
 				schemaVersion: "rag-ime.room-tool-recovery.v1",
-				items: [{ name: "room_state", receiptId: "load:room-state" }],
+				items: [{ name: "ime_plugins", receiptId: "load:plugins" }],
 			}),
 			providerContextJournal,
 		});
@@ -192,7 +192,7 @@ describe("session context refresh", () => {
 		});
 		expect(request.roomToolRecovery).toEqual({
 			schemaVersion: "rag-ime.room-tool-recovery.v1",
-			items: [{ name: "room_state", receiptId: "load:room-state" }],
+			items: [{ name: "ime_plugins", receiptId: "load:plugins" }],
 		});
 	});
 
@@ -354,7 +354,7 @@ describe("session context refresh", () => {
 			setRoomRecoveryContext: () => undefined,
 			getRecentMessages: () => [],
 			getRoomSkillRecovery: () => ({ name: "independent-review" }),
-			getRoomToolRecovery: () => ({ items: [{ name: "room_state", receiptId: "load:state" }] }),
+			getRoomToolRecovery: () => ({ items: [{ name: "ime_plugins", receiptId: "load:plugins" }] }),
 			providerContextJournal,
 		});
 		extension({

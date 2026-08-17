@@ -6,7 +6,6 @@ import type { SessionManager } from "@earendil-works/pi-coding-agent";
 import { ModelRuntime } from "@earendil-works/pi-coding-agent";
 import { describe, expect, it, vi } from "vitest";
 import { PiProductSession, restoreBackendToolDisclosures } from "../src/pi-session.ts";
-import { ROOM_BOOTSTRAP_TOOL_NAMES } from "../src/room-tool-bootstrap.ts";
 import { BackendToolRegistry } from "../src/tool-bridge.ts";
 
 function manifest(risk: string, requireQuery = false) {
@@ -113,7 +112,7 @@ describe("PiProductSession catalog updates", () => {
 		}
 	});
 
-	it("starts a managed Room with stable Room tools and a projected memory capture tool", async () => {
+	it("starts a managed Room with one direct room_partner tool and a projected memory capture tool", async () => {
 		const root = await mkdtemp(join(tmpdir(), "pi-runtime-room-bootstrap-"));
 		const agentDir = join(root, "agent");
 		const sessionDir = join(root, "sessions");
@@ -152,11 +151,16 @@ describe("PiProductSession catalog updates", () => {
 				codexSkillPaths: [],
 				modelRuntime,
 				toolManifest: [
-					...ROOM_BOOTSTRAP_TOOL_NAMES.map((name) => ({
-						name,
-						description: `Run ${name}.`,
-						parameters: { type: "object", properties: {} },
-					})),
+					{
+						name: "room_partner",
+						description: "Coordinate Room Partners and publish Room results.",
+						parameters: {
+							type: "object",
+							properties: { op: { enum: ["list", "delegate", "post"] } },
+							required: ["op"],
+						},
+						alwaysAvailable: true,
+					},
 					{
 						name: "ime_memory",
 						description: "Use governed memory.",
@@ -193,19 +197,17 @@ describe("PiProductSession catalog updates", () => {
 			});
 
 			expect(productSession.snapshot()).toMatchObject({
-				disclosedBackendTools: [...ROOM_BOOTSTRAP_TOOL_NAMES],
-				activeBackendTools: [...ROOM_BOOTSTRAP_TOOL_NAMES],
+				disclosedBackendTools: ["room_partner"],
+				activeBackendTools: ["room_partner"],
 			});
 			const tools = new Map(productSession.listTools().map((tool) => [String(tool.name), tool]));
-			expect(tools.get("room_state")).toMatchObject({ active: true });
-			expect(tools.get("room_post")).toMatchObject({ active: true });
-			expect(tools.get("room_commit")).toMatchObject({ active: true });
+			expect(tools.get("room_partner")).toMatchObject({ active: true });
 			expect(tools.get("memory_capture")).toMatchObject({ active: true });
 			expect(tools.get("ime_memory")).toMatchObject({ active: false });
 			const requests = fetchMock.mock.calls.map(([, init]) => JSON.parse(String(init?.body))) as Array<{
 				toolName: string;
 			}>;
-			expect(requests.map((request) => request.toolName)).toEqual([...ROOM_BOOTSTRAP_TOOL_NAMES, "ime_memory"]);
+			expect(requests.map((request) => request.toolName)).toEqual(["ime_memory"]);
 		} finally {
 			productSession?.dispose();
 			vi.unstubAllGlobals();
