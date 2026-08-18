@@ -805,7 +805,11 @@ async function executeGatewayTool(
 	signal: AbortSignal | undefined,
 	artifacts: ToolArtifactBuffer,
 	onLifecycle?: (stage: "response_received" | "waiting_approval" | "waiting_review") => void,
-): Promise<{ content: Array<{ type: "text"; text: string }>; details: unknown }> {
+): Promise<{
+	content: Array<{ type: "text"; text: string }>;
+	details: unknown;
+	terminate?: boolean;
+}> {
 	const prepared = artifacts.prepare(tool.name, args);
 	const payload = await requestProductGateway(
 		options,
@@ -932,6 +936,7 @@ async function executeGatewayTool(
 			},
 		],
 		details: { ...result, toolName: tool.name, ...(agentBlocks.length > 0 ? { agentBlocks } : {}) },
+		...(result.terminate === true ? { terminate: true } : {}),
 	};
 }
 

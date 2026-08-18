@@ -322,6 +322,48 @@ describe("BackendToolRegistry", () => {
 		}
 	});
 
+	it("propagates a product structured-output termination receipt to the Pi Tool loop", async () => {
+		const fetchMock = vi.fn<typeof fetch>().mockResolvedValue(
+			new Response(
+				JSON.stringify({
+					ok: true,
+					result: {
+						summary: "delivery contract valid",
+						contractStatus: "valid",
+						terminate: true,
+					},
+				}),
+				{ status: 200, headers: { "Content-Type": "application/json" } },
+			),
+		);
+		vi.stubGlobal("fetch", fetchMock);
+		try {
+			const definition = createBackendToolDefinition(
+				{
+					sessionId: "session-structured-child",
+					registry: new BackendToolRegistry(),
+					gatewayUrl: "http://127.0.0.1:8768/api/agent/tool/execute",
+				},
+				tool({ name: "structured_output", alwaysAvailable: true }),
+			);
+			const result = await definition.execute(
+				"call-structured-output",
+				{ value: { claims: [] } } as never,
+				undefined,
+				undefined,
+				{} as never,
+			);
+
+			expect(result.terminate).toBe(true);
+			expect(result.details).toMatchObject({
+				contractStatus: "valid",
+				terminate: true,
+			});
+		} finally {
+			vi.unstubAllGlobals();
+		}
+	});
+
 	it("keeps the native approval bridge on a dynamically loaded tool", async () => {
 		const waitForDecision = vi.fn(async () => true);
 		const fetchMock = vi
