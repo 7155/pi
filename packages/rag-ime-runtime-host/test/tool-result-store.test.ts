@@ -43,6 +43,51 @@ function hiddenTarget(name: string, runtimeName: string, operation: string): Bac
 	};
 }
 
+function hiddenMutationTarget(runtimeName: "edit" | "write"): BackendToolManifest {
+	const operation = "apply";
+	const mutationProperties =
+		runtimeName === "edit"
+			? {
+					path: { type: "string" },
+					resourceRevision: { type: "string", pattern: "^sha256:[0-9a-f]{64}$" },
+					edits: {
+						type: "array",
+						items: {
+							type: "object",
+							properties: { oldText: { type: "string" }, newText: { type: "string" } },
+							required: ["oldText", "newText"],
+						},
+					},
+				}
+			: {
+					path: { type: "string" },
+					resourceRevision: { type: "string", pattern: "^(?:sha256:[0-9a-f]{64}|missing)$" },
+					content: { type: "string" },
+				};
+	const required =
+		runtimeName === "edit"
+			? ["op", "path", "resourceRevision", "edits"]
+			: ["op", "path", "resourceRevision", "content"];
+	return {
+		name: `workspace_${runtimeName}`,
+		description: `Governed target for ${runtimeName}`,
+		modelVisible: false,
+		parameters: {
+			type: "object",
+			additionalProperties: false,
+			oneOf: [
+				{
+					type: "object",
+					additionalProperties: false,
+					required,
+					properties: { op: { const: operation }, ...mutationProperties },
+				},
+			],
+		},
+		runtimeProjections: [{ name: runtimeName, operation }],
+	};
+}
+
 describe("ToolResultStore", () => {
 	it("keeps a stable handle first in context and supports bounded continuation", () => {
 		const store = temporaryStore();
@@ -354,6 +399,127 @@ describe("governed Pi-native workspace tools", () => {
 				allowNetwork: false,
 			},
 		});
+	});
+
+	it("projects snapshot-bound edit and write schemas with truthful mutation receipts", async () => {
+		const registry = new BackendToolRegistry();
+		registry.sync([
+			hiddenTarget("workspace_read", "read", "read"),
+			hiddenMutationTarget("edit"),
+			hiddenMutationTarget("write"),
+		]);
+		const definitions = new Map<string, ToolDefinition<any, any, any>>();
+		const extension = createNativeWorkspaceToolsExtension({
+			sessionId: "session-native-mutations",
+			registry,
+			gatewayUrl: "http://127.0.0.1:8768/api/agent/tool/execute",
+			cwd: "/workspace",
+			resultStore: temporaryStore(),
+		});
+		const factory = typeof extension === "function" ? extension : extension.factory;
+		factory({
+			registerTool(definition: ToolDefinition<any, any, any>) {
+				definitions.set(definition.name, definition);
+			},
+		} as never);
+
+		const revision = `sha256:${"a".repeat(64)}`;
+		const responses = [
+			{
+				summary: "已读取 source.ts 第 1-2 行",
+				content: "const before = true;\n",
+				startLine: 1,
+				endLine: 1,
+				resourceRevision: revision,
+			},
+			{
+				summary: "已修改 source.ts 的 1 处内容",
+				mutationApplied: true,
+				path: "/workspace/source.ts",
+				postimageSha256: "b".repeat(64),
+			},
+			{
+				summary: "已创建 created.ts",
+				mutationApplied: true,
+				path: "/workspace/created.ts",
+				postimageSha256: "c".repeat(64),
+			},
+		];
+		const fetchMock = vi.fn<typeof fetch>().mockImplementation(
+			async () =>
+				new Response(JSON.stringify({ ok: true, result: responses.shift() }), {
+					status: 200,
+					headers: { "Content-Type": "application/json" },
+				}),
+		);
+		vi.stubGlobal("fetch", fetchMock);
+
+		const readResult = await definitions
+			.get("read")
+			?.execute("call-read-revision", { path: "source.ts" }, undefined, undefined, {} as never);
+		const editResult = await definitions.get("edit")?.execute(
+			"call-edit",
+			{
+				path: "source.ts",
+				resourceRevision: revision,
+				edits: [{ oldText: "true", newText: "false" }],
+			},
+			undefined,
+			undefined,
+			{} as never,
+		);
+		const writeResult = await definitions
+			.get("write")
+			?.execute(
+				"call-write",
+				{ path: "created.ts", resourceRevision: "missing", content: "export {};\n" },
+				undefined,
+				undefined,
+				{} as never,
+			);
+
+		expect(readResult?.content[0]).toEqual({
+			type: "text",
+			text: `[resourceRevision: ${revision}]\nconst before = true;\n`,
+		});
+		expect(editResult?.content[0]).toEqual({
+			type: "text",
+			text: `已修改 source.ts 的 1 处内容\npath=/workspace/source.ts\npostimageSha256=${"b".repeat(64)}`,
+		});
+		expect(writeResult?.content[0]).toEqual({
+			type: "text",
+			text: `已创建 created.ts\npath=/workspace/created.ts\npostimageSha256=${"c".repeat(64)}`,
+		});
+		const requests = fetchMock.mock.calls.map(([, init]) => JSON.parse(String(init?.body))) as Array<{
+			tool: string;
+			args: Record<string, unknown>;
+		}>;
+		expect(requests[1]).toMatchObject({
+			tool: "workspace_edit",
+			args: {
+				op: "apply",
+				path: "source.ts",
+				resourceRevision: revision,
+				edits: [{ oldText: "true", newText: "false" }],
+			},
+		});
+		expect(requests[2]).toMatchObject({
+			tool: "workspace_write",
+			args: {
+				op: "apply",
+				path: "created.ts",
+				resourceRevision: "missing",
+				content: "export {};\n",
+			},
+		});
+		for (const name of ["edit", "write"] as const) {
+			const parameters = definitions.get(name)?.parameters as unknown as {
+				required?: string[];
+				properties?: Record<string, unknown>;
+			};
+			expect(parameters.required).toContain("resourceRevision");
+			expect(parameters.properties).not.toHaveProperty("op");
+		}
 	});
 
 	it("reads an evidence handle locally without sending another gateway request", async () => {

@@ -22,12 +22,14 @@ export const NATIVE_WORKSPACE_TOOL_NAMES = [
 	BASH_TOOL_NAME,
 ] as const;
 
-/** The only native workspace schemas disclosed to the Agent model. */
+/** The native workspace schemas disclosed to the Agent model. */
 export const AGENT_NATIVE_WORKSPACE_TOOL_NAMES = [
 	READ_TOOL_NAME,
 	GREP_TOOL_NAME,
 	FIND_TOOL_NAME,
 	LS_TOOL_NAME,
+	EDIT_TOOL_NAME,
+	WRITE_TOOL_NAME,
 	BASH_TOOL_NAME,
 ] as const;
 

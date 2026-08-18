@@ -215,7 +215,7 @@ describe("PiProductSession catalog updates", () => {
 		}
 	});
 
-	it("keeps edit and write out of the complete Agent tool registry", async () => {
+	it("exposes the complete governed native workspace tool registry", async () => {
 		const root = await mkdtemp(join(tmpdir(), "pi-runtime-five-native-tools-"));
 		const agentDir = join(root, "agent");
 		const sessionDir = join(root, "sessions");
@@ -272,18 +272,13 @@ describe("PiProductSession catalog updates", () => {
 
 		try {
 			const tools = new Map(productSession.listTools().map((tool) => [String(tool.name), tool]));
-			expect(["read", "grep", "find", "ls", "bash"].map((name) => tools.get(name)?.active)).toEqual([
-				true,
-				true,
-				true,
-				true,
-				true,
-			]);
-			expect(tools.get("edit")?.active).toBe(false);
-			expect(tools.get("write")?.active).toBe(false);
-			expect(productSession.snapshot().activeBackendTools).not.toEqual(
-				expect.arrayContaining(["workspace_edit", "workspace_write"]),
+			expect(["read", "grep", "find", "ls", "edit", "write", "bash"].map((name) => tools.get(name)?.active)).toEqual(
+				[true, true, true, true, true, true, true],
 			);
+			expect(productSession.snapshot()).toMatchObject({
+				activeBackendTools: [],
+				disclosedBackendTools: [],
+			});
 		} finally {
 			productSession.dispose();
 			await rm(root, { recursive: true, force: true });

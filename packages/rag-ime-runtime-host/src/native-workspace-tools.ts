@@ -1,19 +1,23 @@
 import {
 	createBashToolDefinition,
+	createEditToolDefinition,
 	createFindToolDefinition,
 	createGrepToolDefinition,
 	createLsToolDefinition,
 	createReadToolDefinition,
+	createWriteToolDefinition,
 	type InlineExtension,
 	type ToolDefinition,
 } from "@earendil-works/pi-coding-agent";
 import {
 	AGENT_NATIVE_WORKSPACE_TOOL_NAMES,
 	BASH_TOOL_NAME,
+	EDIT_TOOL_NAME,
 	FIND_TOOL_NAME,
 	GREP_TOOL_NAME,
 	LS_TOOL_NAME,
 	READ_TOOL_NAME,
+	WRITE_TOOL_NAME,
 } from "./runtime-tool-names.ts";
 import { ToolArtifactBuffer } from "./tool-artifact-buffer.ts";
 import {
@@ -31,6 +35,8 @@ interface RuntimeProjectionTarget {
 
 const PROJECTED_TOOL_LIFECYCLE_LABELS: Readonly<Record<string, string>> = {
 	[READ_TOOL_NAME]: "读取文件",
+	[EDIT_TOOL_NAME]: "编辑文件",
+	[WRITE_TOOL_NAME]: "写入文件",
 	[BASH_TOOL_NAME]: "运行命令",
 };
 
@@ -58,6 +64,46 @@ function projectionTarget(
 		if (projection) return { manifest, operation: projection.operation };
 	}
 	return undefined;
+}
+
+/**
+ * The governed workspace mutation targets add a snapshot revision to Pi's
+ * native edit/write shape. Derive that exact model schema from the active
+ * target manifest so the Agent and gateway cannot drift independently.
+ */
+function projectionParameters(target: RuntimeProjectionTarget): ToolDefinition["parameters"] {
+	const schema = target.manifest.parameters;
+	const branches = Array.isArray(schema.oneOf) ? schema.oneOf : [];
+	const branch = branches.find((value) => {
+		const properties = record(record(value).properties);
+		return record(properties.op).const === target.operation;
+	});
+	if (!branch) {
+		throw new Error(
+			`Native workspace projection ${target.manifest.name}.${target.operation} has no parameter branch`,
+		);
+	}
+	const branchRecord = structuredClone(record(branch));
+	const properties = {
+		...structuredClone(record(schema.properties)),
+		...structuredClone(record(branchRecord.properties)),
+	};
+	delete properties.op;
+	const required = [
+		...(Array.isArray(schema.required) ? schema.required : []),
+		...(Array.isArray(branchRecord.required) ? branchRecord.required : []),
+	].filter(
+		(value, index, values): value is string =>
+			typeof value === "string" && value !== "op" && value in properties && values.indexOf(value) === index,
+	);
+	delete branchRecord.oneOf;
+	return {
+		...branchRecord,
+		type: "object",
+		additionalProperties: branchRecord.additionalProperties ?? schema.additionalProperties ?? false,
+		properties,
+		...(required.length > 0 ? { required } : {}),
+	} as ToolDefinition["parameters"];
 }
 
 function nativeWorkspaceTargets(options: BackendToolBridgeOptions): string[] {
@@ -115,12 +161,14 @@ function number(value: unknown): number | undefined {
 
 function formatReadResult(details: Record<string, unknown>): string {
 	const content = text(details.content);
+	const revision = text(details.resourceRevision);
 	const start = number(details.startLine);
 	const end = number(details.endLine);
 	const next = number(details.nextLineOffset);
+	const revisionNote = revision ? `[resourceRevision: ${revision}]\n` : "";
 	const note =
 		next !== undefined ? `\n\n[Showing lines ${start ?? "?"}-${end ?? "?"}. Continue with offset=${next}.]` : "";
-	return `${content}${note}` || text(details.summary);
+	return `${revisionNote}${content}${note}` || text(details.summary);
 }
 
 function formatGrepResult(details: Record<string, unknown>): string {
@@ -179,6 +227,16 @@ function formatBashResult(details: Record<string, unknown>): string {
 	const chunks = combinedOutput ? [combinedOutput] : [stdout, stderr].filter((value) => value.length > 0);
 	chunks.push(`[exit code: ${exitCode ?? "unknown"}]`);
 	return chunks.join(!combinedOutput && stdout && stderr ? "\n[stderr]\n" : "\n");
+}
+
+function formatMutationResult(details: Record<string, unknown>): string {
+	const receipt = resultReceipt(details);
+	const summary = text(receipt.summary) || text(details.summary) || "Workspace mutation finished";
+	const path = text(receipt.path);
+	const postimage = text(receipt.postimageSha256);
+	return [summary, path ? `path=${path}` : "", postimage ? `postimageSha256=${postimage}` : ""]
+		.filter(Boolean)
+		.join("\n");
 }
 
 function projected(
@@ -347,6 +405,46 @@ export function createNativeWorkspaceToolsExtension(
 					limit: boundedLimit(input.limit, 300, 300),
 				}),
 				formatLsResult,
+				artifacts,
+			),
+		);
+	}
+	const edit = projectionTarget(options.registry, EDIT_TOOL_NAME);
+	if (edit) {
+		definitions.push(
+			projected(
+				options,
+				{
+					...createEditToolDefinition(options.cwd),
+					parameters: projectionParameters(edit),
+				} as unknown as ToolDefinition<any, any, any>,
+				edit,
+				(input) => ({
+					path: input.path,
+					resourceRevision: input.resourceRevision,
+					edits: input.edits,
+				}),
+				formatMutationResult,
+				artifacts,
+			),
+		);
+	}
+	const write = projectionTarget(options.registry, WRITE_TOOL_NAME);
+	if (write) {
+		definitions.push(
+			projected(
+				options,
+				{
+					...createWriteToolDefinition(options.cwd),
+					parameters: projectionParameters(write),
+				} as unknown as ToolDefinition<any, any, any>,
+				write,
+				(input) => ({
+					path: input.path,
+					resourceRevision: input.resourceRevision,
+					content: input.content,
+				}),
+				formatMutationResult,
 				artifacts,
 			),
 		);
