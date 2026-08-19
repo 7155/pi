@@ -1,5 +1,8 @@
+import "./upstream-compat.ts";
+
 export * from "./debug-context.ts";
 export * from "./discovery-tools.ts";
+export * from "./jsonl-framing.ts";
 export * from "./lifecycle-hooks.ts";
 export * from "./plugin-manager.ts";
 export * from "./protocol.ts";

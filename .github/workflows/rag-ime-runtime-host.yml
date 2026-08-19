@@ -1,0 +1,63 @@
+name: Product Runtime Host
+
+on:
+  push:
+    branches: [main, integration/upstream-0.84-runtime-host]
+    paths:
+      - "integrations/rag-ime-runtime-host/**"
+      - "packages/agent/**"
+      - "packages/ai/**"
+      - "packages/coding-agent/**"
+      - "package.json"
+      - "package-lock.json"
+      - "tsconfig*.json"
+      - ".github/workflows/rag-ime-runtime-host.yml"
+  pull_request:
+    branches: [main]
+    paths:
+      - "integrations/rag-ime-runtime-host/**"
+      - "packages/agent/**"
+      - "packages/ai/**"
+      - "packages/coding-agent/**"
+      - "package.json"
+      - "package-lock.json"
+      - "tsconfig*.json"
+      - ".github/workflows/rag-ime-runtime-host.yml"
+
+concurrency:
+  group: rag-ime-runtime-host-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  build-and-test:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Setup Node.js
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libcairo2-dev libpango1.0-dev libjpeg-dev libgif-dev librsvg2-dev fd-find ripgrep
+          sudo ln -s $(which fdfind) /usr/local/bin/fd
+
+      - name: Install dependencies
+        run: npm ci --ignore-scripts
+
+      - name: Build upstream packages and product adapter
+        run: npm run build
+
+      - name: Type-check product adapter
+        run: npm run check:rag-ime-runtime-host
+
+      - name: Test product adapter
+        run: npm run test:rag-ime-runtime-host

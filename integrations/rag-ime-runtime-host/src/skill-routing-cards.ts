@@ -1,6 +1,21 @@
+import { createHash } from "node:crypto";
 import { readFileSync } from "node:fs";
-import type { ResourceDiagnostic, Skill, SkillRoutingCard } from "@earendil-works/pi-coding-agent";
+import type { ResourceDiagnostic, Skill } from "@earendil-works/pi-coding-agent";
 
+export interface SkillRoutingCard {
+	when: string[];
+	does: string;
+	notFor?: string[];
+}
+
+export type SkillCatalogEntry =
+	| ({ name: string } & SkillRoutingCard)
+	| {
+			name: string;
+			description: string;
+	  };
+
+export type SkillWithRouting = Skill & { routing?: SkillRoutingCard };
 export type SkillRoutingCardCatalog = Readonly<Record<string, SkillRoutingCard>>;
 
 const MAX_ROUTING_CARD_CHARS = 200;
@@ -17,11 +32,29 @@ function nonEmptyStrings(value: unknown, field: string): string[] {
 	}
 	const strings = value.map((item) => (typeof item === "string" ? item.trim() : ""));
 	if (strings.some((item) => !item)) throw new Error(`${field} must contain only non-empty strings`);
-	return strings;
+	return [...new Set(strings)];
 }
 
 function routingCardLength(name: string, routing: SkillRoutingCard): number {
 	return Array.from(JSON.stringify({ name, ...routing })).length;
+}
+
+function routingForSkill(skill: Skill): SkillRoutingCard | undefined {
+	return (skill as SkillWithRouting).routing;
+}
+
+export function skillCatalogEntry(skill: Skill): SkillCatalogEntry {
+	const routing = routingForSkill(skill);
+	return routing ? { name: skill.name, ...routing } : { name: skill.name, description: skill.description };
+}
+
+export function skillCatalogRevision(skills: Skill[]): string {
+	const entries = skills
+		.filter((skill) => !skill.disableModelInvocation)
+		.slice()
+		.sort((left, right) => left.name.localeCompare(right.name))
+		.map(skillCatalogEntry);
+	return createHash("sha256").update(JSON.stringify(entries)).digest("hex");
 }
 
 export function codexPluginSkillCatalogNames(pluginName: string, skillName: string): string[] {
@@ -107,10 +140,11 @@ export function applySkillRoutingCardCatalog(
 		diagnostics: base.diagnostics,
 		skills: base.skills.map((skill) => {
 			const match = catalogMatch(skill, catalog);
+			const routed = skill as SkillWithRouting;
 			return {
 				...skill,
 				...(match ? { name: match.name } : {}),
-				routing: skill.routing ?? match?.routing ?? fallbackRoutingCard(skill),
+				routing: routed.routing ?? match?.routing ?? fallbackRoutingCard(skill),
 			};
 		}),
 	};

@@ -1,5 +1,6 @@
 #!/usr/bin/env node
-import { createInterface } from "node:readline";
+import "./upstream-compat.ts";
+import { readStrictJsonl } from "./jsonl-framing.ts";
 import { RuntimeRequestDispatcher } from "./request-dispatcher.ts";
 import { RagImeRuntimeHost, runtimeHostOptionsFromEnvironment } from "./runtime-host.ts";
 
@@ -10,15 +11,18 @@ function output(value: unknown): void {
 async function main(): Promise<void> {
 	const host = await RagImeRuntimeHost.create(runtimeHostOptionsFromEnvironment(output));
 	const dispatcher = new RuntimeRequestDispatcher(host, output);
-	const reader = createInterface({ input: process.stdin, crlfDelay: Infinity });
-	reader.on("line", (line) => {
-		dispatcher.dispatch(line);
-	});
-	await new Promise<void>((resolve, reject) => {
-		reader.on("close", resolve);
-		reader.on("error", reject);
-	});
-	await dispatcher.settle();
+	try {
+		for await (const line of readStrictJsonl(process.stdin)) {
+			dispatcher.dispatch(line);
+		}
+		await dispatcher.settle();
+	} catch (error) {
+		// A framing failure invalidates the whole byte stream. Abort Runtime work
+		// first, then wait for request handlers to settle before surfacing it.
+		await host.dispose();
+		await dispatcher.settle();
+		throw error;
+	}
 	await host.dispose();
 }
 

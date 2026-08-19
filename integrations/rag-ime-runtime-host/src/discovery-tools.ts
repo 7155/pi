@@ -4,8 +4,6 @@ import {
 	type InlineExtension,
 	type ResourceLoader,
 	type Skill,
-	skillCatalogEntry,
-	skillCatalogRevision,
 	stripFrontmatter,
 	type ToolDefinition,
 } from "@earendil-works/pi-coding-agent";
@@ -15,6 +13,7 @@ import {
 	TOOL_LOAD_TOOL_NAME,
 	TOOL_SEARCH_TOOL_NAME,
 } from "./runtime-tool-names.ts";
+import { skillCatalogEntry, skillCatalogRevision } from "./skill-routing-cards.ts";
 import { type BackendToolManifest, type BackendToolRegistry, backendToolSchemaRevision } from "./tool-bridge.ts";
 
 const DEFAULT_RESULT_LIMIT = 8;
@@ -409,6 +408,7 @@ export function createDiscoveryToolsExtension(options: DiscoveryToolsOptions): I
 						return {
 							content: [{ type: "text", text: JSON.stringify(providerResult) }],
 							details,
+							addedToolNames: alreadyDisclosed ? undefined : [loaded.tool.name],
 						};
 					},
 				});
