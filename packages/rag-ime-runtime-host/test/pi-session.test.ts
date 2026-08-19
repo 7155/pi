@@ -1,0 +1,357 @@
+import { mkdtemp, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import type { AssistantMessage } from "@earendil-works/pi-ai";
+import { SessionManager } from "@earendil-works/pi-coding-agent";
+import { describe, expect, it, vi } from "vitest";
+import {
+	PiProductSession,
+	prepareNativePiFork,
+	publicPiForkCandidates,
+	publicPiRewriteTarget,
+} from "../src/pi-session.ts";
+
+function assistant(text: string, timestamp: number): AssistantMessage {
+	return {
+		role: "assistant",
+		content: [{ type: "text", text }],
+		api: "openai-completions",
+		provider: "openai",
+		model: "test",
+		usage: {
+			input: 1,
+			output: 1,
+			cacheRead: 0,
+			cacheWrite: 0,
+			totalTokens: 2,
+			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+		},
+		stopReason: "stop",
+		timestamp,
+	};
+}
+
+function assistantWith(
+	content: AssistantMessage["content"],
+	timestamp: number,
+	options: Partial<AssistantMessage> = {},
+): AssistantMessage {
+	return {
+		...assistant("", timestamp),
+		content,
+		...options,
+	};
+}
+
+describe("native Pi conversation fork", () => {
+	it("creates a distinct transcript at the selected user anchor without mutating the source", async () => {
+		const root = await mkdtemp(join(tmpdir(), "pi-runtime-host-fork-"));
+		try {
+			const source = SessionManager.create(root, root);
+			source.appendMessage({ role: "user", content: "first question", timestamp: 1 });
+			source.appendMessage(assistant("first answer", 2));
+			const secondUserId = source.appendMessage({ role: "user", content: "branch this", timestamp: 3 });
+			const sourceLeaf = source.appendMessage(assistant("abandoned answer", 4));
+			const sourceFile = source.getSessionFile();
+
+			const prepared = prepareNativePiFork(source, secondUserId);
+
+			expect(prepared.selectedText).toBe("branch this");
+			expect(prepared.sessionFile).not.toBe(sourceFile);
+			expect(prepared.branchAnchor).not.toBe(secondUserId);
+			expect(prepared.sessionManager.buildSessionContext().messages.map((message) => message.role)).toEqual([
+				"user",
+				"assistant",
+			]);
+			expect(source.getLeafId()).toBe(sourceLeaf);
+			expect(source.getSessionFile()).toBe(sourceFile);
+		} finally {
+			await rm(root, { recursive: true, force: true });
+		}
+	});
+
+	it("creates an assistant branch at the response and leaves the composer empty", async () => {
+		const root = await mkdtemp(join(tmpdir(), "pi-runtime-host-fork-"));
+		try {
+			const source = SessionManager.create(root, root);
+			source.appendMessage({ role: "user", content: "question", timestamp: 1 });
+			const assistantId = source.appendMessage(assistant("answer", 2));
+			source.appendMessage({ role: "user", content: "later question", timestamp: 3 });
+			const sourceLeaf = source.appendMessage(assistant("later answer", 4));
+			const sourceFile = source.getSessionFile();
+
+			const prepared = prepareNativePiFork(source, assistantId);
+
+			expect(prepared.selectedText).toBe("");
+			expect(prepared.branchAnchor).toBe(assistantId);
+			expect(prepared.sessionFile).not.toBe(sourceFile);
+			expect(prepared.sessionManager.buildSessionContext().messages.map((message) => message.role)).toEqual([
+				"user",
+				"assistant",
+			]);
+			expect(source.getLeafId()).toBe(sourceLeaf);
+			expect(source.getSessionFile()).toBe(sourceFile);
+		} finally {
+			await rm(root, { recursive: true, force: true });
+		}
+	});
+
+	it("returns every public user and assistant node without exposing tools or hidden RAG context", async () => {
+		const root = await mkdtemp(join(tmpdir(), "pi-runtime-host-fork-"));
+		try {
+			const source = SessionManager.create(root, root);
+			const userId = source.appendMessage({ role: "user", content: "plain question", timestamp: 10 });
+			const assistantId = source.appendMessage(assistant("plain answer", 20));
+			source.appendMessage(
+				assistantWith(
+					[
+						{ type: "text", text: "calling a tool" },
+						{ type: "toolCall", id: "tool-1", name: "memory", arguments: {} },
+					],
+					30,
+					{ stopReason: "toolUse" },
+				),
+			);
+			source.appendMessage({
+				role: "toolResult",
+				toolCallId: "tool-1",
+				toolName: "memory",
+				content: [{ type: "text", text: "private tool result" }],
+				isError: false,
+				timestamp: 40,
+			});
+			const failedId = source.appendMessage(
+				assistantWith([], 50, { stopReason: "error", errorMessage: '404 Model "missing" is unavailable' }),
+			);
+			const imageUserId = source.appendMessage({
+				role: "user",
+				content: [{ type: "image", data: "AA==", mimeType: "image/png" }],
+				timestamp: 60,
+			});
+			const imageAssistantId = source.appendMessage(
+				assistantWith(
+					[{ type: "image", data: "AA==", mimeType: "image/png" }] as unknown as AssistantMessage["content"],
+					70,
+				),
+			);
+			const wrappedUserId = source.appendMessage({
+				role: "user",
+				content:
+					"<rag-ime-deep-search-context>private evidence</rag-ime-deep-search-context>" +
+					"<rag-ime-user-query>public query</rag-ime-user-query>",
+				timestamp: 80,
+			});
+			source.appendMessage({
+				role: "user",
+				content: "<rag-ime-deep-search-context>private only</rag-ime-deep-search-context>",
+				timestamp: 90,
+			});
+			source.appendMessage(assistantWith([{ type: "thinking", thinking: "private reasoning" }], 100));
+
+			const candidates = publicPiForkCandidates(source);
+
+			expect(candidates).toEqual([
+				{ entryId: userId, text: "plain question", role: "user", createdAtMs: 10 },
+				{ entryId: assistantId, text: "plain answer", role: "assistant", createdAtMs: 20 },
+				{
+					entryId: failedId,
+					text: '404 Model "missing" is unavailable',
+					role: "assistant",
+					createdAtMs: 50,
+				},
+				{ entryId: imageUserId, text: "非文本消息", role: "user", createdAtMs: 60 },
+				{ entryId: imageAssistantId, text: "非文本消息", role: "assistant", createdAtMs: 70 },
+				{ entryId: wrappedUserId, text: "public query", role: "user", createdAtMs: 80 },
+			]);
+			expect(JSON.stringify(candidates)).not.toContain("private evidence");
+			expect(JSON.stringify(candidates)).not.toContain("private tool result");
+			expect(JSON.stringify(candidates)).not.toContain("private reasoning");
+		} finally {
+			await rm(root, { recursive: true, force: true });
+		}
+	});
+
+	it("rejects hidden tool-call assistant nodes as fork anchors", async () => {
+		const root = await mkdtemp(join(tmpdir(), "pi-runtime-host-fork-"));
+		try {
+			const source = SessionManager.create(root, root);
+			source.appendMessage({ role: "user", content: "question", timestamp: 1 });
+			const toolCallId = source.appendMessage(
+				assistantWith([{ type: "toolCall", id: "tool-1", name: "memory", arguments: {} }], 2, {
+					stopReason: "toolUse",
+				}),
+			);
+			source.appendMessage({
+				role: "toolResult",
+				toolCallId: "tool-1",
+				toolName: "memory",
+				content: [{ type: "text", text: "result" }],
+				isError: false,
+				timestamp: 3,
+			});
+			source.appendMessage(assistant("answer", 4));
+
+			expect(() => prepareNativePiFork(source, toolCallId)).toThrow(
+				"Fork entry must identify a public user or assistant message",
+			);
+		} finally {
+			await rm(root, { recursive: true, force: true });
+		}
+	});
+
+	it("only accepts public user entries as in-place rewrite targets", async () => {
+		const root = await mkdtemp(join(tmpdir(), "pi-runtime-host-rewrite-"));
+		try {
+			const source = SessionManager.create(root, root);
+			const userId = source.appendMessage({ role: "user", content: "edit me", timestamp: 1 });
+			const assistantId = source.appendMessage(assistant("answer", 2));
+
+			expect(publicPiRewriteTarget(source, userId)).toMatchObject({
+				entryId: userId,
+				role: "user",
+				text: "edit me",
+			});
+			expect(() => publicPiRewriteTarget(source, assistantId)).toThrow(
+				"Rewrite entry must identify a public user message",
+			);
+		} finally {
+			await rm(root, { recursive: true, force: true });
+		}
+	});
+});
+
+describe("active-turn message queue", () => {
+	it("queues steering and follow-up messages against the current product turn", async () => {
+		const steering: string[] = [];
+		const followUp: string[] = [];
+		const steer = vi.fn(async (message: string) => {
+			steering.push(message);
+		});
+		const queueFollowUp = vi.fn(async (message: string) => {
+			followUp.push(message);
+		});
+		const productSession = Object.create(PiProductSession.prototype) as PiProductSession;
+		Object.assign(productSession as unknown as Record<string, unknown>, {
+			activeTurn: { turnId: "turn-1", clientMessageId: "prompt-1" },
+			session: {
+				isIdle: false,
+				steer,
+				followUp: queueFollowUp,
+				getSteeringMessages: () => steering,
+				getFollowUpMessages: () => followUp,
+				steeringMode: "one-at-a-time",
+				followUpMode: "one-at-a-time",
+			},
+		});
+
+		await expect(
+			productSession.queueMessage({
+				delivery: "steer",
+				message: "change direction",
+				clientMessageId: "steer-1",
+			}),
+		).resolves.toMatchObject({
+			accepted: true,
+			queued: true,
+			delivery: "steer",
+			turnId: "turn-1",
+			clientMessageId: "steer-1",
+			messageQueue: { steering: ["change direction"], followUp: [] },
+		});
+		await expect(
+			productSession.queueMessage({ delivery: "followUp", message: "then summarize" }),
+		).resolves.toMatchObject({
+			delivery: "followUp",
+			messageQueue: { steering: ["change direction"], followUp: ["then summarize"] },
+		});
+		expect(steer).toHaveBeenCalledWith("change direction", undefined);
+		expect(queueFollowUp).toHaveBeenCalledWith("then summarize", undefined);
+	});
+
+	it("rejects queued messages when no turn is running", async () => {
+		const productSession = Object.create(PiProductSession.prototype) as PiProductSession;
+		Object.assign(productSession as unknown as Record<string, unknown>, {
+			activeTurn: undefined,
+			session: { isIdle: true },
+		});
+
+		await expect(productSession.queueMessage({ delivery: "steer", message: "too late" })).rejects.toMatchObject({
+			code: "SESSION_IDLE",
+		});
+	});
+});
+
+describe("request-scoped UI resolution", () => {
+	it("resolves exactly the pending request id and acknowledges only after resolution", () => {
+		const productSession = Object.create(PiProductSession.prototype) as PiProductSession;
+		let resolved: boolean | undefined;
+		Object.assign(productSession as unknown as Record<string, unknown>, {
+			pendingUIRequests: new Map(),
+			pendingDecisions: new Map([
+				[
+					"review:run-1",
+					{
+						requestId: "ui-review-1",
+						resolve: (value: boolean) => {
+							resolved = value;
+						},
+						cleanup: () => {},
+					},
+				],
+			]),
+		});
+
+		expect(productSession.resolveUI("ui-review-1", { value: "是，继续审阅。" })).toEqual({
+			requestId: "ui-review-1",
+			resolved: true,
+		});
+		expect(resolved).toBe(true);
+		expect(() => productSession.resolveUI("ui-missing", { confirmed: true })).toThrow("UI request is not pending");
+	});
+});
+
+describe("manual compaction context refresh", () => {
+	it("reports when the compaction hook already refreshed Session memory", async () => {
+		const productSession = Object.create(PiProductSession.prototype) as PiProductSession;
+		const mutable = productSession as unknown as Record<string, unknown>;
+		Object.assign(mutable, {
+			sessionContextRefreshRevision: 0,
+			session: {
+				isIdle: true,
+				compact: vi.fn(async () => {
+					mutable.sessionContextRefreshRevision = 1;
+					return {
+						summary: "压缩摘要",
+						firstKeptEntryId: "entry-1",
+						tokensBefore: 1200,
+						estimatedTokensAfter: 400,
+					};
+				}),
+			},
+		});
+
+		await expect(productSession.compact()).resolves.toMatchObject({
+			summary: "压缩摘要",
+			contextRefreshApplied: true,
+		});
+	});
+
+	it("reports a missed refresh so the product gateway can use its fallback", async () => {
+		const productSession = Object.create(PiProductSession.prototype) as PiProductSession;
+		Object.assign(productSession as unknown as Record<string, unknown>, {
+			sessionContextRefreshRevision: 0,
+			session: {
+				isIdle: true,
+				compact: vi.fn(async () => ({
+					summary: "压缩摘要",
+					firstKeptEntryId: "entry-1",
+					tokensBefore: 1200,
+				})),
+			},
+		});
+
+		await expect(productSession.compact()).resolves.toMatchObject({
+			contextRefreshApplied: false,
+		});
+	});
+});
