@@ -4,7 +4,6 @@ import { join } from "node:path";
 import {
 	createSyntheticSourceInfo,
 	type ResourceLoader,
-	type Skill,
 	type ToolDefinition,
 } from "@earendil-works/pi-coding-agent";
 import { describe, expect, it } from "vitest";
@@ -23,6 +22,7 @@ import {
 	TOOL_LOAD_TOOL_NAME,
 	TOOL_SEARCH_TOOL_NAME,
 } from "../src/runtime-tool-names.ts";
+import type { SkillRoutingCard, SkillWithRouting } from "../src/skill-routing-cards.ts";
 import { BackendToolRegistry } from "../src/tool-bridge.ts";
 
 function skill(options: {
@@ -30,13 +30,13 @@ function skill(options: {
 	description: string;
 	filePath?: string;
 	disableModelInvocation?: boolean;
-	routing?: Skill["routing"];
-}): Skill {
+	routing?: SkillRoutingCard;
+}): SkillWithRouting {
 	const filePath = options.filePath ?? `/managed/${options.name}/SKILL.md`;
 	return {
 		name: options.name,
 		description: options.description,
-		routing: options.routing,
+		...(options.routing ? { routing: options.routing } : {}),
 		filePath,
 		baseDir: filePath.slice(0, -"/SKILL.md".length),
 		sourceInfo: createSyntheticSourceInfo(filePath, { source: "test" }),

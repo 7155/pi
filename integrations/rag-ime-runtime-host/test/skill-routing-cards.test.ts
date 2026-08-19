@@ -1,6 +1,10 @@
 import { createSyntheticSourceInfo } from "@earendil-works/pi-coding-agent";
 import { describe, expect, it } from "vitest";
-import { applySkillRoutingCardCatalog, parseSkillRoutingCardCatalog } from "../src/skill-routing-cards.ts";
+import {
+	applySkillRoutingCardCatalog,
+	parseSkillRoutingCardCatalog,
+	type SkillWithRouting,
+} from "../src/skill-routing-cards.ts";
 
 describe("Skill routing card catalog", () => {
 	it("parses bounded structured cards and rejects oversized entries", () => {
@@ -41,8 +45,10 @@ describe("Skill routing card catalog", () => {
 			{ known: { when: ["known trigger"], does: "known action" } },
 		);
 
-		expect(result.skills[0]?.routing).toEqual({ when: ["known trigger"], does: "known action" });
-		const fallback = { name: "future", ...result.skills[1]?.routing };
+		const known = result.skills[0] as SkillWithRouting | undefined;
+		const future = result.skills[1] as SkillWithRouting | undefined;
+		expect(known?.routing).toEqual({ when: ["known trigger"], does: "known action" });
+		const fallback = { name: "future", ...future?.routing };
 		expect(Array.from(JSON.stringify(fallback)).length).toBeLessThanOrEqual(200);
 	});
 
@@ -71,7 +77,8 @@ describe("Skill routing card catalog", () => {
 			},
 		);
 
-		expect(result.skills[0]).toMatchObject({
+		const mapped = result.skills[0] as SkillWithRouting | undefined;
+		expect(mapped).toMatchObject({
 			name: "browser:control-in-app-browser",
 			routing: { when: ["需要操作应用内浏览器"], does: "控制应用内浏览器。" },
 		});

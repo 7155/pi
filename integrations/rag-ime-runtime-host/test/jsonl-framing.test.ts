@@ -1,9 +1,5 @@
 import { describe, expect, it } from "vitest";
-import {
-	readStrictJsonl,
-	StrictJsonlFramingError,
-	type StrictJsonlReaderOptions,
-} from "../src/jsonl-framing.ts";
+import { readStrictJsonl, type StrictJsonlReaderOptions } from "../src/jsonl-framing.ts";
 
 async function* chunks(values: Array<Uint8Array | string>): AsyncGenerator<Uint8Array | string> {
 	for (const value of values) yield value;
@@ -34,19 +30,19 @@ describe("strict JSONL framing", () => {
 	});
 
 	it("rejects an oversized record before dispatch", async () => {
-		await expect(collect(["12345\n"], { maxRecordBytes: 4 })).rejects.toMatchObject<StrictJsonlFramingError>({
+		await expect(collect(["12345\n"], { maxRecordBytes: 4 })).rejects.toMatchObject({
 			code: "RECORD_TOO_LARGE",
 		});
 	});
 
 	it("rejects an unterminated final record", async () => {
-		await expect(collect(["{\"id\":\"partial\"}"])).rejects.toMatchObject<StrictJsonlFramingError>({
+		await expect(collect(["{\"id\":\"partial\"}"])).rejects.toMatchObject({
 			code: "TRUNCATED_RECORD",
 		});
 	});
 
 	it("rejects invalid UTF-8 without corrupting it into replacement characters", async () => {
-		await expect(collect([Uint8Array.from([0x7b, 0xff, 0x7d, 0x0a])])).rejects.toMatchObject<StrictJsonlFramingError>({
+		await expect(collect([Uint8Array.from([0x7b, 0xff, 0x7d, 0x0a])])).rejects.toMatchObject({
 			code: "INVALID_UTF8",
 		});
 	});
