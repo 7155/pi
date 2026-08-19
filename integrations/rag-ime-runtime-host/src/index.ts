@@ -6,6 +6,7 @@ export * from "./jsonl-framing.ts";
 export * from "./lifecycle-hooks.ts";
 export * from "./plugin-manager.ts";
 export * from "./protocol.ts";
+export * from "./runtime-baseline.ts";
 export * from "./runtime-host.ts";
 export * from "./runtime-tool-names.ts";
 export * from "./session-context-refresh.ts";
