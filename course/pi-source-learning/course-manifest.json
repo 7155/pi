@@ -1,0 +1,177 @@
+{
+  "schemaVersion": "pi-source-course.v1",
+  "course": "Pi 0.84 源码学习课程",
+  "repository": "7155/pi",
+  "sourceBranch": "integration/upstream-0.84-runtime-host",
+  "sourceCommit": "1cafa4567357ba6d211033e99f58c19385ccacf1",
+  "upstreamVersion": "0.84.2",
+  "upstreamCommit": "59a71b235dadb4ad0d67557a8abb0aaa093e68b4",
+  "learningStyle": [
+    "用途优先",
+    "真实调用链",
+    "README 内含核心源码",
+    "运行时真实值",
+    "失败、取消与并发",
+    "Mermaid 图解",
+    "练习题"
+  ],
+  "lessons": [
+    {
+      "id": "00",
+      "path": "lessons/00-architecture-and-learning-map/README.md",
+      "dependsOn": [],
+      "evidenceFiles": [
+        "README.md"
+      ]
+    },
+    {
+      "id": "01",
+      "path": "lessons/01-create-agent-session/README.md",
+      "dependsOn": [
+        "00"
+      ],
+      "evidenceFiles": [
+        "packages/coding-agent/src/core/sdk.ts"
+      ]
+    },
+    {
+      "id": "02",
+      "path": "lessons/02-agent-state-and-run-lifecycle/README.md",
+      "dependsOn": [
+        "01"
+      ],
+      "evidenceFiles": [
+        "packages/agent/src/agent.ts",
+        "packages/agent/src/types.ts"
+      ]
+    },
+    {
+      "id": "03",
+      "path": "lessons/03-model-turn-and-tool-loop/README.md",
+      "dependsOn": [
+        "02"
+      ],
+      "evidenceFiles": [
+        "packages/agent/src/agent-loop.ts",
+        "packages/agent/src/types.ts"
+      ]
+    },
+    {
+      "id": "04",
+      "path": "lessons/04-steer-follow-up-and-abort/README.md",
+      "dependsOn": [
+        "03"
+      ],
+      "evidenceFiles": [
+        "packages/agent/src/agent.ts",
+        "packages/coding-agent/src/core/agent-session.ts"
+      ]
+    },
+    {
+      "id": "05",
+      "path": "lessons/05-agent-session-orchestration/README.md",
+      "dependsOn": [
+        "04"
+      ],
+      "evidenceFiles": [
+        "packages/coding-agent/src/core/agent-session.ts"
+      ]
+    },
+    {
+      "id": "06",
+      "path": "lessons/06-session-tree-and-recovery/README.md",
+      "dependsOn": [
+        "05"
+      ],
+      "evidenceFiles": [
+        "packages/coding-agent/src/core/session-manager.ts",
+        "packages/coding-agent/src/core/agent-session-runtime.ts"
+      ]
+    },
+    {
+      "id": "07",
+      "path": "lessons/07-context-compaction/README.md",
+      "dependsOn": [
+        "06"
+      ],
+      "evidenceFiles": [
+        "packages/coding-agent/src/core/compaction/compaction.ts",
+        "packages/coding-agent/src/core/agent-session.ts"
+      ]
+    },
+    {
+      "id": "08",
+      "path": "lessons/08-model-runtime-and-provider-boundary/README.md",
+      "dependsOn": [
+        "01"
+      ],
+      "evidenceFiles": [
+        "packages/coding-agent/src/core/model-runtime.ts",
+        "packages/coding-agent/src/core/sdk.ts"
+      ]
+    },
+    {
+      "id": "09",
+      "path": "lessons/09-extensions-skills-and-resources/README.md",
+      "dependsOn": [
+        "05",
+        "08"
+      ],
+      "evidenceFiles": [
+        "packages/coding-agent/src/core/resource-loader.ts",
+        "packages/coding-agent/src/core/extensions/types.ts"
+      ]
+    },
+    {
+      "id": "10",
+      "path": "lessons/10-tui-event-driven-rendering/README.md",
+      "dependsOn": [
+        "05"
+      ],
+      "evidenceFiles": [
+        "packages/tui/src/tui.ts",
+        "packages/coding-agent/src/core/agent-session.ts"
+      ]
+    },
+    {
+      "id": "11",
+      "path": "lessons/11-durable-harness-and-lanes/README.md",
+      "dependsOn": [
+        "03",
+        "06",
+        "07"
+      ],
+      "evidenceFiles": [
+        "packages/agent/src/harness/agent-harness.ts"
+      ]
+    },
+    {
+      "id": "12",
+      "path": "lessons/12-product-runtime-host/README.md",
+      "dependsOn": [
+        "05",
+        "07",
+        "09"
+      ],
+      "evidenceFiles": [
+        "integrations/rag-ime-runtime-host/README.md",
+        "integrations/rag-ime-runtime-host/src/jsonl-framing.ts",
+        "integrations/rag-ime-runtime-host/src/request-dispatcher.ts",
+        "integrations/rag-ime-runtime-host/src/runtime-baseline.ts",
+        "integrations/rag-ime-runtime-host/src/runtime-host.ts",
+        "integrations/rag-ime-runtime-host/src/pi-session.ts"
+      ]
+    },
+    {
+      "id": "13",
+      "path": "lessons/13-build-your-own-agent-app/README.md",
+      "dependsOn": [
+        "12"
+      ],
+      "evidenceFiles": [
+        "packages/coding-agent/src/core/sdk.ts",
+        "integrations/rag-ime-runtime-host/src/runtime-host.ts"
+      ]
+    }
+  ]
+}
