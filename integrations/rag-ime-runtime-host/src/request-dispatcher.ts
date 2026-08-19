@@ -1,4 +1,5 @@
 import { errorResponse, parseRuntimeRequest, type RuntimeRequest, successResponse } from "./protocol.ts";
+import { normalizeRuntimeMetadata } from "./runtime-baseline.ts";
 
 export interface RuntimeRequestHandler {
 	handle(request: RuntimeRequest): Promise<unknown>;
@@ -38,7 +39,8 @@ export class RuntimeRequestDispatcher {
 				id = value.id;
 			}
 			const request = parseRuntimeRequest(value);
-			this.output(successResponse(request.id, await this.handler.handle(request)));
+			const result = normalizeRuntimeMetadata(await this.handler.handle(request));
+			this.output(successResponse(request.id, result));
 		} catch (error) {
 			this.output(errorResponse(id, error));
 		}
