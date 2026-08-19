@@ -56,8 +56,10 @@ jobs:
       - name: Build upstream packages and product adapter
         run: npm run build
 
-      - name: Type-check product adapter
-        run: npm run check:rag-ime-runtime-host
+      - name: Check repository and product adapter
+        run: |
+          npm run check
+          git diff --exit-code
 
       - name: Test product adapter
         run: npm run test:rag-ime-runtime-host
