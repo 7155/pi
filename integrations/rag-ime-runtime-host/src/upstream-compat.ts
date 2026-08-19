@@ -1,4 +1,4 @@
-import { AgentSession } from "@earendil-works/pi-coding-agent";
+import { AgentSession, ModelRuntime } from "@earendil-works/pi-coding-agent";
 
 declare module "@earendil-works/pi-coding-agent" {
 	interface AgentSession {
@@ -8,14 +8,19 @@ declare module "@earendil-works/pi-coding-agent" {
 		 */
 		setRegisteredToolExecutionEnabled(enabled: boolean): void;
 	}
+
+	interface ModelRuntime {
+		/** Re-read models.json and refresh the local model snapshot without network access. */
+		reloadConfig(): Promise<void>;
+	}
 }
 
-const prototype = AgentSession.prototype as AgentSession & {
+const sessionPrototype = AgentSession.prototype as AgentSession & {
 	setRegisteredToolExecutionEnabled?: (enabled: boolean) => void;
 };
 
-if (typeof prototype.setRegisteredToolExecutionEnabled !== "function") {
-	Object.defineProperty(prototype, "setRegisteredToolExecutionEnabled", {
+if (typeof sessionPrototype.setRegisteredToolExecutionEnabled !== "function") {
+	Object.defineProperty(sessionPrototype, "setRegisteredToolExecutionEnabled", {
 		configurable: true,
 		writable: true,
 		value(this: AgentSession, enabled: boolean): void {
@@ -28,6 +33,23 @@ if (typeof prototype.setRegisteredToolExecutionEnabled !== "function") {
 			agent.resolveToolForExecution = enabled
 				? (name: string) => this.getAllTools().find((tool) => tool.name === name)
 				: undefined;
+		},
+	});
+}
+
+const modelRuntimePrototype = ModelRuntime.prototype as ModelRuntime & {
+	reloadConfig?: () => Promise<void>;
+};
+
+if (typeof modelRuntimePrototype.reloadConfig !== "function") {
+	Object.defineProperty(modelRuntimePrototype, "reloadConfig", {
+		configurable: true,
+		writable: true,
+		async value(this: ModelRuntime): Promise<void> {
+			// Upstream 0.84 folded config reload into refresh(). Product requests
+			// must not trigger catalog network traffic, so preserve the old host's
+			// deterministic local-refresh behavior explicitly.
+			await this.refresh({ allowNetwork: false });
 		},
 	});
 }
