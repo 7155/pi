@@ -26,8 +26,8 @@
 		"test": "cd ../.. && npm run test:rag-ime-runtime-host"
 	},
 	"dependencies": {
-		"@earendil-works/pi-ai": "^0.84.2",
-		"@earendil-works/pi-coding-agent": "^0.84.2"
+		"@earendil-works/pi-ai": "0.84.2",
+		"@earendil-works/pi-coding-agent": "0.84.2"
 	},
 	"engines": {
 		"node": ">=22.19.0"
