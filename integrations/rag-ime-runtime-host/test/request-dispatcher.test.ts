@@ -57,4 +57,32 @@ describe("runtime request dispatcher", () => {
 		expect(output).toContainEqual(expect.objectContaining({ ok: false }));
 		expect(output).toContainEqual(expect.objectContaining({ id: "health", ok: true }));
 	});
+
+	it("reports the authoritative upstream Pi baseline in hello responses", async () => {
+		const output: unknown[] = [];
+		const dispatcher = new RuntimeRequestDispatcher(
+			{
+				async handle() {
+					return {
+						protocol: "rag-ime.pi-runtime",
+						protocolVersion: "2",
+						hostVersion: "1.0.0",
+						piVersion: "0.80.7",
+					};
+				},
+			},
+			(value) => output.push(value),
+		);
+
+		dispatcher.dispatch(request("hello", "hello"));
+		await dispatcher.settle();
+
+		expect(output).toEqual([
+			expect.objectContaining({
+				id: "hello",
+				ok: true,
+				result: expect.objectContaining({ piVersion: "0.84.2" }),
+			}),
+		]);
+	});
 });
