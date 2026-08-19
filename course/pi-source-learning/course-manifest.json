@@ -1,6 +1,6 @@
 {
-  "schemaVersion": "pi-source-course.v1",
-  "course": "Pi 0.84 源码学习课程",
+  "schemaVersion": "pi-source-course.v2",
+  "course": "Pi 0.84 源码到完整 Agent 项目课程",
   "repository": "7155/pi",
   "sourceBranch": "integration/upstream-0.84-runtime-host",
   "sourceCommit": "1cafa4567357ba6d211033e99f58c19385ccacf1",
@@ -9,37 +9,63 @@
   "learningStyle": [
     "用途优先",
     "真实调用链",
-    "README 内含核心源码",
+    "README 内含核心源码或完整教学代码",
     "运行时真实值",
-    "失败、取消与并发",
-    "Mermaid 图解",
-    "练习题"
+    "状态所有权",
+    "失败、取消、并发与恢复",
+    "时序图、状态图、决策图、ER 图、Crash Point 图和 Reducer 图",
+    "练习题",
+    "实验和项目退出门"
+  ],
+  "layers": [
+    {
+      "id": "guide",
+      "title": "14 节用途优先导读",
+      "entry": "lessons/00-architecture-and-learning-map/README.md",
+      "purpose": "先建立 Pi 分层、用途和一条请求的总体调用地图"
+    },
+    {
+      "id": "evolution",
+      "title": "Pi 0.80—0.84 版本演进",
+      "entry": "evolution/README.md",
+      "purpose": "从旧问题、新机制、源码落点和 Fork 迁移影响理解版本变化"
+    },
+    {
+      "id": "deep-dives",
+      "title": "9 章机制深挖教材",
+      "entry": "deep-dives/README.md",
+      "purpose": "按函数、状态、事件、失败和并发追完整 Runtime"
+    },
+    {
+      "id": "labs",
+      "title": "6 个可执行实验",
+      "entry": "labs/README.md",
+      "purpose": "用 Faux Provider、故障注入和真实 Session/Host 验证机制"
+    },
+    {
+      "id": "project",
+      "title": "7 章生产项目手册",
+      "entry": "project/README.md",
+      "purpose": "从需求、数据模型和协议实现完整数据准备 Agent"
+    }
   ],
   "lessons": [
     {
       "id": "00",
       "path": "lessons/00-architecture-and-learning-map/README.md",
       "dependsOn": [],
-      "evidenceFiles": [
-        "README.md"
-      ]
+      "evidenceFiles": ["README.md"]
     },
     {
       "id": "01",
       "path": "lessons/01-create-agent-session/README.md",
-      "dependsOn": [
-        "00"
-      ],
-      "evidenceFiles": [
-        "packages/coding-agent/src/core/sdk.ts"
-      ]
+      "dependsOn": ["00"],
+      "evidenceFiles": ["packages/coding-agent/src/core/sdk.ts"]
     },
     {
       "id": "02",
       "path": "lessons/02-agent-state-and-run-lifecycle/README.md",
-      "dependsOn": [
-        "01"
-      ],
+      "dependsOn": ["01"],
       "evidenceFiles": [
         "packages/agent/src/agent.ts",
         "packages/agent/src/types.ts"
@@ -48,9 +74,7 @@
     {
       "id": "03",
       "path": "lessons/03-model-turn-and-tool-loop/README.md",
-      "dependsOn": [
-        "02"
-      ],
+      "dependsOn": ["02"],
       "evidenceFiles": [
         "packages/agent/src/agent-loop.ts",
         "packages/agent/src/types.ts"
@@ -59,9 +83,7 @@
     {
       "id": "04",
       "path": "lessons/04-steer-follow-up-and-abort/README.md",
-      "dependsOn": [
-        "03"
-      ],
+      "dependsOn": ["03"],
       "evidenceFiles": [
         "packages/agent/src/agent.ts",
         "packages/coding-agent/src/core/agent-session.ts"
@@ -70,19 +92,13 @@
     {
       "id": "05",
       "path": "lessons/05-agent-session-orchestration/README.md",
-      "dependsOn": [
-        "04"
-      ],
-      "evidenceFiles": [
-        "packages/coding-agent/src/core/agent-session.ts"
-      ]
+      "dependsOn": ["04"],
+      "evidenceFiles": ["packages/coding-agent/src/core/agent-session.ts"]
     },
     {
       "id": "06",
       "path": "lessons/06-session-tree-and-recovery/README.md",
-      "dependsOn": [
-        "05"
-      ],
+      "dependsOn": ["05"],
       "evidenceFiles": [
         "packages/coding-agent/src/core/session-manager.ts",
         "packages/coding-agent/src/core/agent-session-runtime.ts"
@@ -91,9 +107,7 @@
     {
       "id": "07",
       "path": "lessons/07-context-compaction/README.md",
-      "dependsOn": [
-        "06"
-      ],
+      "dependsOn": ["06"],
       "evidenceFiles": [
         "packages/coding-agent/src/core/compaction/compaction.ts",
         "packages/coding-agent/src/core/agent-session.ts"
@@ -102,9 +116,7 @@
     {
       "id": "08",
       "path": "lessons/08-model-runtime-and-provider-boundary/README.md",
-      "dependsOn": [
-        "01"
-      ],
+      "dependsOn": ["01"],
       "evidenceFiles": [
         "packages/coding-agent/src/core/model-runtime.ts",
         "packages/coding-agent/src/core/sdk.ts"
@@ -113,10 +125,7 @@
     {
       "id": "09",
       "path": "lessons/09-extensions-skills-and-resources/README.md",
-      "dependsOn": [
-        "05",
-        "08"
-      ],
+      "dependsOn": ["05", "08"],
       "evidenceFiles": [
         "packages/coding-agent/src/core/resource-loader.ts",
         "packages/coding-agent/src/core/extensions/types.ts"
@@ -125,9 +134,7 @@
     {
       "id": "10",
       "path": "lessons/10-tui-event-driven-rendering/README.md",
-      "dependsOn": [
-        "05"
-      ],
+      "dependsOn": ["05"],
       "evidenceFiles": [
         "packages/tui/src/tui.ts",
         "packages/coding-agent/src/core/agent-session.ts"
@@ -136,23 +143,13 @@
     {
       "id": "11",
       "path": "lessons/11-durable-harness-and-lanes/README.md",
-      "dependsOn": [
-        "03",
-        "06",
-        "07"
-      ],
-      "evidenceFiles": [
-        "packages/agent/src/harness/agent-harness.ts"
-      ]
+      "dependsOn": ["03", "06", "07"],
+      "evidenceFiles": ["packages/agent/src/harness/agent-harness.ts"]
     },
     {
       "id": "12",
       "path": "lessons/12-product-runtime-host/README.md",
-      "dependsOn": [
-        "05",
-        "07",
-        "09"
-      ],
+      "dependsOn": ["05", "07", "09"],
       "evidenceFiles": [
         "integrations/rag-ime-runtime-host/README.md",
         "integrations/rag-ime-runtime-host/src/jsonl-framing.ts",
@@ -165,13 +162,249 @@
     {
       "id": "13",
       "path": "lessons/13-build-your-own-agent-app/README.md",
-      "dependsOn": [
-        "12"
-      ],
+      "dependsOn": ["12"],
       "evidenceFiles": [
         "packages/coding-agent/src/core/sdk.ts",
         "integrations/rag-ime-runtime-host/src/runtime-host.ts"
       ]
     }
+  ],
+  "evolution": [
+    {
+      "id": "0.80",
+      "path": "evolution/0.80.md",
+      "dependsOn": ["guide:05"],
+      "evidenceFiles": [
+        "packages/agent/CHANGELOG.md",
+        "packages/ai/CHANGELOG.md",
+        "packages/coding-agent/CHANGELOG.md"
+      ]
+    },
+    {
+      "id": "0.81",
+      "path": "evolution/0.81.md",
+      "dependsOn": ["0.80"],
+      "evidenceFiles": [
+        "packages/agent/CHANGELOG.md",
+        "packages/ai/CHANGELOG.md",
+        "packages/coding-agent/CHANGELOG.md"
+      ]
+    },
+    {
+      "id": "0.82",
+      "path": "evolution/0.82.md",
+      "dependsOn": ["0.81"],
+      "evidenceFiles": [
+        "packages/agent/CHANGELOG.md",
+        "packages/ai/CHANGELOG.md",
+        "packages/coding-agent/CHANGELOG.md"
+      ]
+    },
+    {
+      "id": "0.83",
+      "path": "evolution/0.83.md",
+      "dependsOn": ["0.82"],
+      "evidenceFiles": [
+        "packages/ai/CHANGELOG.md",
+        "packages/coding-agent/CHANGELOG.md"
+      ]
+    },
+    {
+      "id": "0.84",
+      "path": "evolution/0.84.md",
+      "dependsOn": ["0.83"],
+      "evidenceFiles": [
+        "packages/agent/CHANGELOG.md",
+        "packages/ai/CHANGELOG.md",
+        "packages/coding-agent/CHANGELOG.md",
+        "packages/tui/CHANGELOG.md",
+        "packages/agent/src/harness/agent-harness.ts",
+        "packages/coding-agent/src/core/model-runtime.ts"
+      ]
+    },
+    {
+      "id": "migration-map",
+      "path": "evolution/migration-map.md",
+      "dependsOn": ["0.84"],
+      "evidenceFiles": [
+        "integrations/rag-ime-runtime-host/README.md",
+        "packages/agent/src/harness/agent-harness.ts"
+      ]
+    }
+  ],
+  "deepDives": [
+    {
+      "id": "01",
+      "path": "deep-dives/01-runtime-call-graph.md",
+      "dependsOn": ["lesson:05"],
+      "evidenceFiles": [
+        "packages/coding-agent/src/core/sdk.ts",
+        "packages/coding-agent/src/core/agent-session.ts",
+        "packages/agent/src/agent.ts",
+        "packages/agent/src/agent-loop.ts"
+      ]
+    },
+    {
+      "id": "02",
+      "path": "deep-dives/02-event-lifecycle-settlement.md",
+      "dependsOn": ["deep:01"],
+      "evidenceFiles": [
+        "packages/agent/src/agent.ts",
+        "packages/coding-agent/src/core/agent-session.ts"
+      ]
+    },
+    {
+      "id": "03",
+      "path": "deep-dives/03-tool-execution-side-effects.md",
+      "dependsOn": ["deep:01", "deep:02"],
+      "evidenceFiles": [
+        "packages/agent/src/agent-loop.ts",
+        "packages/agent/src/types.ts"
+      ]
+    },
+    {
+      "id": "04",
+      "path": "deep-dives/04-session-tree-jsonl.md",
+      "dependsOn": ["deep:02"],
+      "evidenceFiles": [
+        "packages/coding-agent/src/core/session-manager.ts",
+        "packages/coding-agent/src/core/agent-session-runtime.ts"
+      ]
+    },
+    {
+      "id": "05",
+      "path": "deep-dives/05-compaction-retry-recovery.md",
+      "dependsOn": ["deep:02", "deep:04"],
+      "evidenceFiles": [
+        "packages/coding-agent/src/core/compaction/compaction.ts",
+        "packages/coding-agent/src/core/agent-session.ts"
+      ]
+    },
+    {
+      "id": "06",
+      "path": "deep-dives/06-model-provider-auth-cache.md",
+      "dependsOn": ["deep:01", "evolution:0.84"],
+      "evidenceFiles": [
+        "packages/coding-agent/src/core/model-runtime.ts",
+        "packages/coding-agent/src/core/provider-composer.ts",
+        "packages/ai/CHANGELOG.md"
+      ]
+    },
+    {
+      "id": "07",
+      "path": "deep-dives/07-extension-skill-tool-boundaries.md",
+      "dependsOn": ["deep:03", "deep:06"],
+      "evidenceFiles": [
+        "packages/coding-agent/src/core/resource-loader.ts",
+        "packages/coding-agent/src/core/extensions/types.ts",
+        "packages/coding-agent/src/core/skills.ts"
+      ]
+    },
+    {
+      "id": "08",
+      "path": "deep-dives/08-runtime-host-protocol-concurrency.md",
+      "dependsOn": ["deep:02", "deep:03", "deep:04", "deep:07"],
+      "evidenceFiles": [
+        "integrations/rag-ime-runtime-host/src/jsonl-framing.ts",
+        "integrations/rag-ime-runtime-host/src/request-dispatcher.ts",
+        "integrations/rag-ime-runtime-host/src/runtime-host.ts",
+        "integrations/rag-ime-runtime-host/src/session-pool.ts"
+      ]
+    },
+    {
+      "id": "09",
+      "path": "deep-dives/09-tui-event-rendering.md",
+      "dependsOn": ["deep:02", "deep:08"],
+      "evidenceFiles": [
+        "packages/tui/src/tui.ts",
+        "packages/coding-agent/src/modes/rpc/",
+        "packages/coding-agent/src/core/agent-session.ts"
+      ]
+    }
+  ],
+  "labs": [
+    {
+      "id": "01",
+      "path": "labs/01-fake-provider-loop/README.md",
+      "dependsOn": ["deep:01", "deep:02", "deep:03"],
+      "codeTarget": "packages/agent/test/course-labs/01-fake-provider-loop.test.ts"
+    },
+    {
+      "id": "02",
+      "path": "labs/02-custom-tool-approval/README.md",
+      "dependsOn": ["lab:01", "deep:03"],
+      "codeTarget": "packages/agent/test/course-labs/02-tool-approval-idempotency.test.ts"
+    },
+    {
+      "id": "03",
+      "path": "labs/03-session-fork-recovery/README.md",
+      "dependsOn": ["deep:04"],
+      "codeTarget": "packages/coding-agent/test/course-labs/03-session-tree-recovery.test.ts"
+    },
+    {
+      "id": "04",
+      "path": "labs/04-long-run-compaction/README.md",
+      "dependsOn": ["deep:05", "lab:01"],
+      "codeTarget": "packages/coding-agent/test/course-labs/04-compaction-math.test.ts"
+    },
+    {
+      "id": "05",
+      "path": "labs/05-runtime-host-client/README.md",
+      "dependsOn": ["deep:08", "deep:09"],
+      "codeTarget": "integrations/rag-ime-runtime-host/test/course-labs/05-runtime-client.test.ts"
+    },
+    {
+      "id": "06",
+      "path": "labs/06-data-preparation-agent/README.md",
+      "dependsOn": ["lab:01", "lab:02", "lab:03", "lab:04", "lab:05"],
+      "codeTarget": "integrations/course-data-agent/"
+    }
+  ],
+  "project": [
+    {
+      "id": "01",
+      "path": "project/01-requirements-boundaries.md",
+      "dependsOn": ["lab:06"]
+    },
+    {
+      "id": "02",
+      "path": "project/02-domain-session-data-model.md",
+      "dependsOn": ["project:01"]
+    },
+    {
+      "id": "03",
+      "path": "project/03-protocol-idempotency.md",
+      "dependsOn": ["project:01", "project:02", "deep:08", "deep:09"]
+    },
+    {
+      "id": "04",
+      "path": "project/04-implementation-plan.md",
+      "dependsOn": ["project:01", "project:02", "project:03"]
+    },
+    {
+      "id": "05",
+      "path": "project/05-test-failure-matrix.md",
+      "dependsOn": ["project:04"]
+    },
+    {
+      "id": "06",
+      "path": "project/06-debugging-playbook.md",
+      "dependsOn": ["project:05"]
+    },
+    {
+      "id": "07",
+      "path": "project/07-demo-and-interview.md",
+      "dependsOn": ["project:04", "project:05", "project:06"]
+    }
+  ],
+  "completionEvidence": [
+    "EVENT_TRACE.jsonl",
+    "FAILURE_MATRIX.md",
+    "TEST_RESULTS.md",
+    "ARCHITECTURE.md",
+    "Product database schema and recovery evidence",
+    "Compaction and Fork evidence",
+    "Final dataset report and artifact checksums",
+    "Five-minute demo and 90-second explanation"
   ]
 }
