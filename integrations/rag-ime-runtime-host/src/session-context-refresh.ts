@@ -1,6 +1,5 @@
 import type { ExtensionFactory } from "@earendil-works/pi-coding-agent";
 import { type BackendToolBridgeOptions, requestProductGateway } from "./tool-bridge.ts";
-import { replaceRuntimeSessionContext } from "./transient-context.ts";
 
 interface SessionContextRefreshOptions {
 	bridge: BackendToolBridgeOptions;
@@ -46,12 +45,12 @@ export function createSessionContextRefreshExtension(options: SessionContextRefr
 			if (options.getSessionContext().trim()) return;
 			await refresh("session_start", event.prompt);
 		});
-		pi.on("session_compact", async (event, ctx) => {
-			const context = await refresh("compaction", "", event.compactionEntry.summary);
-			if (!context) return;
-			return {
-				systemPrompt: replaceRuntimeSessionContext(ctx.getSystemPrompt(), context),
-			};
+		pi.on("session_compact", async (event) => {
+			// Upstream 0.84 owns compaction settlement and no longer accepts a
+			// system-prompt return value from session_compact handlers. Refresh the
+			// product-owned Session context here; the normal before_agent_start
+			// composition injects it into the next provider run.
+			await refresh("compaction", "", event.compactionEntry.summary);
 		});
 	};
 }

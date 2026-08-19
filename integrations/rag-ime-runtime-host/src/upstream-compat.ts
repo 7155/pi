@@ -18,11 +18,16 @@ if (typeof prototype.setRegisteredToolExecutionEnabled !== "function") {
 	Object.defineProperty(prototype, "setRegisteredToolExecutionEnabled", {
 		configurable: true,
 		writable: true,
-		value(_enabled: boolean): void {
+		value(this: AgentSession, enabled: boolean): void {
 			// Pi 0.84 carries newly activated schemas through ToolResultMessage
-			// addedToolNames. The product adapter now emits that field from
-			// tool_load, so the old execution-only registry hook is intentionally
-			// a no-op on the upstream runtime.
+			// addedToolNames. Preserve the old introspection field for product
+			// diagnostics, but do not patch the upstream agent loop or Provider
+			// context. Actual disclosure is owned by active tools + addedToolNames.
+			const agent = (this as unknown as { agent?: Record<string, unknown> }).agent;
+			if (!agent) return;
+			agent.resolveToolForExecution = enabled
+				? (name: string) => this.getAllTools().find((tool) => tool.name === name)
+				: undefined;
 		},
 	});
 }
