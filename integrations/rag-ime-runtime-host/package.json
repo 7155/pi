@@ -1,0 +1,35 @@
+{
+	"name": "@earendil-works/pi-rag-ime-runtime-host",
+	"version": "0.84.2",
+	"description": "Product-owned Pi runtime adapter for Wisdom Weasel and PAW integrations",
+	"license": "MIT",
+	"type": "module",
+	"private": true,
+	"bin": {
+		"rag-ime-runtime-host": "dist/cli.js"
+	},
+	"main": "./dist/index.js",
+	"types": "./dist/index.d.ts",
+	"exports": {
+		".": {
+			"types": "./dist/index.d.ts",
+			"import": "./dist/index.js"
+		}
+	},
+	"files": [
+		"dist",
+		"README.md"
+	],
+	"scripts": {
+		"clean": "node -e \"require('node:fs').rmSync('dist',{recursive:true,force:true})\"",
+		"build": "cd ../.. && npm run build:rag-ime-runtime-host",
+		"test": "cd ../.. && npm run test:rag-ime-runtime-host"
+	},
+	"dependencies": {
+		"@earendil-works/pi-ai": "0.84.2",
+		"@earendil-works/pi-coding-agent": "0.84.2"
+	},
+	"engines": {
+		"node": ">=22.19.0"
+	}
+}
