@@ -138,11 +138,7 @@ function completedWorkflowDetails(event: ToolResultEvent): Record<string, unknow
 			: "",
 	].filter(Boolean);
 	if (completed.length === 0) return undefined;
-	return {
-		completionKey: completed.join("|"),
-		plan,
-		goal,
-	};
+	return { completionKey: completed.join("|"), plan, goal };
 }
 
 function textFromContent(content: unknown): string {
@@ -242,10 +238,7 @@ export function createLifecycleHookController(options: LifecycleHookOptions): Li
 		};
 		const temporary = `${stateFile}.tmp-${process.pid}-${Date.now()}`;
 		try {
-			await writeFile(temporary, `${JSON.stringify(state)}\n`, {
-				encoding: "utf8",
-				mode: 0o600,
-			});
+			await writeFile(temporary, `${JSON.stringify(state)}\n`, { encoding: "utf8", mode: 0o600 });
 			await rename(temporary, stateFile);
 		} finally {
 			try {
@@ -312,8 +305,7 @@ export function createLifecycleHookController(options: LifecycleHookOptions): Li
 					pendingEvents.delete(eventId);
 					await persistPending();
 				} catch {
-					// Preserve ordering and retry the same stable event on the next
-					// lifecycle opportunity instead of minting a duplicate event.
+					// Preserve ordering and retry the same stable event later.
 					break;
 				}
 			}
@@ -391,8 +383,7 @@ export function createLifecycleHookController(options: LifecycleHookOptions): Li
 				{ completionKey },
 			);
 		} catch {
-			// The stable envelope was persisted before delivery and remains queued
-			// for startup or the next lifecycle opportunity.
+			// The stable envelope was persisted before delivery and remains queued.
 		}
 	}
 
@@ -412,8 +403,7 @@ export function createLifecycleHookController(options: LifecycleHookOptions): Li
 						"session_start",
 					);
 				} catch {
-					// Hooks are optional automation. A Sidecar outage must not
-					// block the user's first provider request.
+					// Sidecar outages must not block the first provider request.
 				}
 			}
 			if (!pendingContext) return;
@@ -444,32 +434,57 @@ export function createLifecycleHookController(options: LifecycleHookOptions): Li
 			}
 		});
 
-		pi.on("session_compact", async (event, ctx) => {
+		pi.on("session_compact", async (event) => {
 			const summary = redactSensitiveText(event.compactionEntry.summary, 800);
 			try {
 				await send(
 					"compaction",
 					{
+						status: "completed",
 						reason: event.reason,
 						willRetry: event.willRetry,
 						summary,
 						facts: summary ? [{ text: summary, evidence: `pi-compaction:${event.reason}` }] : [],
 					},
 					{
+						status: "completed",
 						reason: event.reason,
 						summarySha256: digest(summary),
 						willRetry: event.willRetry,
 					},
 				);
 			} catch {
-				return undefined;
+				// Persisted outbox state will retry this event later.
 			}
-			if (!pendingContext) return undefined;
-			const context = pendingContext;
-			pendingContext = "";
-			return {
-				systemPrompt: replaceHookBlock(ctx.getSystemPrompt(), context, (options.now ?? (() => new Date()))()),
-			};
+			// Upstream 0.84 owns compaction settlement. Any nextTurnContext from
+			// the product remains pending and is injected by before_agent_start.
+		});
+
+		pi.on("session_compact_failed", async (event) => {
+			const errorSummary = redactSensitiveText(event.errorMessage ?? "", 400);
+			try {
+				await send(
+					"compaction",
+					{
+						status: event.aborted ? "aborted" : "failed",
+						reason: event.reason,
+						willRetry: event.willRetry,
+						fromExtension: event.fromExtension,
+						errorSummary,
+						facts: [],
+						auditOnly: true,
+					},
+					{
+						status: event.aborted ? "aborted" : "failed",
+						reason: event.reason,
+						willRetry: event.willRetry,
+						fromExtension: event.fromExtension,
+						errorSha256: digest(errorSummary),
+					},
+				);
+			} catch {
+				// Persisted outbox state will retry this event later.
+			}
 		});
 
 		pi.on("tool_result", async (event: ToolResultEvent) => {
@@ -517,10 +532,7 @@ export function createLifecycleHookController(options: LifecycleHookOptions): Li
 		.then((restoredEventCount) => (restoredEventCount > 0 ? flushPending() : undefined))
 		.catch(() => undefined);
 
-	return {
-		extension,
-		projectComplete,
-	};
+	return { extension, projectComplete };
 }
 
 export { replaceHookBlock };
