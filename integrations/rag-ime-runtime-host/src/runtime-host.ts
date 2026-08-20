@@ -4,21 +4,30 @@ import { homedir } from "node:os";
 import { delimiter, join, isAbsolute as pathIsAbsolute, relative, resolve, sep } from "node:path";
 import {
 	type Api,
+	type AssistantMessage,
 	type Context,
 	getSupportedThinkingLevels,
 	type Model,
 	type ModelThinkingLevel,
 } from "@earendil-works/pi-ai";
-import { ModelRuntime } from "@earendil-works/pi-coding-agent";
-import { PiProductSession } from "./pi-session.ts";
+import { configureHttpDispatcher, ModelRuntime } from "@earendil-works/pi-coding-agent";
+import { pendingRoomCancellationSurfaces, roomCancellationSurfaces } from "./cancellation-receipts.ts";
+import { listBundledPiPackages } from "./bundled-package-catalog.ts";
+import { NativePiPackageManager } from "./native-package-manager.ts";
+import { PiProductSession, type PiSessionAbortReceipt } from "./pi-session.ts";
 import { ManagedPluginManager } from "./plugin-manager.ts";
 import {
 	PROTOCOL_NAME,
 	PROTOCOL_VERSION,
+	parseRoomCancelParams,
+	type RoomCancelParams,
 	type RuntimeEventEnvelope,
 	RuntimeProtocolError,
 	type RuntimeRequest,
+	sameRoomCancelLineage,
 } from "./protocol.ts";
+import type { RoomResourceLimits } from "./room-resource-limits.ts";
+import { RunScope } from "./runtime-primitives.ts";
 import { BoundedSessionPool } from "./session-pool.ts";
 import {
 	codexPluginSkillCatalogNames,
@@ -26,20 +35,36 @@ import {
 	type SkillRoutingCardCatalog,
 } from "./skill-routing-cards.ts";
 import { decodeRuntimePrompt } from "./transient-context.ts";
+import { PI_RUNTIME_BASELINE } from "./runtime-baseline.ts";
 
 const HOST_VERSION = "1.0.0";
 const SESSION_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,199}$/;
 const COMPLETION_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,199}$/;
 const THINKING_LEVELS = new Set<ModelThinkingLevel>(["off", "minimal", "low", "medium", "high", "xhigh", "max"]);
-const STATELESS_THINKING_LEVELS = new Set<ModelThinkingLevel>([
-	"off",
-	"minimal",
-	"low",
-	"medium",
-	"high",
-	"xhigh",
-	"max",
-]);
+
+export const RUNTIME_PRIMITIVE_CAPABILITIES = Object.freeze({
+	continuationEnvelope: "2",
+	continuationLease: "1",
+	cancelScope: "1",
+	runScope: "1",
+	agentSettledReceipt: "2",
+	contextProvider: "1",
+	sessionAwaitSettled: true,
+	sessionSettlementGet: true,
+	sessionContinuationQueue: true,
+	sessionCancelOperationRegistry: true,
+	sessionCancelOperations: Object.freeze({
+		provider: true,
+		tool: true,
+		retrySleep: true,
+		manualCompaction: true,
+		autoCompaction: true,
+		branchSummary: true,
+		bashProcess: true,
+		continuationTimer: true,
+	}),
+	roomTypes: true,
+});
 
 export interface RuntimeHostOptions {
 	agentDir: string;
@@ -57,6 +82,27 @@ export interface RuntimeHostOptions {
 	allowedWorkspaceRoots?: string[];
 	modelRuntime?: ModelRuntime;
 	emitEvent(event: RuntimeEventEnvelope): void;
+}
+
+interface RoomCancelOperation {
+	lineage: RoomCancelParams;
+	cancelled?: { cancelledIds: string[]; abortRequired: boolean };
+	receipt?: Record<string, unknown>;
+	inFlight?: Promise<Record<string, unknown>>;
+	abortAttempt?: RoomAbortAttempt;
+}
+
+interface RoomAbortAttempt {
+	status: "pending" | "settled" | "failed";
+	completion: Promise<void>;
+	receipt?: PiSessionAbortReceipt;
+	error?: unknown;
+}
+
+const ROOM_CANCEL_ACK_TIMEOUT_MS = 1_000;
+
+function roomCancelFenceKey(lineage: Pick<RoomCancelParams, "sessionId" | "rootId" | "dispatchId">): string {
+	return `${lineage.sessionId}\u001f${lineage.rootId}\u001f${lineage.dispatchId}`;
 }
 
 function requiredString(params: Record<string, unknown>, key: string, maximum = 4096): string {
@@ -122,6 +168,116 @@ function optionalTimeoutMs(params: Record<string, unknown>): number {
 	return value;
 }
 
+function requiredGeneration(params: Record<string, unknown>): number {
+	return requiredNonNegativeInteger(params, "generation");
+}
+
+function requiredNonNegativeInteger(params: Record<string, unknown>, key: string): number {
+	const value = params[key];
+	if (typeof value !== "number" || !Number.isSafeInteger(value) || value < 0) {
+		throw new RuntimeProtocolError("INVALID_PARAMS", `${key} must be a non-negative safe integer`);
+	}
+	return value;
+}
+
+function optionalRoomCapability(params: Record<string, unknown>): Record<string, unknown> | undefined {
+	const value = params.roomCapability;
+	if (value === undefined || value === null) return undefined;
+	if (typeof value !== "object" || Array.isArray(value)) {
+		throw new RuntimeProtocolError("INVALID_PARAMS", "roomCapability must be an object");
+	}
+	const record = value as Record<string, unknown>;
+	for (const key of ["manifestId", "promptCompileReceiptId", "promptPlanHash"] as const) {
+		if (typeof record[key] !== "string" || !record[key]) {
+			throw new RuntimeProtocolError("INVALID_PARAMS", `roomCapability.${key} is required`);
+		}
+	}
+	if (typeof record.manifestHash !== "string" || !/^[a-f0-9]{64}$/u.test(record.manifestHash)) {
+		throw new RuntimeProtocolError("INVALID_PARAMS", "roomCapability.manifestHash must be sha256 hex");
+	}
+	if (
+		typeof record.capabilityEpoch !== "number" ||
+		!Number.isSafeInteger(record.capabilityEpoch) ||
+		record.capabilityEpoch < 0
+	) {
+		throw new RuntimeProtocolError("INVALID_PARAMS", "roomCapability.capabilityEpoch is invalid");
+	}
+	if (
+		record.contextEpoch !== undefined &&
+		(typeof record.contextEpoch !== "number" || !Number.isSafeInteger(record.contextEpoch) || record.contextEpoch < 1)
+	) {
+		throw new RuntimeProtocolError("INVALID_PARAMS", "roomCapability.contextEpoch is invalid");
+	}
+	return structuredClone(record);
+}
+
+function optionalRoomProviderContext(params: Record<string, unknown>): Record<string, unknown> | undefined {
+	const value = params.roomProviderContext;
+	if (value === undefined || value === null) return undefined;
+	if (typeof value !== "object" || Array.isArray(value)) {
+		throw new RuntimeProtocolError("INVALID_PARAMS", "roomProviderContext must be an object");
+	}
+	const record = value as Record<string, unknown>;
+	for (const key of ["journalId", "projectionHash"] as const) {
+		if (typeof record[key] !== "string" || !record[key]) {
+			throw new RuntimeProtocolError("INVALID_PARAMS", `roomProviderContext.${key} is required`);
+		}
+	}
+	if (
+		typeof record.throughSequence !== "number" ||
+		!Number.isSafeInteger(record.throughSequence) ||
+		record.throughSequence < 0
+	) {
+		throw new RuntimeProtocolError("INVALID_PARAMS", "roomProviderContext.throughSequence is invalid");
+	}
+	return structuredClone(record);
+}
+
+function optionalRoomSkillPolicy(params: Record<string, unknown>): Record<string, unknown> | undefined {
+	const value = params.roomSkillPolicy;
+	if (value === undefined || value === null) return undefined;
+	if (typeof value !== "object" || Array.isArray(value)) {
+		throw new RuntimeProtocolError("INVALID_PARAMS", "roomSkillPolicy must be an object");
+	}
+	const record = value as Record<string, unknown>;
+	if (record.selection !== "required" || typeof record.skillId !== "string" || !record.skillId) {
+		throw new RuntimeProtocolError("INVALID_PARAMS", "roomSkillPolicy must name one required Skill");
+	}
+	if (typeof record.skillHash !== "string" || !/^[a-f0-9]{64}$/u.test(record.skillHash)) {
+		throw new RuntimeProtocolError("INVALID_PARAMS", "roomSkillPolicy.skillHash must be sha256 hex");
+	}
+	return structuredClone(record);
+}
+
+function optionalRoomResourceLimits(params: Record<string, unknown>): RoomResourceLimits | undefined {
+	const value = params.roomResourceLimits;
+	if (value === undefined || value === null) return undefined;
+	if (typeof value !== "object" || Array.isArray(value)) {
+		throw new RuntimeProtocolError("INVALID_PARAMS", "roomResourceLimits must be an object");
+	}
+	const record = value as Record<string, unknown>;
+	const result = {} as RoomResourceLimits;
+	for (const key of ["deadlineAtMs", "maxOutputTokens", "maxToolCost", "retryRemaining", "repairRemaining"] as const) {
+		const entry = record[key];
+		if (typeof entry !== "number" || !Number.isSafeInteger(entry) || entry < 0) {
+			throw new RuntimeProtocolError("INVALID_PARAMS", `roomResourceLimits.${key} is invalid`);
+		}
+		result[key] = entry;
+	}
+	for (const key of ["maxInputTokens", "maxToolCalls"] as const) {
+		const entry = record[key];
+		if (entry === undefined) continue;
+		if (typeof entry !== "number" || !Number.isSafeInteger(entry) || entry < 1) {
+			throw new RuntimeProtocolError("INVALID_PARAMS", `roomResourceLimits.${key} is invalid`);
+		}
+		result[key] = entry;
+	}
+	if (result.deadlineAtMs <= Date.now() || result.maxOutputTokens < 1) {
+		throw new RuntimeProtocolError("ROOM_RESOURCE_LIMIT_EXHAUSTED", "Room resource limit is already exhausted");
+	}
+	return result;
+}
+
 function isInside(root: string, candidate: string): boolean {
 	const child = relative(root, candidate);
 	return child === "" || (!child.startsWith(`..${sep}`) && child !== ".." && !pathIsAbsolute(child));
@@ -145,9 +301,14 @@ export class RagImeRuntimeHost {
 	readonly modelRuntime: ModelRuntime;
 	readonly sessions: BoundedSessionPool<PiProductSession>;
 	readonly plugins: ManagedPluginManager;
+	readonly nativePackages: NativePiPackageManager;
 	private readonly options: RuntimeHostOptions;
 	private readonly allowedWorkspaceRoots: string[];
-	private readonly completions = new Map<string, AbortController>();
+	private readonly completions = new Map<string, RunScope>();
+	private readonly roomReceipts = new Map<string, Record<string, unknown>>();
+	private readonly roomCancelOperations = new Map<string, RoomCancelOperation>();
+	private readonly roomCancelFences = new Map<string, RoomCancelParams>();
+	private completionSequence = 0;
 
 	private constructor(options: RuntimeHostOptions, modelRuntime: ModelRuntime) {
 		this.options = options;
@@ -158,7 +319,13 @@ export class RagImeRuntimeHost {
 			inboxRoot: options.pluginInbox,
 			approvalToken: options.pluginApprovalToken,
 		});
-		this.allowedWorkspaceRoots = (options.allowedWorkspaceRoots ?? []).map((path) => resolve(path));
+		this.nativePackages = new NativePiPackageManager({
+			agentDir: options.agentDir,
+			inboxRoot: options.pluginInbox,
+			pluginsRoot: options.pluginsRoot,
+			approvalToken: options.pluginApprovalToken,
+		});
+		this.allowedWorkspaceRoots = [...(options.allowedWorkspaceRoots ?? [])];
 	}
 
 	static async create(options: RuntimeHostOptions): Promise<RagImeRuntimeHost> {
@@ -168,6 +335,19 @@ export class RagImeRuntimeHost {
 			mkdir(options.pluginsRoot, { recursive: true, mode: 0o700 }),
 			mkdir(options.pluginInbox, { recursive: true, mode: 0o700 }),
 		]);
+		if (!options.modelRuntime) {
+			// Importing coding-agent loads npm undici, whose default dispatcher
+			// replaces Node's env-aware dispatcher. Reinstall Pi's configured
+			// dispatcher before creating the production model runtime so both
+			// WebSocket and SSE Provider traffic honor HTTP(S)_PROXY.
+			configureHttpDispatcher();
+		}
+		const allowedWorkspaceRoots = [
+			...new Set(
+				await Promise.all((options.allowedWorkspaceRoots ?? []).map(async (path) => realpath(resolve(path)))),
+			),
+		];
+		const canonicalOptions = { ...options, allowedWorkspaceRoots };
 		const modelRuntime =
 			options.modelRuntime ??
 			(await ModelRuntime.create({
@@ -175,19 +355,49 @@ export class RagImeRuntimeHost {
 				modelsPath: join(options.agentDir, "models.json"),
 				allowModelNetwork: false,
 			}));
-		const host = new RagImeRuntimeHost(options, modelRuntime);
-		await host.plugins.initialize();
+		const host = new RagImeRuntimeHost(canonicalOptions, modelRuntime);
+		await Promise.all([host.plugins.initialize(), host.nativePackages.initialize()]);
 		return host;
 	}
 
 	async dispose(): Promise<void> {
-		for (const controller of this.completions.values()) controller.abort();
+		await Promise.all(
+			[...this.completions.values()].map(async (scope) => {
+				await scope.cancel("runtime_host_disposed");
+			}),
+		);
 		this.completions.clear();
+		this.roomReceipts.clear();
+		this.roomCancelOperations.clear();
+		this.roomCancelFences.clear();
 		await this.sessions.dispose();
+	}
+
+	private clearRoomStateForSession(sessionId: string): void {
+		for (const [key, receipt] of this.roomReceipts) {
+			if (receipt.sessionId === sessionId) this.roomReceipts.delete(key);
+		}
+		for (const [cancelId, operation] of this.roomCancelOperations) {
+			if (operation.lineage.sessionId === sessionId) this.roomCancelOperations.delete(cancelId);
+		}
+		for (const [key, lineage] of this.roomCancelFences) {
+			if (lineage.sessionId === sessionId) this.roomCancelFences.delete(key);
+		}
 	}
 
 	private params(request: RuntimeRequest): Record<string, unknown> {
 		return request.params ?? {};
+	}
+
+	private emitCompletionNotice(requestId: string, payload: Record<string, unknown>): void {
+		this.completionSequence += 1;
+		this.options.emitEvent({
+			protocolVersion: PROTOCOL_VERSION,
+			event: "runtime.notice",
+			sessionId: requestId,
+			sequence: this.completionSequence,
+			payload: { requestId, ...payload },
+		});
 	}
 
 	private session(params: Record<string, unknown>): PiProductSession {
@@ -195,6 +405,88 @@ export class RagImeRuntimeHost {
 		const session = this.sessions.get(sessionId);
 		if (!session) throw new RuntimeProtocolError("SESSION_NOT_FOUND", `Session is not open: ${sessionId}`);
 		return session;
+	}
+
+	private async applyRoomCancel(
+		lineage: RoomCancelParams,
+		operation: RoomCancelOperation,
+		target: PiProductSession,
+	): Promise<Record<string, unknown>> {
+		operation.cancelled ??= target.cancelRoom(lineage);
+		let abortAttempt = operation.abortAttempt;
+		if (operation.cancelled.abortRequired && !abortAttempt) {
+			abortAttempt = {
+				status: "pending",
+				completion: Promise.resolve(),
+			};
+			const activeAttempt = abortAttempt;
+			activeAttempt.completion = target.abortRoom(lineage).then(
+				(receipt) => {
+					activeAttempt.receipt = receipt;
+					activeAttempt.status = "settled";
+				},
+				(error: unknown) => {
+					activeAttempt.error = error;
+					activeAttempt.status = "failed";
+				},
+			);
+			operation.abortAttempt = activeAttempt;
+		}
+		if (abortAttempt?.status === "pending") {
+			let timeout: ReturnType<typeof setTimeout> | undefined;
+			try {
+				await Promise.race([
+					abortAttempt.completion,
+					new Promise<void>((resolve) => {
+						timeout = setTimeout(resolve, ROOM_CANCEL_ACK_TIMEOUT_MS);
+					}),
+				]);
+			} finally {
+				if (timeout) clearTimeout(timeout);
+			}
+		}
+		if (abortAttempt?.status === "failed") {
+			operation.abortAttempt = undefined;
+			throw abortAttempt.error;
+		}
+		const abortReceipt = abortAttempt?.status === "settled" ? abortAttempt.receipt : undefined;
+		if (abortReceipt && abortReceipt.turnId !== lineage.turnId) {
+			operation.abortAttempt = undefined;
+			throw new RuntimeProtocolError(
+				"ROOM_CANCEL_LINEAGE_MISMATCH",
+				"Room abort receipt does not match the requested active turn",
+			);
+		}
+		const cancellationSurfaces = roomCancellationSurfaces(
+			lineage.sessionId,
+			operation.cancelled.cancelledIds,
+			abortReceipt,
+		);
+		if (operation.cancelled.abortRequired && abortAttempt?.status === "pending") {
+			for (const proof of Object.values(cancellationSurfaces)) proof.state = "requested";
+		}
+		const pendingTargets = pendingRoomCancellationSurfaces(cancellationSurfaces);
+		const receipt = {
+			schemaVersion: "wisdom-weasel.room-runtime-receipt.v1",
+			receiptKind: "cancel_applied",
+			status: "applied",
+			cancelId: lineage.cancelId,
+			rootId: lineage.rootId,
+			dispatchId: lineage.dispatchId,
+			generation: lineage.generation,
+			sessionId: lineage.sessionId,
+			turnId: lineage.turnId,
+			capabilityEpoch: lineage.capabilityEpoch,
+			cancelledContinuationIds: [...operation.cancelled.cancelledIds],
+			activeRunAborted: operation.cancelled.abortRequired,
+			pendingTargets,
+			cancellationSurfaces,
+			sessionAbortReceipt: abortReceipt,
+		};
+		operation.receipt = receipt;
+		if (abortAttempt?.status === "settled") operation.abortAttempt = undefined;
+		if (pendingTargets.length === 0) target.finishRoomCancel(lineage.rootId, lineage.generation, lineage.cancelId);
+		return receipt;
 	}
 
 	private async workspace(value: unknown): Promise<string> {
@@ -228,16 +520,18 @@ export class RagImeRuntimeHost {
 					protocol: PROTOCOL_NAME,
 					protocolVersion: PROTOCOL_VERSION,
 					hostVersion: HOST_VERSION,
-					piVersion: "0.80.7",
+					piVersion: PI_RUNTIME_BASELINE,
 					capabilities: {
 						multiSession: true,
 						maxSessions: this.sessions.maxSessions,
 						concurrentControlPlane: true,
 						settledEvents: true,
 						dynamicTools: true,
+						sessionControlState: true,
 						sessionSnapshot: true,
 						conversationFork: true,
-						managedPlugins: true,
+							managedPlugins: true,
+							bundledPackageCatalog: true,
 						pluginDrafts: true,
 						managedSkills: true,
 						commandCatalog: true,
@@ -247,6 +541,7 @@ export class RagImeRuntimeHost {
 						activeTurnMessaging: true,
 						statelessCompletion: true,
 						transientContext: true,
+						runtimePrimitives: RUNTIME_PRIMITIVE_CAPABILITIES,
 					},
 				};
 			case "health":
@@ -262,9 +557,9 @@ export class RagImeRuntimeHost {
 				// the live catalog capabilities. Re-read the file on every catalog
 				// request so product clients never need to cache or duplicate them.
 				try {
-					await this.modelRuntime.reloadConfig();
+					await this.modelRuntime.refresh({ allowNetwork: false });
 				} catch {
-					// reloadConfig records configuration and availability failures for
+					// refresh records configuration and availability failures for
 					// the public error field; return the runtime's resulting snapshot.
 				}
 				let models: Model<Api>[];
@@ -282,24 +577,31 @@ export class RagImeRuntimeHost {
 				const modelId = requiredString(params, "modelId", 200);
 				const thinkingLevel = requiredString(params, "thinkingLevel", 20) as ModelThinkingLevel;
 				const timeoutMs = optionalTimeoutMs(params);
-				if (!STATELESS_THINKING_LEVELS.has(thinkingLevel)) {
-					throw new RuntimeProtocolError(
-						"INVALID_PARAMS",
-						"Stateless completion received an unsupported thinking level",
-					);
+				if (!THINKING_LEVELS.has(thinkingLevel)) {
+					throw new RuntimeProtocolError("INVALID_PARAMS", `Unsupported thinkingLevel: ${thinkingLevel}`);
 				}
 				if (this.completions.has(requestId)) {
 					throw new RuntimeProtocolError("REQUEST_ALREADY_ACTIVE", `Completion is already active: ${requestId}`);
 				}
 
-				const controller = new AbortController();
-				this.completions.set(requestId, controller);
+				const completionScope = new RunScope({
+					scopeId: `completion:${requestId}`,
+					sessionId: `stateless:${requestId}`,
+					runId: `completion:${requestId}`,
+					kind: "prompt",
+				});
+				const releaseProvider = completionScope.register({
+					operationId: `provider:${requestId}`,
+					kind: "provider",
+					cancel: () => undefined,
+				});
+				this.completions.set(requestId, completionScope);
 				const started = performance.now();
 				try {
 					// Re-read Pi's local configuration for every request. The product only
 					// stores a model reference; Pi remains the model/capability authority.
 					try {
-						await this.modelRuntime.reloadConfig();
+						await this.modelRuntime.refresh({ allowNetwork: false });
 					} catch {
 						// Use the resulting availability snapshot so the caller receives the
 						// concrete model/configuration error below instead of stale metadata.
@@ -330,7 +632,7 @@ export class RagImeRuntimeHost {
 							"Stateless completion does not accept images; provide semantic Context Packet text",
 						);
 					}
-					if (controller.signal.aborted) {
+					if (completionScope.signal.aborted) {
 						throw new RuntimeProtocolError("REQUEST_ABORTED", "Stateless completion was cancelled");
 					}
 					const message = requiredString(params, "message", 64_000);
@@ -343,14 +645,86 @@ export class RagImeRuntimeHost {
 							},
 						],
 					};
-					const response = await this.modelRuntime.completeSimple(model, context, {
-						...(thinkingLevel === "off" ? {} : { reasoning: thinkingLevel }),
+					const reasoning = thinkingLevel === "off" ? undefined : thinkingLevel;
+					const stream = this.modelRuntime.streamSimple(model, context, {
+						...(reasoning ? { reasoning } : {}),
 						cacheRetention: "none",
 						maxRetries: 0,
 						maxTokens: Math.min(model.maxTokens, 4096),
-						signal: controller.signal,
+						signal: completionScope.signal,
 						timeoutMs,
 					});
+					let response: AssistantMessage | undefined;
+					let firstTokenMs = 0;
+					let reasoningStartedAtMs = 0;
+					let reasoningEndedAtMs = 0;
+					let reasoningChars = 0;
+					let lastReasoningProgressChars = 0;
+					for await (const event of stream) {
+						if (completionScope.signal.aborted) break;
+						if (event.type === "thinking_start") {
+							if (reasoningStartedAtMs <= 0) {
+								reasoningStartedAtMs = Math.max(1, Math.round(performance.now() - started));
+								this.emitCompletionNotice(requestId, {
+									type: "completion_reasoning_progress",
+									phase: "started",
+									totalChars: 0,
+									elapsedMs: reasoningStartedAtMs,
+								});
+							}
+							continue;
+						}
+						if (event.type === "thinking_delta") {
+							reasoningChars += event.delta.length;
+							if (reasoningStartedAtMs <= 0) {
+								reasoningStartedAtMs = Math.max(1, Math.round(performance.now() - started));
+								this.emitCompletionNotice(requestId, {
+									type: "completion_reasoning_progress",
+									phase: "started",
+									totalChars: 0,
+									elapsedMs: reasoningStartedAtMs,
+								});
+							}
+							if (reasoningChars - lastReasoningProgressChars >= 128) {
+								lastReasoningProgressChars = reasoningChars;
+								this.emitCompletionNotice(requestId, {
+									type: "completion_reasoning_progress",
+									phase: "streaming",
+									totalChars: reasoningChars,
+									elapsedMs: Math.max(1, Math.round(performance.now() - started)),
+								});
+							}
+							continue;
+						}
+						if (event.type === "thinking_end") {
+							reasoningChars = Math.max(reasoningChars, event.content.length);
+							reasoningEndedAtMs = Math.max(1, Math.round(performance.now() - started));
+							this.emitCompletionNotice(requestId, {
+								type: "completion_reasoning_progress",
+								phase: "completed",
+								totalChars: reasoningChars,
+								elapsedMs: reasoningEndedAtMs,
+							});
+							continue;
+						}
+						if (event.type === "text_delta" && event.delta) {
+							if (firstTokenMs <= 0) {
+								firstTokenMs = Math.max(1, Math.round(performance.now() - started));
+							}
+							this.emitCompletionNotice(requestId, {
+								type: "completion_text_delta",
+								delta: event.delta,
+								elapsedMs: Math.max(1, Math.round(performance.now() - started)),
+							});
+							continue;
+						}
+						if (event.type === "done") {
+							response = event.message;
+						} else if (event.type === "error") {
+							response = event.error;
+						}
+					}
+					response ??= await stream.result();
 					if (response.stopReason === "error" || response.stopReason === "aborted") {
 						throw new RuntimeProtocolError(
 							response.stopReason === "aborted" ? "REQUEST_ABORTED" : "COMPLETION_FAILED",
@@ -376,17 +750,34 @@ export class RagImeRuntimeHost {
 						thinkingLevel,
 						usage: response.usage,
 						stopReason: response.stopReason,
+						firstTokenMs,
+						reasoningChars,
+						reasoningElapsedMs:
+							reasoningStartedAtMs > 0
+								? Math.max(
+										0,
+										(reasoningEndedAtMs || Math.round(performance.now() - started)) - reasoningStartedAtMs,
+									)
+								: 0,
 						elapsedMs: Math.max(0, Math.round(performance.now() - started)),
 					};
 				} finally {
-					this.completions.delete(requestId);
+					releaseProvider();
+					completionScope.settle();
+					if (this.completions.get(requestId) === completionScope) {
+						this.completions.delete(requestId);
+					}
 				}
 			}
 			case "completion.cancel": {
 				const requestId = completionIdParam(params);
-				const controller = this.completions.get(requestId);
-				controller?.abort();
-				return { requestId, cancelled: controller !== undefined };
+				const scope = this.completions.get(requestId);
+				const scopeReceipt = scope ? await scope.cancel("stateless_completion_cancelled") : undefined;
+				return {
+					requestId,
+					cancelled: scope !== undefined,
+					...(scopeReceipt ? { scopeReceipt } : {}),
+				};
 			}
 			case "session.open": {
 				const sessionId = requiredSessionId(params);
@@ -423,21 +814,57 @@ export class RagImeRuntimeHost {
 						modelId,
 						thinkingLevel: thinking as ModelThinkingLevel | undefined,
 						toolManifest: params.toolManifest ?? [],
+						roomCapability: optionalRoomCapability(params),
 						toolGatewayUrl: this.options.toolGatewayUrl,
 						toolGatewayToken: this.options.toolGatewayToken,
 						systemPrompt: optionalString(params, "systemPrompt", 64_000),
+						sessionContext: optionalString(params, "sessionContext", 256_000),
+						roomContext: optionalString(params, "roomContext", 256_000),
+						roomRecoveryContext: optionalString(params, "roomRecoveryContext", 256_000),
+						roomProviderContext: optionalRoomProviderContext(params),
+						roomSkillPolicy: optionalRoomSkillPolicy(params),
+						roomResourceLimits: optionalRoomResourceLimits(params),
+						isPackageCapabilityEnabled: (capability) => this.nativePackages.hasEnabledCapability(capability),
 						noContextFiles: optionalBoolean(params, "noContextFiles"),
 						emitEvent: this.options.emitEvent,
 					}),
 				);
-				return { snapshot: opened.session.snapshot(), evictedSessionId: opened.evictedSessionId };
+				if (opened.evictedSessionId) this.clearRoomStateForSession(opened.evictedSessionId);
+				return {
+					// Opening a long-lived Session must never serialize its full
+					// transcript onto the shared JSONL control lane. Explicit
+					// session.snapshot remains available to history consumers.
+					snapshot: opened.session.openSnapshot(),
+					evictedSessionId: opened.evictedSessionId,
+					roomSkillLoad: opened.session.roomSkillLoadReceipt(),
+				};
 			}
+			case "session.control_state":
+				return this.session(params).controlState();
+			case "session.settlement.get":
+				return {
+					settlement: this.session(params).settlement(
+						requiredString(params, "turnId", 240),
+						optionalString(params, "clientMessageId", 128),
+					),
+				};
+			case "session.await_settled":
+				return await this.session(params).awaitSettled(requiredString(params, "turnId", 240), {
+					allowSuspended: optionalBoolean(params, "allowSuspended"),
+					timeoutMs: params.timeoutMs === undefined ? undefined : requiredNonNegativeInteger(params, "timeoutMs"),
+					expectedClientMessageId: optionalString(params, "clientMessageId", 128),
+				});
 			case "session.snapshot":
 				return this.session(params).snapshot();
 			case "session.debug.context":
 				return this.session(params).debugContext(optionalString(params, "turnId", 240));
 			case "session.commands":
-				return { commands: this.session(params).listCommands() };
+				return {
+					commands: this.session(params).listCommands(),
+					diagnostics: this.session(params).resourceDiagnostics(),
+				};
+			case "session.command.invoke":
+				return await this.session(params).invokeCommand(requiredString(params, "command", 20_000));
 			case "session.fork.candidates":
 				return { items: this.session(params).forkCandidates() };
 			case "session.fork": {
@@ -473,13 +900,16 @@ export class RagImeRuntimeHost {
 							modelId: profile.modelId,
 							thinkingLevel: profile.thinkingLevel,
 							toolManifest: profile.toolManifest,
+							roomCapability: profile.roomCapability,
 							toolGatewayUrl: this.options.toolGatewayUrl,
 							toolGatewayToken: this.options.toolGatewayToken,
+							isPackageCapabilityEnabled: (capability) => this.nativePackages.hasEnabledCapability(capability),
 							systemPrompt: profile.systemPrompt,
 							noContextFiles: profile.noContextFiles,
 							emitEvent: this.options.emitEvent,
 						}),
 					);
+					if (opened.evictedSessionId) this.clearRoomStateForSession(opened.evictedSessionId);
 					if (!opened.created) {
 						throw new RuntimeProtocolError("SESSION_ALREADY_OPEN", `Session is already open: ${targetSessionId}`);
 					}
@@ -526,8 +956,7 @@ export class RagImeRuntimeHost {
 					images: Array.isArray(params.images) ? (params.images as never) : undefined,
 				});
 			case "session.abort":
-				await this.session(params).abort();
-				return { aborted: true };
+				return this.session(params).abort();
 			case "session.compact":
 				return this.session(params).compact(optionalString(params, "instructions", 4000));
 			case "session.model.set":
@@ -542,8 +971,118 @@ export class RagImeRuntimeHost {
 				}
 				return this.session(params).setThinkingLevel(level as ModelThinkingLevel);
 			}
-			case "session.close":
-				return { closed: await this.sessions.close(requiredSessionId(params)) };
+			case "session.close": {
+				const sessionId = requiredSessionId(params);
+				const closed = await this.sessions.close(sessionId);
+				if (closed) this.clearRoomStateForSession(sessionId);
+				return { closed };
+			}
+			case "room.dispatch": {
+				const sessionId = requiredSessionId(params);
+				const dispatchId = requiredString(params, "dispatchId", 240);
+				const rootId = requiredString(params, "rootId", 240);
+				const generation = requiredGeneration(params);
+				const capabilityEpoch = requiredNonNegativeInteger(params, "capabilityEpoch");
+				const dispatchAttempt = requiredNonNegativeInteger(params, "dispatchAttempt");
+				const idempotencyKey = requiredString(params, "idempotencyKey", 512);
+				const receiptKey = `${rootId}\u001f${idempotencyKey}`;
+				const existing = this.roomReceipts.get(receiptKey);
+				if (existing) return { ...existing, duplicate: true };
+				const cancelFence = this.roomCancelFences.get(roomCancelFenceKey({ sessionId, rootId, dispatchId }));
+				if (cancelFence) {
+					throw new RuntimeProtocolError(
+						"ROOM_DISPATCH_CANCELLED",
+						generation <= cancelFence.generation
+							? "Room Dispatch is cancelling or already cancelled at this generation"
+							: "A cancelled Room Dispatch cannot be resumed; create a new Dispatch identity",
+					);
+				}
+				const accepted = await this.session(params).dispatchRoom({
+					message: requiredString(params, "message", 1_000_000),
+					dispatchId,
+					rootId,
+					generation,
+					capabilityEpoch,
+					dispatchAttempt,
+					sessionContext: optionalString(params, "sessionContext", 256_000),
+					roomContext: optionalString(params, "roomContext", 256_000),
+					roomRecoveryContext: optionalString(params, "roomRecoveryContext", 256_000),
+					roomProviderContext: optionalRoomProviderContext(params),
+					roomCapability: optionalRoomCapability(params),
+					roomResourceLimits: optionalRoomResourceLimits(params),
+				});
+				const receipt = {
+					schemaVersion: "wisdom-weasel.room-runtime-receipt.v1",
+					receiptKind: "dispatch_accepted",
+					status: "accepted",
+					rootId,
+					dispatchId,
+					generation,
+					capabilityEpoch,
+					sessionId,
+					...accepted,
+				};
+				this.roomReceipts.set(receiptKey, receipt);
+				return receipt;
+			}
+			case "room.cancel": {
+				const lineage = parseRoomCancelParams(params);
+				const existingOperation = this.roomCancelOperations.get(lineage.cancelId);
+				if (existingOperation && !sameRoomCancelLineage(existingOperation.lineage, lineage)) {
+					throw new RuntimeProtocolError(
+						"ROOM_CANCEL_LINEAGE_MISMATCH",
+						"Room cancellation reuses cancelId with different runtime lineage",
+					);
+				}
+				if (
+					existingOperation?.receipt &&
+					Array.isArray(existingOperation.receipt.pendingTargets) &&
+					existingOperation.receipt.pendingTargets.length === 0
+				) {
+					return structuredClone(existingOperation.receipt);
+				}
+				const acceptedLineage = [...this.roomReceipts.values()].some(
+					(receipt) =>
+						receipt.receiptKind === "dispatch_accepted" &&
+						receipt.status === "accepted" &&
+						receipt.sessionId === lineage.sessionId &&
+						receipt.rootId === lineage.rootId &&
+						receipt.dispatchId === lineage.dispatchId &&
+						receipt.turnId === lineage.turnId &&
+						receipt.capabilityEpoch === lineage.capabilityEpoch &&
+						typeof receipt.generation === "number" &&
+						receipt.generation <= lineage.generation,
+				);
+				if (!acceptedLineage) {
+					throw new RuntimeProtocolError(
+						"ROOM_CANCEL_LINEAGE_MISMATCH",
+						"Room cancellation does not match an active Room dispatch receipt",
+					);
+				}
+				const target = this.session(params);
+				const operation = existingOperation ?? { lineage: structuredClone(lineage) };
+				if (!existingOperation) {
+					this.roomCancelOperations.set(lineage.cancelId, operation);
+					this.roomCancelFences.set(roomCancelFenceKey(lineage), structuredClone(lineage));
+				}
+				if (operation.inFlight) return structuredClone(await operation.inFlight);
+				const run = this.applyRoomCancel(lineage, operation, target);
+				operation.inFlight = run;
+				try {
+					return structuredClone(await run);
+				} catch (error) {
+					if (!operation.cancelled) {
+						this.roomCancelOperations.delete(lineage.cancelId);
+						const fenceKey = roomCancelFenceKey(lineage);
+						if (this.roomCancelFences.get(fenceKey)?.cancelId === lineage.cancelId) {
+							this.roomCancelFences.delete(fenceKey);
+						}
+					}
+					throw error;
+				} finally {
+					if (operation.inFlight === run) operation.inFlight = undefined;
+				}
+			}
 			case "approval.resolve":
 				return {
 					requestId: this.session(params).resolveDecision(
@@ -574,53 +1113,149 @@ export class RagImeRuntimeHost {
 				return { tools: this.session(params).listTools() };
 			case "tools.sync":
 				return { tools: await this.session(params).syncTools(params.tools) };
-			case "plugins.list":
-				return { plugins: await this.plugins.list() };
+			case "plugins.catalog": {
+				const installed = await this.nativePackages.list();
+				return { packages: await listBundledPiPackages(installed) };
+			}
+			case "plugins.list": {
+				const [legacy, native] = await Promise.all([this.plugins.list(), this.nativePackages.list()]);
+				return { plugins: [...native, ...legacy].sort((left, right) => left.id.localeCompare(right.id)) };
+			}
 			case "plugins.create":
 				return this.plugins.createDraft({
 					draftId: requiredString(params, "draftId", 64),
 					manifest: params.manifest,
 					files: params.files as Record<string, string>,
 				});
+			case "plugins.package.create":
+				return this.nativePackages.createDraft({
+					draftId: requiredString(params, "draftId", 64),
+					packageJson: params.packageJson,
+					files: params.files as Record<string, string>,
+				});
+			case "plugins.package.prepare":
+				return this.nativePackages.prepare(requiredString(params, "source"));
 			case "plugins.validate":
 				return this.plugins.validate(requiredString(params, "sourcePath"));
+			case "plugins.install.preview": {
+				const preparedPackageId = optionalString(params, "preparedPackageId", 240);
+				const sourcePath = optionalString(params, "sourcePath");
+				if (Boolean(preparedPackageId) === Boolean(sourcePath)) {
+					throw new RuntimeProtocolError(
+						"INVALID_PARAMS",
+						"Plugin install preview requires exactly one sourcePath or preparedPackageId",
+					);
+				}
+				return preparedPackageId
+					? this.nativePackages.previewInstall({
+							preparedPackageId,
+							expectedDigest: requiredString(params, "expectedDigest", 64),
+							enable: params.enable === true,
+						})
+					: this.plugins.previewInstall({
+							sourcePath: sourcePath!,
+							expectedDigest: requiredString(params, "expectedDigest", 64),
+							enable: params.enable === true,
+						});
+			}
 			case "plugins.install": {
-				const plugin = await this.plugins.install({
-					sourcePath: requiredString(params, "sourcePath"),
+				const preparedPackageId = optionalString(params, "preparedPackageId", 240);
+				const sourcePath = optionalString(params, "sourcePath");
+				if (Boolean(preparedPackageId) === Boolean(sourcePath)) {
+					throw new RuntimeProtocolError(
+						"INVALID_PARAMS",
+						"Plugin install requires exactly one sourcePath or preparedPackageId",
+					);
+				}
+				const common = {
 					expectedDigest: requiredString(params, "expectedDigest", 64),
 					approvalToken: optionalString(params, "approvalToken", 1024),
 					enable: params.enable === true,
-				});
+					previewToken: requiredString(params, "previewToken", 240),
+					payloadSha256: requiredString(params, "payloadSha256", 64),
+					confirmText: requiredString(params, "confirmText", 32),
+				};
+				const plugin = preparedPackageId
+					? await this.nativePackages.install({ preparedPackageId, ...common })
+					: await this.plugins.install({ sourcePath: sourcePath!, ...common });
 				await this.reloadPlugins();
 				return plugin;
 			}
 			case "plugins.enable": {
-				const plugin = await this.plugins.enable(
-					requiredString(params, "pluginId", 64),
-					optionalString(params, "approvalToken", 1024),
-					requiredString(params, "expectedActiveDigest", 64),
-					requiredBoolean(params, "expectedEnabled"),
-				);
+				const pluginId = requiredString(params, "pluginId", 200);
+				const native = (await this.nativePackages.list()).some((plugin) => plugin.id === pluginId);
+				const plugin = native
+					? await this.nativePackages.setEnabled({
+							packageId: pluginId,
+							enabled: true,
+							expectedActiveDigest: requiredString(params, "expectedActiveDigest", 64),
+							expectedEnabled: requiredBoolean(params, "expectedEnabled"),
+							approvalToken: optionalString(params, "approvalToken", 1024),
+						})
+					: await this.plugins.enable(
+							pluginId,
+							optionalString(params, "approvalToken", 1024),
+							requiredString(params, "expectedActiveDigest", 64),
+							requiredBoolean(params, "expectedEnabled"),
+						);
 				await this.reloadPlugins();
 				return plugin;
 			}
 			case "plugins.disable": {
-				const plugin = await this.plugins.disable(
-					requiredString(params, "pluginId", 64),
-					optionalString(params, "approvalToken", 1024),
-					requiredString(params, "expectedActiveDigest", 64),
-					requiredBoolean(params, "expectedEnabled"),
-				);
+				const pluginId = requiredString(params, "pluginId", 200);
+				const native = (await this.nativePackages.list()).some((plugin) => plugin.id === pluginId);
+				const plugin = native
+					? await this.nativePackages.setEnabled({
+							packageId: pluginId,
+							enabled: false,
+							expectedActiveDigest: requiredString(params, "expectedActiveDigest", 64),
+							expectedEnabled: requiredBoolean(params, "expectedEnabled"),
+							approvalToken: optionalString(params, "approvalToken", 1024),
+						})
+					: await this.plugins.disable(
+							pluginId,
+							optionalString(params, "approvalToken", 1024),
+							requiredString(params, "expectedActiveDigest", 64),
+							requiredBoolean(params, "expectedEnabled"),
+						);
 				await this.reloadPlugins();
 				return plugin;
 			}
+			case "plugins.uninstall": {
+				const pluginId = requiredString(params, "pluginId", 200);
+				const native = (await this.nativePackages.list()).some((plugin) => plugin.id === pluginId);
+				const removed = native
+					? await this.nativePackages.uninstall({
+							packageId: pluginId,
+							expectedActiveDigest: requiredString(params, "expectedActiveDigest", 64),
+							expectedEnabled: requiredBoolean(params, "expectedEnabled"),
+							approvalToken: optionalString(params, "approvalToken", 1024),
+						})
+					: await this.plugins.uninstall(
+							pluginId,
+							optionalString(params, "approvalToken", 1024),
+							requiredString(params, "expectedActiveDigest", 64),
+							requiredBoolean(params, "expectedEnabled"),
+						);
+				await this.reloadPlugins();
+				return removed;
+			}
 			case "plugins.rollback": {
-				const plugin = await this.plugins.rollback(
-					requiredString(params, "pluginId", 64),
-					optionalString(params, "approvalToken", 1024),
-					requiredString(params, "expectedActiveDigest", 64),
-					requiredString(params, "targetDigest", 64),
-				);
+				const pluginId = requiredString(params, "pluginId", 200);
+				const native = (await this.nativePackages.list()).some((plugin) => plugin.id === pluginId);
+				const plugin = native
+					? await this.nativePackages.rollback({
+							packageId: pluginId,
+							expectedActiveDigest: requiredString(params, "expectedActiveDigest", 64),
+							targetDigest: requiredString(params, "targetDigest", 64),
+							approvalToken: optionalString(params, "approvalToken", 1024),
+						})
+					: await this.plugins.rollback(
+							pluginId,
+							optionalString(params, "approvalToken", 1024),
+							requiredString(params, "expectedActiveDigest", 64),
+							requiredString(params, "targetDigest", 64),
+						);
 				await this.reloadPlugins();
 				return plugin;
 			}

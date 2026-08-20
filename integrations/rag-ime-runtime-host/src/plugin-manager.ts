@@ -1,4 +1,4 @@
-import { createHash, timingSafeEqual } from "node:crypto";
+import { createHash, randomUUID, timingSafeEqual } from "node:crypto";
 import { copyFile, lstat, mkdir, readdir, readFile, realpath, rename, rm, stat, writeFile } from "node:fs/promises";
 import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { RuntimeProtocolError } from "./protocol.ts";
@@ -12,6 +12,7 @@ const PLUGIN_ID_PATTERN = /^[a-z0-9](?:[a-z0-9._-]{0,62}[a-z0-9])?$/;
 const VERSION_PATTERN = /^\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.-]+)?$/;
 const DRAFT_ID_PATTERN = /^[a-z0-9][a-z0-9._-]{0,63}$/;
 const SAFE_SOURCE_FILE_PATTERN = /\.(?:ts|js|mjs|json|md)$/;
+const INSTALL_PREVIEW_TTL_MS = 10 * 60 * 1000;
 
 export interface PluginManifest {
 	schemaVersion: typeof MANIFEST_SCHEMA_VERSION;
@@ -63,9 +64,34 @@ export interface InstalledPlugin {
 	rollbackTarget?: { version: string; digest: string; installedAt: string };
 }
 
+export interface RemovedPlugin {
+	id: string;
+	digest: string;
+	distribution: "legacy_runtime_extension";
+	removed: true;
+}
+
 interface ScannedPlugin {
 	validation: PluginValidation;
 	sourceRoot: string;
+}
+
+interface PluginInstallPreviewRecord {
+	pluginId: string;
+	sourceRoot: string;
+	expectedDigest: string;
+	enable: boolean;
+	expectedActiveDigest?: string;
+	expectedEnabled?: boolean;
+	payloadSha256: string;
+	expiresAtMs: number;
+}
+
+export interface PluginInstallPreview extends PluginValidation {
+	previewToken: string;
+	payloadSha256: string;
+	requiredConfirm: "apply";
+	expiresAtMs: number;
 }
 
 export interface PluginManagerOptions {
@@ -168,6 +194,8 @@ export class ManagedPluginManager {
 	readonly inboxRoot: string;
 	readonly activeDir: string;
 	private readonly approvalToken?: string;
+	private readonly installPreviews = new Map<string, PluginInstallPreviewRecord>();
+	private readonly mutationTails = new Map<string, Promise<void>>();
 
 	constructor(options: PluginManagerOptions) {
 		this.pluginsRoot = resolve(options.pluginsRoot);
@@ -197,6 +225,44 @@ export class ManagedPluginManager {
 		if (expected.length !== actual.length || !timingSafeEqual(expected, actual)) {
 			throw new RuntimeProtocolError("PLUGIN_APPROVAL_REQUIRED", "Product approval token is invalid");
 		}
+	}
+
+	private async withPluginMutation<T>(pluginId: string, operation: () => Promise<T>): Promise<T> {
+		const previous = this.mutationTails.get(pluginId) ?? Promise.resolve();
+		let release!: () => void;
+		const gate = new Promise<void>((resolveGate) => {
+			release = resolveGate;
+		});
+		const tail = previous.catch(() => undefined).then(() => gate);
+		this.mutationTails.set(pluginId, tail);
+		await previous.catch(() => undefined);
+		try {
+			return await operation();
+		} finally {
+			release();
+			if (this.mutationTails.get(pluginId) === tail) this.mutationTails.delete(pluginId);
+		}
+	}
+
+	private pruneInstallPreviews(nowMs = Date.now()): void {
+		for (const [token, preview] of this.installPreviews) {
+			if (preview.expiresAtMs <= nowMs) this.installPreviews.delete(token);
+		}
+	}
+
+	private installPreviewPayload(input: Omit<PluginInstallPreviewRecord, "payloadSha256" | "expiresAtMs">): string {
+		return createHash("sha256")
+			.update(
+				JSON.stringify({
+					pluginId: input.pluginId,
+					sourceRoot: input.sourceRoot,
+					expectedDigest: input.expectedDigest,
+					enable: input.enable,
+					expectedActiveDigest: input.expectedActiveDigest ?? null,
+					expectedEnabled: input.expectedEnabled ?? null,
+				}),
+			)
+			.digest("hex");
 	}
 
 	private async scan(sourcePath: string, requireInboxBoundary: boolean): Promise<ScannedPlugin> {
@@ -421,13 +487,11 @@ export class ManagedPluginManager {
 		return result.sort((left, right) => left.id.localeCompare(right.id));
 	}
 
-	async install(options: {
+	async previewInstall(options: {
 		sourcePath: string;
 		expectedDigest: string;
-		approvalToken?: string;
 		enable?: boolean;
-	}): Promise<InstalledPlugin> {
-		this.requireApproval(options.approvalToken);
+	}): Promise<PluginInstallPreview> {
 		const scanned = await this.scan(options.sourcePath, true);
 		if (scanned.validation.digest !== options.expectedDigest) {
 			throw new RuntimeProtocolError("PLUGIN_DIGEST_MISMATCH", "Plugin changed after validation", {
@@ -435,59 +499,139 @@ export class ManagedPluginManager {
 				actual: scanned.validation.digest,
 			});
 		}
-		const { manifest, digest, files } = scanned.validation;
-		const versionsDir = join(this.pluginsRoot, manifest.id, "versions");
-		await mkdir(versionsDir, { recursive: true, mode: 0o700 });
-		const directory = `${manifest.version}-${digest}`;
-		const destination = join(versionsDir, directory);
-		const temporary = join(versionsDir, `.${directory}.${process.pid}.${Date.now()}.tmp`);
-		let destinationExists = false;
-		try {
-			destinationExists = (await stat(destination)).isDirectory();
-		} catch (error) {
-			if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
-		}
-		if (!destinationExists) {
-			await mkdir(temporary, { recursive: true, mode: 0o700 });
-			try {
-				for (const file of files) {
-					const target = join(temporary, file);
-					await mkdir(dirname(target), { recursive: true, mode: 0o700 });
-					await copyFile(join(scanned.sourceRoot, file), target);
-				}
-				const copied = await this.scan(temporary, false);
-				if (copied.validation.digest !== digest) {
-					throw new RuntimeProtocolError("PLUGIN_DIGEST_MISMATCH", "Plugin changed while being installed");
-				}
-				await rename(temporary, destination);
-			} catch (error) {
-				await rm(temporary, { recursive: true, force: true });
-				throw error;
-			}
-		}
-
-		const previous = await this.readState(manifest.id);
-		const installs = previous?.installs.filter((record) => record.digest !== digest) ?? [];
-		installs.push({ manifest, digest, directory, installedAt: new Date().toISOString() });
-		const activationHistory = [...(previous?.activationHistory ?? [])];
-		if (
-			previous?.activeDigest &&
-			previous.activeDigest !== digest &&
-			activationHistory.at(-1) !== previous.activeDigest
-		) {
-			activationHistory.push(previous.activeDigest);
-		}
-		const state: PluginState = {
-			schemaVersion: STATE_SCHEMA_VERSION,
-			id: manifest.id,
-			enabled: options.enable ?? previous?.enabled ?? false,
-			activeDigest: digest,
-			installs,
-			activationHistory,
+		const previous = await this.readState(scanned.validation.manifest.id);
+		const bound = {
+			pluginId: scanned.validation.manifest.id,
+			sourceRoot: scanned.sourceRoot,
+			expectedDigest: scanned.validation.digest,
+			enable: options.enable ?? previous?.enabled ?? false,
+			expectedActiveDigest: previous?.activeDigest,
+			expectedEnabled: previous?.enabled,
 		};
-		await this.writeState(state);
-		await this.syncActiveEntry(state);
-		return (await this.list()).find((plugin) => plugin.id === manifest.id)!;
+		const payloadSha256 = this.installPreviewPayload(bound);
+		const previewToken = randomUUID();
+		const expiresAtMs = Date.now() + INSTALL_PREVIEW_TTL_MS;
+		this.pruneInstallPreviews();
+		this.installPreviews.set(previewToken, { ...bound, payloadSha256, expiresAtMs });
+		return {
+			...scanned.validation,
+			previewToken,
+			payloadSha256,
+			requiredConfirm: "apply",
+			expiresAtMs,
+		};
+	}
+
+	async install(options: {
+		sourcePath: string;
+		expectedDigest: string;
+		approvalToken?: string;
+		enable?: boolean;
+		previewToken?: string;
+		payloadSha256?: string;
+		confirmText?: string;
+	}): Promise<InstalledPlugin> {
+		this.requireApproval(options.approvalToken);
+		const scannedBeforeLock = await this.scan(options.sourcePath, true);
+		const pluginId = scannedBeforeLock.validation.manifest.id;
+		return this.withPluginMutation(pluginId, async () => {
+			const scanned = await this.scan(options.sourcePath, true);
+			if (scanned.validation.digest !== options.expectedDigest) {
+				throw new RuntimeProtocolError("PLUGIN_DIGEST_MISMATCH", "Plugin changed after validation", {
+					expected: options.expectedDigest,
+					actual: scanned.validation.digest,
+				});
+			}
+			if (options.confirmText?.trim().toLowerCase() !== "apply") {
+				throw new RuntimeProtocolError("PLUGIN_CONFIRMATION_REQUIRED", "Plugin install requires confirmText=apply");
+			}
+			this.pruneInstallPreviews();
+			const preview = options.previewToken ? this.installPreviews.get(options.previewToken) : undefined;
+			if (!preview) {
+				throw new RuntimeProtocolError(
+					"PLUGIN_PREVIEW_REQUIRED",
+					"Plugin install requires a live one-time Runtime Host preview",
+				);
+			}
+			// Consume before mutation. Failed attempts cannot replay an already
+			// reviewed capability after the source or installed state changes.
+			this.installPreviews.delete(options.previewToken!);
+			const previous = await this.readState(pluginId);
+			const bound = {
+				pluginId,
+				sourceRoot: scanned.sourceRoot,
+				expectedDigest: scanned.validation.digest,
+				enable: options.enable ?? previous?.enabled ?? false,
+				expectedActiveDigest: previous?.activeDigest,
+				expectedEnabled: previous?.enabled,
+			};
+			const currentPayloadSha256 = this.installPreviewPayload(bound);
+			if (
+				preview.pluginId !== pluginId ||
+				preview.sourceRoot !== scanned.sourceRoot ||
+				preview.expectedDigest !== scanned.validation.digest ||
+				preview.enable !== bound.enable ||
+				preview.expectedActiveDigest !== bound.expectedActiveDigest ||
+				preview.expectedEnabled !== bound.expectedEnabled ||
+				preview.payloadSha256 !== currentPayloadSha256 ||
+				options.payloadSha256 !== currentPayloadSha256
+			) {
+				throw new RuntimeProtocolError("PLUGIN_STATE_CHANGED", "Plugin install changed after Runtime Host preview");
+			}
+
+			const { manifest, digest, files } = scanned.validation;
+			const versionsDir = join(this.pluginsRoot, manifest.id, "versions");
+			await mkdir(versionsDir, { recursive: true, mode: 0o700 });
+			const directory = `${manifest.version}-${digest}`;
+			const destination = join(versionsDir, directory);
+			const temporary = join(versionsDir, `.${directory}.${process.pid}.${Date.now()}.tmp`);
+			let destinationExists = false;
+			try {
+				destinationExists = (await stat(destination)).isDirectory();
+			} catch (error) {
+				if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+			}
+			if (!destinationExists) {
+				await mkdir(temporary, { recursive: true, mode: 0o700 });
+				try {
+					for (const file of files) {
+						const target = join(temporary, file);
+						await mkdir(dirname(target), { recursive: true, mode: 0o700 });
+						await copyFile(join(scanned.sourceRoot, file), target);
+					}
+					const copied = await this.scan(temporary, false);
+					if (copied.validation.digest !== digest) {
+						throw new RuntimeProtocolError("PLUGIN_DIGEST_MISMATCH", "Plugin changed while being installed");
+					}
+					await rename(temporary, destination);
+				} catch (error) {
+					await rm(temporary, { recursive: true, force: true });
+					throw error;
+				}
+			}
+
+			const installs = previous?.installs.filter((record) => record.digest !== digest) ?? [];
+			installs.push({ manifest, digest, directory, installedAt: new Date().toISOString() });
+			const activationHistory = [...(previous?.activationHistory ?? [])];
+			if (
+				previous?.activeDigest &&
+				previous.activeDigest !== digest &&
+				activationHistory.at(-1) !== previous.activeDigest
+			) {
+				activationHistory.push(previous.activeDigest);
+			}
+			const state: PluginState = {
+				schemaVersion: STATE_SCHEMA_VERSION,
+				id: manifest.id,
+				enabled: bound.enable,
+				activeDigest: digest,
+				installs,
+				activationHistory,
+			};
+			await this.writeState(state);
+			await this.syncActiveEntry(state);
+			return (await this.list()).find((plugin) => plugin.id === manifest.id)!;
+		});
 	}
 
 	private async mutate(
@@ -499,12 +643,14 @@ export class ManagedPluginManager {
 		if (!PLUGIN_ID_PATTERN.test(pluginId)) {
 			throw new RuntimeProtocolError("PLUGIN_NOT_FOUND", `Invalid plugin id: ${pluginId}`);
 		}
-		const state = await this.readState(pluginId);
-		if (!state) throw new RuntimeProtocolError("PLUGIN_NOT_FOUND", `Plugin is not installed: ${pluginId}`);
-		change(state);
-		await this.writeState(state);
-		await this.syncActiveEntry(state);
-		return (await this.list()).find((plugin) => plugin.id === pluginId)!;
+		return this.withPluginMutation(pluginId, async () => {
+			const state = await this.readState(pluginId);
+			if (!state) throw new RuntimeProtocolError("PLUGIN_NOT_FOUND", `Plugin is not installed: ${pluginId}`);
+			change(state);
+			await this.writeState(state);
+			await this.syncActiveEntry(state);
+			return (await this.list()).find((plugin) => plugin.id === pluginId)!;
+		});
 	}
 
 	private requireToggleGuard(
@@ -551,6 +697,32 @@ export class ManagedPluginManager {
 		return this.mutate(pluginId, approvalToken, (state) => {
 			this.requireToggleGuard(state, expectedActiveDigest, expectedEnabled);
 			state.enabled = false;
+		});
+	}
+
+	async uninstall(
+		pluginId: string,
+		approvalToken: string | undefined,
+		expectedActiveDigest: string | undefined,
+		expectedEnabled: boolean | undefined,
+	): Promise<RemovedPlugin> {
+		this.requireApproval(approvalToken);
+		if (!PLUGIN_ID_PATTERN.test(pluginId)) {
+			throw new RuntimeProtocolError("PLUGIN_NOT_FOUND", `Invalid plugin id: ${pluginId}`);
+		}
+		return this.withPluginMutation(pluginId, async () => {
+			const state = await this.readState(pluginId);
+			if (!state?.activeDigest) {
+				throw new RuntimeProtocolError("PLUGIN_NOT_FOUND", `Plugin is not installed: ${pluginId}`);
+			}
+			this.requireToggleGuard(state, expectedActiveDigest, expectedEnabled);
+			const digest = state.activeDigest;
+			// Remove the executable shim first, then the immutable legacy store.
+			// A failed cleanup can leave inert files, but cannot leave the plugin
+			// loaded by a subsequently reloaded Pi Session.
+			await rm(join(this.activeDir, `${pluginId}.ts`), { force: true });
+			await rm(join(this.pluginsRoot, pluginId), { recursive: true, force: true });
+			return { id: pluginId, digest, distribution: "legacy_runtime_extension", removed: true };
 		});
 	}
 

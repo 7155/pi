@@ -688,6 +688,17 @@ export interface ContextEvent {
 	messages: AgentMessage[];
 }
 
+/**
+ * Fired after Pi has assembled the final provider-neutral Context and before it
+ * is encoded into a provider-specific request. This event is observational;
+ * handlers cannot replace the model or Context.
+ */
+export interface ProviderContextInspectionEvent {
+	type: "provider_context_inspection";
+	model: Model<Api>;
+	context: Context;
+}
+
 /** Fired before a provider request is sent. Can replace the payload. */
 export interface BeforeProviderRequestEvent {
 	type: "before_provider_request";
@@ -1052,6 +1063,7 @@ export type ExtensionEvent =
 	| ResourcesDiscoverEvent
 	| SessionEvent
 	| ContextEvent
+	| ProviderContextInspectionEvent
 	| BeforeProviderRequestEvent
 	| BeforeProviderHeadersEvent
 	| AfterProviderResponseEvent
@@ -1235,6 +1247,7 @@ export interface ExtensionAPI {
 	on(event: "session_before_tree", handler: ExtensionHandler<SessionBeforeTreeEvent, SessionBeforeTreeResult>): void;
 	on(event: "session_tree", handler: ExtensionHandler<SessionTreeEvent>): void;
 	on(event: "context", handler: ExtensionHandler<ContextEvent, ContextEventResult>): void;
+	on(event: "provider_context_inspection", handler: ExtensionHandler<ProviderContextInspectionEvent>): void;
 	on(
 		event: "before_provider_request",
 		handler: ExtensionHandler<BeforeProviderRequestEvent, BeforeProviderRequestEventResult>,

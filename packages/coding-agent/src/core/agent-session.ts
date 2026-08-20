@@ -1004,6 +1004,38 @@ export class AgentSession {
 		return this._resourceLoader.getPrompts().prompts;
 	}
 
+	/**
+	 * Commands currently exposed by the authoritative Session resource set.
+	 *
+	 * Consumers must use this projection instead of rebuilding a partial
+	 * command catalog from prompts and skills: enabled Package extensions can
+	 * register commands too, and reload swaps the ExtensionRunner atomically.
+	 */
+	get slashCommands(): ReadonlyArray<SlashCommandInfo> {
+		const extensionCommands: SlashCommandInfo[] = this._extensionRunner.getRegisteredCommands().map((command) => ({
+			name: command.invocationName,
+			description: command.description,
+			source: "extension",
+			sourceInfo: command.sourceInfo,
+		}));
+
+		const templates: SlashCommandInfo[] = this.promptTemplates.map((template) => ({
+			name: template.name,
+			description: template.description,
+			source: "prompt",
+			sourceInfo: template.sourceInfo,
+		}));
+
+		const skills: SlashCommandInfo[] = this._resourceLoader.getSkills().skills.map((skill) => ({
+			name: `skill:${skill.name}`,
+			description: skill.description,
+			source: "skill",
+			sourceInfo: skill.sourceInfo,
+		}));
+
+		return [...extensionCommands, ...templates, ...skills];
+	}
+
 	private _normalizePromptSnippet(text: string | undefined): string | undefined {
 		if (!text) return undefined;
 		const oneLine = text
@@ -1283,7 +1315,12 @@ export class AgentSession {
 	/**
 	 * Try to execute an extension command. Returns true if command was found and executed.
 	 */
-	private async _tryExecuteExtensionCommand(text: string): Promise<boolean> {
+	async executeSlashCommand(text: string): Promise<boolean> {
+		if (!text.startsWith("/")) return false;
+		return this._tryExecuteExtensionCommand(text, true);
+	}
+
+	private async _tryExecuteExtensionCommand(text: string, rethrow = false): Promise<boolean> {
 		// Parse command name and args
 		const spaceIndex = text.indexOf(" ");
 		const commandName = spaceIndex === -1 ? text.slice(1) : text.slice(1, spaceIndex);
@@ -1305,6 +1342,7 @@ export class AgentSession {
 				event: "command",
 				error: err instanceof Error ? err.message : String(err),
 			});
+			if (rethrow) throw err;
 			return true;
 		}
 	}
@@ -2430,30 +2468,7 @@ export class AgentSession {
 	}
 
 	private _bindExtensionCore(runner: ExtensionRunner): void {
-		const getCommands = (): SlashCommandInfo[] => {
-			const extensionCommands: SlashCommandInfo[] = runner.getRegisteredCommands().map((command) => ({
-				name: command.invocationName,
-				description: command.description,
-				source: "extension",
-				sourceInfo: command.sourceInfo,
-			}));
-
-			const templates: SlashCommandInfo[] = this.promptTemplates.map((template) => ({
-				name: template.name,
-				description: template.description,
-				source: "prompt",
-				sourceInfo: template.sourceInfo,
-			}));
-
-			const skills: SlashCommandInfo[] = this._resourceLoader.getSkills().skills.map((skill) => ({
-				name: `skill:${skill.name}`,
-				description: skill.description,
-				source: "skill",
-				sourceInfo: skill.sourceInfo,
-			}));
-
-			return [...extensionCommands, ...templates, ...skills];
-		};
+		const getCommands = (): SlashCommandInfo[] => [...this.slashCommands];
 
 		runner.bindCore(
 			{

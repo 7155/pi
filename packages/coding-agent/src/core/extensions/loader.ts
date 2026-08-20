@@ -144,6 +144,27 @@ function getAliases(): Record<string, string> {
 	return _aliases;
 }
 
+function getBuiltNodeModuleResolution():
+	| { alias: Record<string, string> }
+	| { virtualModules: Record<string, unknown>; tryNative: false } {
+	try {
+		return { alias: getAliases() };
+	} catch (error) {
+		// A self-contained Node bundle has the extension API dependencies embedded
+		// but intentionally has no adjacent node_modules tree. Reuse the same
+		// virtual module table as compiled binaries instead of failing before the
+		// extension module itself is imported. Ordinary dist builds keep aliases.
+		if (
+			error instanceof Error &&
+			(error as NodeJS.ErrnoException).code !== "MODULE_NOT_FOUND" &&
+			!error.message.includes("Cannot find module")
+		) {
+			throw error;
+		}
+		return { virtualModules: VIRTUAL_MODULES, tryNative: false };
+	}
+}
+
 type HandlerFn = (...args: unknown[]) => Promise<unknown>;
 
 let extensionCacheCwd: string | undefined;
@@ -457,7 +478,7 @@ async function loadExtensionModule(extensionPath: string, cacheToken?: Extension
 			? { virtualModules: VIRTUAL_MODULES, tryNative: false }
 			: isTypeScriptSourceRuntime
 				? { virtualModules: VIRTUAL_MODULES, tsconfigPaths: true }
-				: { alias: getAliases() }),
+				: getBuiltNodeModuleResolution()),
 	});
 
 	const module = await jiti.import(extensionPath, { default: true });

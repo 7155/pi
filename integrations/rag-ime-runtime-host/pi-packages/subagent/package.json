@@ -1,0 +1,14 @@
+{
+  "name": "@paw/pi-subagent",
+  "version": "0.1.1",
+  "description": "Optional bounded subagent delegation for Pi Sessions",
+  "private": true,
+  "type": "module",
+  "pi": {
+    "extensions": ["./index.ts"],
+    "skills": ["./skills"]
+  },
+  "paw": {
+    "capabilities": ["subagent"]
+  }
+}

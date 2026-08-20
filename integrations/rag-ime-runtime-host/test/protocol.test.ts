@@ -1,7 +1,39 @@
 import { describe, expect, it } from "vitest";
-import { PROTOCOL_VERSION, parseRuntimeRequest, RuntimeProtocolError } from "../src/protocol.ts";
+import { PROTOCOL_VERSION, parseRoomCancelParams, parseRuntimeRequest, RuntimeProtocolError } from "../src/protocol.ts";
 
 describe("runtime protocol", () => {
+	it("requires the complete Room cancellation lineage", () => {
+		expect(
+			parseRoomCancelParams({
+				cancelId: "cancel:1",
+				sessionId: "session:target",
+				rootId: "root:1",
+				dispatchId: "dispatch:1",
+				generation: 4,
+				turnId: "turn:1",
+				capabilityEpoch: 7,
+			}),
+		).toEqual({
+			cancelId: "cancel:1",
+			sessionId: "session:target",
+			rootId: "root:1",
+			dispatchId: "dispatch:1",
+			generation: 4,
+			turnId: "turn:1",
+			capabilityEpoch: 7,
+		});
+		expect(() =>
+			parseRoomCancelParams({
+				cancelId: "cancel:1",
+				sessionId: "session:target",
+				rootId: "root:1",
+				dispatchId: "dispatch:1",
+				generation: 4,
+				capabilityEpoch: 7,
+			}),
+		).toThrow("turnId must be a non-empty string");
+	});
+
 	it("accepts versioned plugin and session methods", () => {
 		expect(
 			parseRuntimeRequest({
@@ -35,6 +67,14 @@ describe("runtime protocol", () => {
 				params: { sessionId: "source" },
 			}),
 		).toMatchObject({ id: "request-4", method: "session.commands" });
+		expect(
+			parseRuntimeRequest({
+				protocolVersion: PROTOCOL_VERSION,
+				id: "request-command",
+				method: "session.command.invoke",
+				params: { sessionId: "source", command: "/workflow" },
+			}),
+		).toMatchObject({ id: "request-command", method: "session.command.invoke" });
 		expect(
 			parseRuntimeRequest({
 				protocolVersion: PROTOCOL_VERSION,
@@ -91,6 +131,44 @@ describe("runtime protocol", () => {
 				params: { sessionId: "source", requestId: "ui-1", response: { confirmed: true } },
 			}),
 		).toMatchObject({ id: "request-11", method: "ui.resolve" });
+		expect(
+			parseRuntimeRequest({
+				protocolVersion: PROTOCOL_VERSION,
+				id: "request-12",
+				method: "room.dispatch",
+				params: { sessionId: "target" },
+			}),
+		).toMatchObject({ id: "request-12", method: "room.dispatch" });
+		expect(
+			parseRuntimeRequest({
+				protocolVersion: PROTOCOL_VERSION,
+				id: "request-13",
+				method: "room.cancel",
+				params: { sessionId: "target" },
+			}),
+		).toMatchObject({ id: "request-13", method: "room.cancel" });
+		expect(
+			parseRuntimeRequest({
+				protocolVersion: PROTOCOL_VERSION,
+				id: "request-14",
+				method: "session.control_state",
+				params: { sessionId: "source" },
+			}),
+		).toMatchObject({ id: "request-14", method: "session.control_state" });
+	});
+
+	it("accepts the native package lifecycle methods", () => {
+		for (const method of [
+			"plugins.catalog",
+			"plugins.package.create",
+			"plugins.package.prepare",
+			"plugins.install.preview",
+			"plugins.uninstall",
+		] as const) {
+			expect(
+				parseRuntimeRequest({ protocolVersion: PROTOCOL_VERSION, id: `request-${method}`, method, params: {} }),
+			).toMatchObject({ method });
+		}
 	});
 
 	it("rejects unknown or unversioned requests", () => {

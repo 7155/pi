@@ -1,0 +1,13 @@
+{
+  "schemaVersion": 1,
+  "packages": [
+    {
+      "directory": "session-workflow",
+      "displayName": "Session Workflow"
+    },
+    {
+      "directory": "subagent",
+      "displayName": "Subagent"
+    }
+  ]
+}

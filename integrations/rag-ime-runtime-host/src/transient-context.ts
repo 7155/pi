@@ -1,13 +1,8 @@
-import type { ExtensionFactory } from "@earendil-works/pi-coding-agent";
 import { RuntimeProtocolError } from "./protocol.ts";
 
 export const TRANSIENT_CONTEXT_ENVELOPE_PREFIX = "RAG_IME_TRANSIENT_CONTEXT_V1\n";
 const TRANSIENT_CONTEXT_SCHEMA = "rag-ime.runtime-prompt.v1";
 const MAX_TRANSIENT_CONTEXT_CHARS = 64_000;
-const SESSION_CONTEXT_BLOCK_PATTERN =
-	/\n*<rag-ime-context\s+type="session_memory"(?=[\s>])[^>]*>[\s\S]*?<\/rag-ime-context>/g;
-const MANAGED_CONTEXT_BLOCK_PATTERN =
-	/\n*<rag-ime-context\s+type="(?:session_memory|turn_context)"(?=[\s>])[^>]*>[\s\S]*?<\/rag-ime-context>/g;
 
 export interface DecodedRuntimePrompt {
 	message: string;
@@ -16,6 +11,7 @@ export interface DecodedRuntimePrompt {
 }
 
 export interface RuntimeContextSnapshot {
+	roomContext?: string;
 	sessionContext: string;
 	transientContext: string;
 }
@@ -67,68 +63,4 @@ export function formatLocalTimestamp(now: Date = new Date()): string {
 		`T${pad(now.getHours())}:${pad(now.getMinutes())}:${pad(now.getSeconds())}` +
 		`${offsetSign}${pad(Math.floor(absoluteOffset / 60))}:${pad(absoluteOffset % 60)}`
 	);
-}
-
-export function injectRuntimeContext(
-	systemPrompt: string,
-	contexts: RuntimeContextSnapshot,
-	now: Date = new Date(),
-): string {
-	const base = systemPrompt.replace(MANAGED_CONTEXT_BLOCK_PATTERN, "").trimEnd();
-	const sessionEvidence = contexts.sessionContext.trim();
-	const turnEvidence = contexts.transientContext.trim();
-	if (!sessionEvidence && !turnEvidence) return base;
-	const currentTime = formatLocalTimestamp(now);
-	const result = [base, ""];
-	if (sessionEvidence) {
-		result.push(
-			`<rag-ime-context type="session_memory" current_time="${currentTime}">`,
-			sessionEvidence,
-			"</rag-ime-context>",
-		);
-	}
-	if (turnEvidence) {
-		result.push(
-			`<rag-ime-context type="turn_context" current_time="${currentTime}">`,
-			turnEvidence,
-			"</rag-ime-context>",
-		);
-	}
-	return result.join("\n");
-}
-
-export function injectTransientContext(systemPrompt: string, context: string): string {
-	return injectRuntimeContext(systemPrompt, {
-		sessionContext: "",
-		transientContext: context,
-	});
-}
-
-export function replaceRuntimeSessionContext(
-	systemPrompt: string,
-	sessionContext: string,
-	now: Date = new Date(),
-): string {
-	const current = systemPrompt.trimEnd();
-	const normalized = sessionContext.trim();
-	const withoutSessionContext = current.replace(SESSION_CONTEXT_BLOCK_PATTERN, "").trimEnd();
-	if (!normalized) return withoutSessionContext;
-	const block = [
-		`<rag-ime-context type="session_memory" current_time="${formatLocalTimestamp(now)}">`,
-		normalized,
-		"</rag-ime-context>",
-	].join("\n");
-	return `${withoutSessionContext}\n\n${block}`;
-}
-
-export function createTransientContextExtension(getContext: () => RuntimeContextSnapshot): ExtensionFactory {
-	return (pi) => {
-		pi.on("before_agent_start", (event) => {
-			const context = getContext();
-			if (!context.sessionContext.trim() && !context.transientContext.trim()) return;
-			return {
-				systemPrompt: injectRuntimeContext(event.systemPrompt, context),
-			};
-		});
-	};
 }

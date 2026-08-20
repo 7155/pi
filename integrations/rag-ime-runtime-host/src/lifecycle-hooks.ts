@@ -1,4 +1,4 @@
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { chmod, mkdir, readFile, rename, unlink, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import type { ExtensionFactory, ToolResultEvent, TurnEndEvent } from "@earendil-works/pi-coding-agent";
@@ -23,7 +23,7 @@ export interface LifecycleHookController {
 
 interface LifecycleHookOptions {
 	bridge: BackendToolBridgeOptions;
-	now?: () => Date;
+	isManagedRoom?(): boolean;
 	setTimer?: typeof setTimeout;
 	clearTimer?: typeof clearTimeout;
 	stateDirectory?: string;
@@ -52,16 +52,6 @@ function asRecord(value: unknown): Record<string, unknown> {
 
 function text(value: unknown): string {
 	return typeof value === "string" ? value.trim() : "";
-}
-
-function localTimestamp(date: Date): string {
-	const offsetMinutes = -date.getTimezoneOffset();
-	const sign = offsetMinutes >= 0 ? "+" : "-";
-	const absoluteOffset = Math.abs(offsetMinutes);
-	const local = new Date(date.getTime() + offsetMinutes * 60_000).toISOString().slice(0, 19);
-	return `${local}${sign}${String(Math.floor(absoluteOffset / 60)).padStart(2, "0")}:${String(
-		absoluteOffset % 60,
-	).padStart(2, "0")}`;
 }
 
 function bounded(value: string, maximum: number): string {
@@ -191,15 +181,10 @@ function completionFacts(details: Record<string, unknown>): Array<Record<string,
 	return facts;
 }
 
-function replaceHookBlock(systemPrompt: string, context: string, now: Date): string {
+function replaceHookBlock(systemPrompt: string, context: string): string {
 	const base = systemPrompt.replace(HOOK_BLOCK_PATTERN, "\n").trimEnd();
 	if (!context.trim()) return base;
-	return [
-		base,
-		`<rag-ime-context type="lifecycle_hook" current_time="${localTimestamp(now)}">`,
-		context.trim(),
-		"</rag-ime-context>",
-	]
+	return [base, '<rag-ime-context type="lifecycle_hook">', context.trim(), "</rag-ime-context>"]
 		.filter(Boolean)
 		.join("\n");
 }
@@ -209,6 +194,7 @@ export function createLifecycleHookController(options: LifecycleHookOptions): Li
 	let sessionStarted = false;
 	let idleTimer: ReturnType<typeof setTimeout> | undefined;
 	let idleSequence = 0;
+	let activeAgentRunId = "";
 	const pendingEvents = new Map<string, LifecycleEventEnvelope>();
 	const deliveredResults = new Map<string, Record<string, unknown>>();
 	const awaitingResults = new Set<string>();
@@ -218,6 +204,7 @@ export function createLifecycleHookController(options: LifecycleHookOptions): Li
 	let persistenceQueue: Promise<void> = Promise.resolve();
 	const schedule = options.setTimer ?? setTimeout;
 	const cancel = options.clearTimer ?? clearTimeout;
+	const isManagedRoom = (): boolean => options.isManagedRoom?.() === true;
 
 	async function writePendingState(events: LifecycleEventEnvelope[]): Promise<void> {
 		if (!stateFile) return;
@@ -388,6 +375,10 @@ export function createLifecycleHookController(options: LifecycleHookOptions): Li
 	}
 
 	const extension: ExtensionFactory = (pi) => {
+		pi.on("agent_start", async () => {
+			activeAgentRunId = randomUUID();
+		});
+
 		pi.on("before_agent_start", async (event) => {
 			clearIdle();
 			await flushPending();
@@ -406,15 +397,24 @@ export function createLifecycleHookController(options: LifecycleHookOptions): Li
 					// Sidecar outages must not block the first provider request.
 				}
 			}
+			if (isManagedRoom()) {
+				// Room context epochs own task recovery. Keep lifecycle events auditable,
+				// but never let an old generic suggestion become a second recovery packet.
+				pendingContext = "";
+				const systemPrompt = replaceHookBlock(event.systemPrompt, "");
+				return systemPrompt === event.systemPrompt ? undefined : { systemPrompt };
+			}
 			if (!pendingContext) return;
 			const context = pendingContext;
 			pendingContext = "";
 			return {
-				systemPrompt: replaceHookBlock(event.systemPrompt, context, (options.now ?? (() => new Date()))()),
+				systemPrompt: replaceHookBlock(event.systemPrompt, context),
 			};
 		});
 
 		pi.on("turn_end", async (event: TurnEndEvent) => {
+			const agentRunId = activeAgentRunId || randomUUID();
+			activeAgentRunId = agentRunId;
 			const assistantSummary = textFromContent(asRecord(event.message).content);
 			try {
 				const result = await send(
@@ -426,7 +426,7 @@ export function createLifecycleHookController(options: LifecycleHookOptions): Li
 						toolResultCount: event.toolResults.length,
 						failedToolCount: event.toolResults.filter((item) => item.isError).length,
 					},
-					{ turnIndex: event.turnIndex },
+					{ agentRunId, turnIndex: event.turnIndex },
 				);
 				scheduleIdle(result.idleDelayMs);
 			} catch {
@@ -436,16 +436,28 @@ export function createLifecycleHookController(options: LifecycleHookOptions): Li
 
 		pi.on("session_compact", async (event) => {
 			const summary = redactSensitiveText(event.compactionEntry.summary, 800);
+			const managedRoom = isManagedRoom();
 			try {
 				await send(
 					"compaction",
-					{
-						status: "completed",
-						reason: event.reason,
-						willRetry: event.willRetry,
-						summary,
-						facts: summary ? [{ text: summary, evidence: `pi-compaction:${event.reason}` }] : [],
-					},
+					managedRoom
+						? {
+								status: "completed",
+								reason: event.reason,
+								willRetry: event.willRetry,
+								summaryLength: summary.length,
+								summarySha256: digest(summary),
+								auditOnly: true,
+								facts: [],
+								contextOwner: "room_context_epoch",
+							}
+						: {
+								status: "completed",
+								reason: event.reason,
+								willRetry: event.willRetry,
+								summary,
+								facts: summary ? [{ text: summary, evidence: `pi-compaction:${event.reason}` }] : [],
+							},
 					{
 						status: "completed",
 						reason: event.reason,
@@ -456,8 +468,9 @@ export function createLifecycleHookController(options: LifecycleHookOptions): Li
 			} catch {
 				// Persisted outbox state will retry this event later.
 			}
-			// Upstream 0.84 owns compaction settlement. Any nextTurnContext from
-			// the product remains pending and is injected by before_agent_start.
+			if (managedRoom) pendingContext = "";
+			// Upstream 0.84 owns compaction settlement. Any ordinary-Session
+			// nextTurnContext remains pending for before_agent_start.
 		});
 
 		pi.on("session_compact_failed", async (event) => {
@@ -485,6 +498,7 @@ export function createLifecycleHookController(options: LifecycleHookOptions): Li
 			} catch {
 				// Persisted outbox state will retry this event later.
 			}
+			if (isManagedRoom()) pendingContext = "";
 		});
 
 		pi.on("tool_result", async (event: ToolResultEvent) => {

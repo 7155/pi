@@ -1,10 +1,17 @@
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import type { AssistantMessage, Context, Model, ModelsSimpleStreamOptions } from "@earendil-works/pi-ai";
+import {
+	type AssistantMessage,
+	type AssistantMessageEventStream,
+	type Context,
+	createAssistantMessageEventStream,
+	type Model,
+	type ModelsSimpleStreamOptions,
+} from "@earendil-works/pi-ai";
 import { ModelRuntime } from "@earendil-works/pi-coding-agent";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { PROTOCOL_VERSION, type RuntimeRequest } from "../src/protocol.ts";
+import { PROTOCOL_VERSION, type RuntimeEventEnvelope, type RuntimeRequest } from "../src/protocol.ts";
 import { RagImeRuntimeHost } from "../src/runtime-host.ts";
 
 const model: Model<"openai-responses"> = {
@@ -42,6 +49,36 @@ function assistant(stopReason: AssistantMessage["stopReason"] = "stop", errorMes
 	};
 }
 
+function completedStream({
+	message = assistant(),
+	reasoning = "",
+	textChunks = ["one-shot result"],
+}: {
+	message?: AssistantMessage;
+	reasoning?: string;
+	textChunks?: string[];
+} = {}): AssistantMessageEventStream {
+	const stream = createAssistantMessageEventStream();
+	stream.push({ type: "start", partial: message });
+	if (reasoning) {
+		stream.push({ type: "thinking_start", contentIndex: 0, partial: message });
+		stream.push({ type: "thinking_delta", contentIndex: 0, delta: reasoning, partial: message });
+		stream.push({ type: "thinking_end", contentIndex: 0, content: reasoning, partial: message });
+	}
+	stream.push({ type: "text_start", contentIndex: reasoning ? 1 : 0, partial: message });
+	for (const delta of textChunks) {
+		stream.push({ type: "text_delta", contentIndex: reasoning ? 1 : 0, delta, partial: message });
+	}
+	stream.push({
+		type: "text_end",
+		contentIndex: reasoning ? 1 : 0,
+		content: textChunks.join(""),
+		partial: message,
+	});
+	stream.push({ type: "done", reason: "stop", message });
+	return stream;
+}
+
 function request(id: string, method: RuntimeRequest["method"], params: Record<string, unknown>): RuntimeRequest {
 	return { protocolVersion: PROTOCOL_VERSION, id, method, params };
 }
@@ -50,14 +87,16 @@ async function fixture(): Promise<{
 	host: RagImeRuntimeHost;
 	modelRuntime: ModelRuntime;
 	root: string;
+	events: RuntimeEventEnvelope[];
 }> {
 	const root = await mkdtemp(join(tmpdir(), "rag-ime-stateless-"));
+	const events: RuntimeEventEnvelope[] = [];
 	const modelRuntime = await ModelRuntime.create({
 		authPath: join(root, "auth.json"),
 		modelsPath: null,
 		allowModelNetwork: false,
 	});
-	vi.spyOn(modelRuntime, "reloadConfig").mockResolvedValue(undefined);
+	vi.spyOn(modelRuntime, "refresh").mockResolvedValue({ aborted: false, errors: new Map() });
 	vi.spyOn(modelRuntime, "getAvailable").mockResolvedValue([model]);
 	vi.spyOn(modelRuntime, "getAvailableSnapshot").mockReturnValue([model]);
 	const host = await RagImeRuntimeHost.create({
@@ -67,22 +106,25 @@ async function fixture(): Promise<{
 		pluginInbox: join(root, "plugin-inbox"),
 		maxSessions: 2,
 		modelRuntime,
-		emitEvent: () => undefined,
+		emitEvent: (event) => events.push(event),
 	});
-	return { host, modelRuntime, root };
+	return { host, modelRuntime, root, events };
 }
 
 afterEach(() => vi.restoreAllMocks());
 
 describe("stateless completion", () => {
 	it("sends one semantic user message without a system prompt, tools, session, images, or cache retention", async () => {
-		const { host, modelRuntime, root } = await fixture();
+		const { host, modelRuntime, root, events } = await fixture();
 		let capturedContext: Context | undefined;
 		let capturedOptions: ModelsSimpleStreamOptions | undefined;
-		vi.spyOn(modelRuntime, "completeSimple").mockImplementation(async (_model, context, options) => {
+		vi.spyOn(modelRuntime, "streamSimple").mockImplementation((_model, context, options) => {
 			capturedContext = context;
 			capturedOptions = options;
-			return assistant();
+			return completedStream({
+				reasoning: "private provider reasoning that must never cross the host boundary",
+				textChunks: ["one-", "shot result"],
+			});
 		});
 
 		try {
@@ -115,6 +157,17 @@ describe("stateless completion", () => {
 				timeoutMs: 15_000,
 			});
 			expect(Object.hasOwn(capturedOptions ?? {}, "sessionId")).toBe(false);
+			expect(events.map((event) => event.payload.type)).toEqual([
+				"completion_reasoning_progress",
+				"completion_reasoning_progress",
+				"completion_text_delta",
+				"completion_text_delta",
+			]);
+			expect(events.map((event) => event.payload.phase).filter(Boolean)).toEqual(["started", "completed"]);
+			expect(events.map((event) => event.payload.delta).filter(Boolean)).toEqual(["one-", "shot result"]);
+			expect(JSON.stringify(events)).not.toContain("private provider reasoning");
+			expect(result.reasoningChars).toBeGreaterThan(0);
+			expect(result.firstTokenMs).toBeGreaterThan(0);
 		} finally {
 			await host.dispose();
 			await rm(root, { recursive: true, force: true });
@@ -142,9 +195,9 @@ describe("stateless completion", () => {
 		}
 	});
 
-	it("omits reasoning for off and forwards supported high thinking", async () => {
+	it("omits off, forwards supported thinking, and rejects invalid levels", async () => {
 		const { host, modelRuntime, root } = await fixture();
-		const complete = vi.spyOn(modelRuntime, "completeSimple").mockResolvedValue(assistant());
+		const complete = vi.spyOn(modelRuntime, "streamSimple").mockImplementation(() => completedStream());
 
 		try {
 			await host.handle(
@@ -173,11 +226,22 @@ describe("stateless completion", () => {
 						requestId: "surface-invalid",
 						provider: "test",
 						modelId: model.id,
-						thinkingLevel: "ultra",
+						thinkingLevel: "turbo",
 						message: "answer once",
 					}),
 				),
-			).rejects.toThrow("unsupported thinking level");
+			).rejects.toThrow("Unsupported thinkingLevel: turbo");
+			await expect(
+				host.handle(
+					request("call-max", "completion.once", {
+						requestId: "surface-max",
+						provider: "test",
+						modelId: model.id,
+						thinkingLevel: "max",
+						message: "answer once",
+					}),
+				),
+			).rejects.toThrow(`does not support max thinking`);
 		} finally {
 			await host.dispose();
 			await rm(root, { recursive: true, force: true });
@@ -186,14 +250,18 @@ describe("stateless completion", () => {
 
 	it("cancels an in-flight one-shot request by request id", async () => {
 		const { host, modelRuntime, root } = await fixture();
-		vi.spyOn(modelRuntime, "completeSimple").mockImplementation(
-			async (_model, _context, options) =>
-				new Promise<AssistantMessage>((resolve) => {
-					options?.signal?.addEventListener("abort", () => resolve(assistant("aborted", "cancelled")), {
-						once: true,
-					});
-				}),
-		);
+		vi.spyOn(modelRuntime, "streamSimple").mockImplementation((_model, _context, options) => {
+			const stream = createAssistantMessageEventStream();
+			options?.signal?.addEventListener(
+				"abort",
+				() => {
+					const aborted = assistant("aborted", "cancelled");
+					stream.push({ type: "error", reason: "aborted", error: aborted });
+				},
+				{ once: true },
+			);
+			return stream;
+		});
 
 		try {
 			const pending = host.handle(
@@ -205,10 +273,16 @@ describe("stateless completion", () => {
 					message: "wait",
 				}),
 			);
-			await vi.waitFor(() => expect(modelRuntime.completeSimple).toHaveBeenCalledOnce());
+			await vi.waitFor(() => expect(modelRuntime.streamSimple).toHaveBeenCalledOnce());
 			await expect(
 				host.handle(request("cancel", "completion.cancel", { requestId: "surface-pending" })),
-			).resolves.toMatchObject({ cancelled: true });
+			).resolves.toMatchObject({
+				cancelled: true,
+				scopeReceipt: {
+					scopeId: "completion:surface-pending",
+					reason: "stateless_completion_cancelled",
+				},
+			});
 			await expect(pending).rejects.toThrow("cancelled");
 		} finally {
 			await host.dispose();

@@ -461,12 +461,22 @@ export class DefaultResourceLoader implements ResourceLoader {
 				}
 			}
 		}
+		// Overrides are an authorization boundary for managed hosts. Populate the
+		// authoritative package/top-level provenance before invoking them so a host
+		// can reject ambient extensions without also rejecting enabled Packages.
+		this.applyExtensionSourceInfo(extensionsResult.extensions, metadataByPath);
 		this.extensionsResult = this.extensionsOverride ? this.extensionsOverride(extensionsResult) : extensionsResult;
 		this.applyExtensionSourceInfo(this.extensionsResult.extensions, metadataByPath);
 
+		// Explicit caller-supplied Skill paths are an authorization decision and
+		// must win name collisions with ambient/user or Package discovery.  A
+		// managed host may deliberately pin a product Skill that is also mirrored
+		// into agentDir/skills for standalone Pi.  Loading discovered paths first
+		// makes the ambient copy win by name, after which a provenance filter can
+		// (correctly) remove it and accidentally leave no Skill at all.
 		const skillPaths = this.noSkills
-			? this.mergePaths(cliEnabledSkills, this.additionalSkillPaths)
-			: this.mergePaths([...cliEnabledSkills, ...enabledSkills], this.additionalSkillPaths);
+			? this.mergePaths(this.additionalSkillPaths, cliEnabledSkills)
+			: this.mergePaths(this.additionalSkillPaths, [...cliEnabledSkills, ...enabledSkills]);
 
 		this.lastSkillPaths = skillPaths;
 		this.updateSkillsFromPaths(skillPaths, metadataByPath);
@@ -680,7 +690,19 @@ export class DefaultResourceLoader implements ResourceLoader {
 				includeDefaults: false,
 			});
 		}
-		const resolvedSkills = this.skillsOverride ? this.skillsOverride(skillsResult) : skillsResult;
+		// Apply final provenance before the override. Managed hosts use this hook
+		// to distinguish enabled Package resources from ambient user/project
+		// discovery, including paths appended later by resources_discover.
+		const sourcedSkills = skillsResult.skills.map((skill) => ({
+			...skill,
+			sourceInfo:
+				this.findSourceInfoForPath(skill.filePath, this.extensionSkillSourceInfos, metadataByPath) ??
+				skill.sourceInfo ??
+				this.getDefaultSourceInfoForPath(skill.filePath),
+		}));
+		const resolvedSkills = this.skillsOverride
+			? this.skillsOverride({ ...skillsResult, skills: sourcedSkills })
+			: { ...skillsResult, skills: sourcedSkills };
 		this.skills = resolvedSkills.skills.map((skill) => ({
 			...skill,
 			sourceInfo:

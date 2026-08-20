@@ -1,13 +1,23 @@
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import type { ExtensionFactory } from "@earendil-works/pi-coding-agent";
 import { type BackendToolBridgeOptions, requestProductGateway } from "./tool-bridge.ts";
 
-const WORKFLOW_BLOCK_PATTERN = /\n*<rag-ime-context type="workflow_control"[^>]*>[\s\S]*?<\/rag-ime-context>\n*/gu;
+const WORKFLOW_BLOCK_PATTERN =
+	/\n*(?:<workflow-state\b[^>]*>[\s\S]*?<\/workflow-state>|<rag-ime-context type="workflow_control"[^>]*>[\s\S]*?<\/rag-ime-context>)\n*/gu;
+const MAX_TOOL_EVIDENCE_FINGERPRINTS = 10_000;
+// Loopback should normally answer in milliseconds. Eight seconds tolerates a
+// loaded local process while still bounding Agent settlement deterministically.
+const GOAL_SETTLE_GATEWAY_TIMEOUT_MS = 8_000;
+// The Product Room Kernel already bounds recovery to four repairs
+// (`SYSTEM_MAX_REPAIRS = 4`). Ordinary Goals get the same four native
+// continuation opportunities; attempt five is the final typed settle decision.
+const MAX_GOAL_SETTLE_ATTEMPTS_PER_SCOPE = 5;
 
 interface WorkflowControlOptions {
 	bridge: BackendToolBridgeOptions;
+	isEnabled?(): boolean;
+	hasActiveRoom?(): boolean;
 	onProjectComplete?(details: Record<string, unknown>): Promise<void>;
-	now?: () => Date;
 }
 
 interface WorkflowSnapshot {
@@ -31,31 +41,74 @@ function numberValue(value: unknown): number {
 	return Number.isFinite(parsed) ? Math.max(0, parsed) : 0;
 }
 
+function canonicalJson(value: unknown, ancestors = new Set<object>()): string {
+	if (Array.isArray(value)) {
+		if (ancestors.has(value)) return '"[circular]"';
+		ancestors.add(value);
+		const result = `[${value.map((item) => canonicalJson(item, ancestors)).join(",")}]`;
+		ancestors.delete(value);
+		return result;
+	}
+	if (value && typeof value === "object") {
+		if (ancestors.has(value)) return '"[circular]"';
+		ancestors.add(value);
+		const result = `{${Object.entries(value as Record<string, unknown>)
+			.sort(([left], [right]) => (left < right ? -1 : left > right ? 1 : 0))
+			.map(([key, item]) => `${JSON.stringify(key)}:${canonicalJson(item, ancestors)}`)
+			.join(",")}}`;
+		ancestors.delete(value);
+		return result;
+	}
+	if (typeof value === "bigint") return JSON.stringify(value.toString());
+	if (typeof value === "number" && !Number.isFinite(value)) return "null";
+	return JSON.stringify(value) ?? "null";
+}
+
+function toolEvidenceFingerprint(toolName: string, args: unknown, result: unknown): string {
+	const visibleResult =
+		result &&
+		typeof result === "object" &&
+		!Array.isArray(result) &&
+		Array.isArray((result as Record<string, unknown>).content)
+			? {
+					content: (result as Record<string, unknown>).content,
+					...((result as Record<string, unknown>).terminate === true ? { terminate: true } : {}),
+				}
+			: result;
+	return createHash("sha256")
+		.update(canonicalJson({ args, result: visibleResult, toolName }))
+		.digest("hex");
+}
+
+function evidenceSetDigest(fingerprints: ReadonlySet<string>): string {
+	return createHash("sha256")
+		.update([...fingerprints].sort().join("\n"))
+		.digest("hex");
+}
+
 function optionalNumber(value: unknown): number | undefined {
 	if (value === null || value === undefined || value === "") return undefined;
 	const parsed = Number(value);
 	return Number.isFinite(parsed) ? Math.max(0, parsed) : undefined;
 }
 
-function localTimestamp(date: Date): string {
-	const offsetMinutes = -date.getTimezoneOffset();
-	const sign = offsetMinutes >= 0 ? "+" : "-";
-	const absoluteOffset = Math.abs(offsetMinutes);
-	const offsetHours = String(Math.floor(absoluteOffset / 60)).padStart(2, "0");
-	const offsetRemainder = String(absoluteOffset % 60).padStart(2, "0");
-	const local = new Date(date.getTime() + offsetMinutes * 60_000).toISOString().slice(0, 19);
-	return `${local}${sign}${offsetHours}:${offsetRemainder}`;
+interface PublicPlanItem {
+	label: string;
+	status: string;
 }
 
-function publicPlanItems(value: unknown): string[] {
+function publicPlanItems(value: unknown): PublicPlanItem[] {
 	if (!Array.isArray(value)) return [];
-	return value.slice(0, 12).flatMap((item, index) => {
+	return value.slice(0, 12).flatMap((item) => {
 		const record = asRecord(item);
 		const label = text(record.text) || text(record.title) || text(record.objective);
 		if (!label) return [];
-		const status = text(record.status) || (record.completed === true ? "completed" : "pending");
-		const marker = status === "completed" ? "x" : status === "in_progress" || status === "executing" ? ">" : " ";
-		return [`${index + 1}. [${marker}] ${label.slice(0, 240)}`];
+		return [
+			{
+				label: label.slice(0, 240),
+				status: text(record.status) || (record.completed === true ? "completed" : "pending"),
+			},
+		];
 	});
 }
 
@@ -65,24 +118,29 @@ function renderWorkflow(snapshot: WorkflowSnapshot): string {
 	const gate = asRecord(snapshot.actGate);
 	const planStatus = text(plan.status);
 	const goalStatus = text(goal.status);
-	const lines = ["## 当前工作流"];
+	const lines: string[] = [];
+	const planItems = publicPlanItems(plan.items);
+	const showPlan = Boolean(planStatus) && (planStatus !== "draft" || planItems.length > 0);
 
-	if (planStatus) {
-		lines.push(`### Plan · ${planStatus}`);
-		const title = text(plan.title);
-		if (title) lines.push(title.slice(0, 320));
-		lines.push(...publicPlanItems(plan.items));
-		lines.push(
-			plan.actApproved === true
-				? "执行边界：计划已批准；写操作仍须通过产品权限与审批。"
-				: "执行边界：计划尚未批准，只能调研、阅读和修改计划，不得执行写操作。",
-		);
+	const objective = (showPlan ? text(plan.title) : "") || (goal.configured === true ? text(goal.objective) : "");
+	if (objective) {
+		lines.push(`当前任务：${objective.slice(0, 500)}`);
+	}
+
+	if (showPlan && planItems.length > 0) {
+		const completed = planItems.filter((item) => item.status === "completed").length;
+		const active = planItems.find((item) => ["in_progress", "executing"].includes(item.status));
+		const next = active ?? planItems.find((item) => item.status !== "completed");
+		const summary =
+			completed === planItems.length
+				? "全部完成"
+				: `${completed}/${planItems.length} 项完成${next ? `，正在执行：${next.label}` : ""}`;
+		lines.push(`计划：${summary}`);
+	} else if (showPlan && planStatus === "completed") {
+		lines.push("计划：全部完成");
 	}
 
 	if (goal.configured === true && goalStatus) {
-		lines.push(`### Goal · ${goalStatus}`);
-		const objective = text(goal.objective);
-		if (objective) lines.push(objective.slice(0, 500));
 		const remaining = asRecord(goal.remaining);
 		const budget = asRecord(goal.budget);
 		const remainingTokens = optionalNumber(remaining.tokens);
@@ -95,43 +153,48 @@ function renderWorkflow(snapshot: WorkflowSnapshot): string {
 				? `剩余时间 ${Math.ceil((remainingTimeMs ?? 0) / 60_000)} 分钟`
 				: "",
 		].filter(Boolean);
-		if (budgetParts.length) lines.push(budgetParts.join(" · "));
-		if (goalStatus === "paused") lines.push("Goal 已暂停，不要自行继续执行。");
+		if (budgetParts.length) lines.push(`剩余预算：${budgetParts.join(" · ")}`);
 	}
 
-	if (gate.allowed === false) {
-		lines.push(`### Act Gate\n${text(gate.message) || text(gate.reason) || "当前写操作未获批准。"}`);
+	if (goalStatus === "paused") {
+		lines.push("行动状态：已暂停，等待用户继续。");
+	} else if (Object.keys(gate).length > 0) {
+		const message = text(gate.message);
+		const reason = text(gate.reason);
+		const roomDispatch = `${message} ${reason}`.includes("Room Dispatch");
+		const state =
+			gate.allowed === true
+				? roomDispatch
+					? "当前 Room 任务已经开始，可以在本轮权限范围内继续工作。"
+					: "可以继续。"
+				: message || reason || "当前改变尚未获准。";
+		lines.push(`行动状态：${state}`);
+	} else if (goalStatus === "active" || showPlan) {
+		lines.push("行动状态：可以继续。");
 	}
 	return lines.join("\n").trim();
 }
 
-function replaceWorkflowBlock(systemPrompt: string, body: string, now: Date): string {
+function replaceWorkflowBlock(systemPrompt: string, body: string): string {
 	const base = systemPrompt.replace(WORKFLOW_BLOCK_PATTERN, "\n").trimEnd();
 	if (!body) return base;
-	return [
-		base,
-		`<rag-ime-context type="workflow_control" current_time="${localTimestamp(now)}">`,
-		body,
-		"</rag-ime-context>",
-	]
-		.filter(Boolean)
-		.join("\n");
+	return [base, "<workflow-state>", body, "</workflow-state>"].filter(Boolean).join("\n");
 }
 
-function lastAssistantUsage(messages: readonly unknown[]): { tokenDelta: number } {
-	for (let index = messages.length - 1; index >= 0; index -= 1) {
-		const record = messages[index] as unknown as Record<string, unknown>;
+function assistantUsage(messages: readonly unknown[]): { tokenDelta: number } {
+	let tokenDelta = 0;
+	for (const message of messages) {
+		const record = message as unknown as Record<string, unknown>;
 		if (record.role !== "assistant") continue;
 		const usage = asRecord(record.usage);
-		const total =
+		tokenDelta +=
 			numberValue(usage.totalTokens) ||
 			numberValue(usage.input) +
 				numberValue(usage.output) +
 				numberValue(usage.cacheRead) +
 				numberValue(usage.cacheWrite);
-		return { tokenDelta: total };
 	}
-	return { tokenDelta: 0 };
+	return { tokenDelta };
 }
 
 function completionKey(snapshot: WorkflowSnapshot): string {
@@ -152,14 +215,34 @@ export function createWorkflowControlExtension(options: WorkflowControlOptions):
 	let initializedCompletionState = false;
 	let goalActive = false;
 	let activeTurnId = "";
-	let activeUsageReport:
-		| {
-				turnId: string;
-				idempotencyKey: string;
-				tokenDelta: number;
-				elapsedDeltaMs: number;
-		  }
-		| undefined;
+	let usageReportSequence = 0;
+	let usageReportedAtMs = 0;
+	let goalSettleAttempt = 0;
+	const toolArgsByCallId = new Map<string, unknown>();
+	const seenToolEvidenceFingerprints = new Set<string>();
+	const freshToolEvidenceFingerprints = new Set<string>();
+	const queuedFollowUpKeys = new Set<string>();
+	const pendingUsageReports: Array<Record<string, unknown>> = [];
+
+	function enabled(): boolean {
+		return options.isEnabled?.() ?? true;
+	}
+
+	function clearInactiveState(): void {
+		turnStartedAtMs = 0;
+		lastCompletionKey = "";
+		initializedCompletionState = false;
+		goalActive = false;
+		activeTurnId = "";
+		usageReportSequence = 0;
+		usageReportedAtMs = 0;
+		goalSettleAttempt = 0;
+		toolArgsByCallId.clear();
+		seenToolEvidenceFingerprints.clear();
+		freshToolEvidenceFingerprints.clear();
+		queuedFollowUpKeys.clear();
+		pendingUsageReports.length = 0;
+	}
 
 	async function fetchState(
 		path: "workflow-state" | "goal-usage",
@@ -192,11 +275,41 @@ export function createWorkflowControlExtension(options: WorkflowControlOptions):
 		lastCompletionKey = key;
 	}
 
+	async function flushPendingUsageReports(): Promise<boolean> {
+		while (pendingUsageReports.length > 0) {
+			const report = pendingUsageReports[0];
+			try {
+				const snapshot = await fetchState("goal-usage", {
+					sessionId: options.bridge.sessionId,
+					...report,
+				});
+				pendingUsageReports.shift();
+				const goal = asRecord(snapshot.goal);
+				goalActive = goal.configured === true && text(goal.status) === "active";
+				await observeCompletion(snapshot);
+			} catch {
+				return false;
+			}
+		}
+		return true;
+	}
+
 	return (pi) => {
 		pi.on("before_agent_start", async (event) => {
+			if (!enabled()) {
+				clearInactiveState();
+				const systemPrompt = replaceWorkflowBlock(event.systemPrompt, "");
+				return systemPrompt === event.systemPrompt ? undefined : { systemPrompt };
+			}
 			turnStartedAtMs = Date.now();
 			activeTurnId = `turn:${randomUUID()}`;
-			activeUsageReport = undefined;
+			usageReportSequence = 0;
+			usageReportedAtMs = turnStartedAtMs;
+			goalSettleAttempt = 0;
+			toolArgsByCallId.clear();
+			seenToolEvidenceFingerprints.clear();
+			freshToolEvidenceFingerprints.clear();
+			queuedFollowUpKeys.clear();
 			try {
 				const snapshot = await fetchState("workflow-state", {
 					sessionId: options.bridge.sessionId,
@@ -204,12 +317,9 @@ export function createWorkflowControlExtension(options: WorkflowControlOptions):
 				const goal = asRecord(snapshot.goal);
 				goalActive = goal.configured === true && text(goal.status) === "active";
 				await observeCompletion(snapshot);
+				await flushPendingUsageReports();
 				return {
-					systemPrompt: replaceWorkflowBlock(
-						event.systemPrompt,
-						renderWorkflow(snapshot),
-						(options.now ?? (() => new Date()))(),
-					),
+					systemPrompt: replaceWorkflowBlock(event.systemPrompt, renderWorkflow(snapshot)),
 				};
 			} catch {
 				// Workflow state is advisory in the prompt. The Product gateway
@@ -219,29 +329,121 @@ export function createWorkflowControlExtension(options: WorkflowControlOptions):
 		});
 
 		pi.on("agent_end", async (event) => {
+			if (!enabled()) {
+				clearInactiveState();
+				return;
+			}
 			if (!options.bridge.gatewayUrl || !goalActive) return;
-			const { tokenDelta } = lastAssistantUsage(event.messages);
+			const { tokenDelta } = assistantUsage(event.messages);
 			const turnId = activeTurnId;
 			if (!turnId) return;
-			activeUsageReport ??= {
+			const sequence = ++usageReportSequence;
+			const reportAtMs = Date.now();
+			const report = {
 				turnId,
-				idempotencyKey: `goal-usage:${turnId}`,
+				eventId: `agent-end:${turnId}:${sequence}`,
+				idempotencyKey: `goal-usage:${turnId}:agent-end:${sequence}`,
 				tokenDelta,
-				elapsedDeltaMs: turnStartedAtMs > 0 ? Math.max(0, Date.now() - turnStartedAtMs) : 0,
+				elapsedDeltaMs:
+					usageReportedAtMs > 0
+						? Math.max(0, reportAtMs - usageReportedAtMs)
+						: turnStartedAtMs > 0
+							? Math.max(0, reportAtMs - turnStartedAtMs)
+							: 0,
 			};
+			usageReportedAtMs = reportAtMs;
+			pendingUsageReports.push(report);
+			// Failed usage reports remain queued and are retried at the next native
+			// lifecycle boundary. They never fail an otherwise successful turn.
+			await flushPendingUsageReports();
+
+			// Pi 0.84 has one authoritative continuation queue. An agent_end
+			// extension may append a follow-up before Pi performs its native
+			// retry/compaction/queue settlement; no custom settle hook is needed.
+			if (options.hasActiveRoom?.() || !goalActive) return;
+			const lastAssistant = [...event.messages]
+				.reverse()
+				.find((message) => (message as unknown as Record<string, unknown>).role === "assistant") as
+				| Record<string, unknown>
+				| undefined;
+			if (lastAssistant?.stopReason === "error" || lastAssistant?.stopReason === "aborted") return;
+
+			goalSettleAttempt += 1;
+			const reachedAttemptLimit = goalSettleAttempt >= MAX_GOAL_SETTLE_ATTEMPTS_PER_SCOPE;
+			const evidenceDigest = evidenceSetDigest(freshToolEvidenceFingerprints);
+			const controller = new AbortController();
+			const timeout = setTimeout(() => {
+				controller.abort(new Error(`Goal settle gateway timed out after ${GOAL_SETTLE_GATEWAY_TIMEOUT_MS}ms`));
+			}, GOAL_SETTLE_GATEWAY_TIMEOUT_MS);
+			let response: Awaited<ReturnType<typeof requestProductGateway>>;
 			try {
-				const snapshot = await fetchState("goal-usage", {
-					sessionId: options.bridge.sessionId,
-					...activeUsageReport,
-				});
-				const goal = asRecord(snapshot.goal);
-				goalActive = goal.configured === true && text(goal.status) === "active";
-				await observeCompletion(snapshot);
-			} catch {
-				// Usage telemetry must not turn a successful model response into
-				// a failed turn. Product-side enforcement remains authoritative.
+				response = await requestProductGateway(
+					options.bridge,
+					"goal-settle",
+					{
+						schemaVersion: "rag-ime.agent-goal-settle-request.v1",
+						sessionId: options.bridge.sessionId,
+						settleScopeId: activeTurnId,
+						settleAttempt: goalSettleAttempt,
+						freshToolEvidenceCount: freshToolEvidenceFingerprints.size,
+						freshToolEvidenceSha256: evidenceDigest,
+					},
+					controller.signal,
+				);
+			} catch (error) {
+				if (controller.signal.aborted) {
+					throw new Error(`Goal settle gateway timed out after ${GOAL_SETTLE_GATEWAY_TIMEOUT_MS}ms`, {
+						cause: error,
+					});
+				}
+				if (!reachedAttemptLimit) throw error;
+				goalActive = false;
+				return;
+			} finally {
+				clearTimeout(timeout);
+			}
+			const result = asRecord(response.result);
+			const state = text(result.state);
+			goalActive = state === "continue" && !reachedAttemptLimit;
+			if (state !== "continue" || reachedAttemptLimit) return;
+			const message = text(result.message);
+			const followUpKey = text(result.followUpKey);
+			const goalId = text(result.goalId);
+			if (!message || !followUpKey || !goalId) {
+				throw new Error("Goal settle follow-up response is incomplete");
+			}
+			if (queuedFollowUpKeys.has(followUpKey)) {
+				goalActive = false;
+				return;
+			}
+			queuedFollowUpKeys.add(followUpKey);
+			freshToolEvidenceFingerprints.clear();
+			pi.sendUserMessage(message, {
+				deliverAs: "followUp",
+				expandPromptTemplates: false,
+			});
+		});
+
+		pi.on("tool_execution_start", (event) => {
+			if (!enabled()) return;
+			if (toolArgsByCallId.size < MAX_TOOL_EVIDENCE_FINGERPRINTS) {
+				toolArgsByCallId.set(event.toolCallId, event.args);
 			}
 		});
+
+		pi.on("tool_execution_end", (event) => {
+			if (!enabled()) return;
+			const args = toolArgsByCallId.get(event.toolCallId);
+			toolArgsByCallId.delete(event.toolCallId);
+			if (!event.isError && seenToolEvidenceFingerprints.size < MAX_TOOL_EVIDENCE_FINGERPRINTS) {
+				const fingerprint = toolEvidenceFingerprint(event.toolName, args, event.result);
+				if (!seenToolEvidenceFingerprints.has(fingerprint)) {
+					seenToolEvidenceFingerprints.add(fingerprint);
+					freshToolEvidenceFingerprints.add(fingerprint);
+				}
+			}
+		});
+
 	};
 }
 

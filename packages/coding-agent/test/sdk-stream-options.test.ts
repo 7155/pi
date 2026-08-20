@@ -1,4 +1,4 @@
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
@@ -193,5 +193,31 @@ describe("createAgentSession stream options", () => {
 			"x-hook": "provider:model:explicit",
 		});
 		expect(options).not.toHaveProperty("transformHeaders");
+	});
+
+	it("exposes the final provider-neutral Context to observational extensions", async () => {
+		const inspectionPath = join(tempDir, "provider-context.json");
+		await captureStreamOptions(
+			"openai-completions",
+			{},
+			{},
+			`import { writeFileSync } from "node:fs";
+			export default function (pi) {
+				pi.on("provider_context_inspection", (event) => {
+					writeFileSync(${JSON.stringify(inspectionPath)}, JSON.stringify({
+						provider: event.model.provider,
+						model: event.model.id,
+						systemPrompt: event.context.systemPrompt,
+						messageCount: event.context.messages.length,
+					}));
+				});
+			}`,
+		);
+
+		expect(JSON.parse(readFileSync(inspectionPath, "utf8"))).toEqual({
+			provider: "capture-provider",
+			model: "capture-model",
+			messageCount: 0,
+		});
 	});
 });

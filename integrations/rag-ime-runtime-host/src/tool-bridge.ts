@@ -1,17 +1,43 @@
 import { createHash } from "node:crypto";
 import type { InlineExtension, ToolDefinition } from "@earendil-works/pi-coding-agent";
 import { RuntimeProtocolError } from "./protocol.ts";
-import { RESERVED_RUNTIME_TOOL_NAMES } from "./runtime-tool-names.ts";
+import { NATIVE_WORKSPACE_TOOL_NAMES, RESERVED_RUNTIME_TOOL_NAMES } from "./runtime-tool-names.ts";
+import {
+	modelVisibleResult,
+	modelVisibleToolGatewayResult,
+	successfulProductEvidenceRef,
+	ToolArtifactBuffer,
+} from "./tool-artifact-buffer.ts";
+import type { ToolResultStore } from "./tool-result-store.ts";
 
 const TOOL_NAME_PATTERN = /^[a-zA-Z][a-zA-Z0-9_.-]{0,127}$/;
 const MAX_TOOLS = 256;
+const MAX_CONCURRENT_GATEWAY_REQUESTS = 8;
+const DEFAULT_GATEWAY_REQUEST_TIMEOUT_MS = 30_000;
+const ROOM_DELEGATION_GATEWAY_REQUEST_TIMEOUT_MS = 300_000;
 
 export interface BackendToolManifest {
 	name: string;
 	description: string;
 	parameters: Record<string, unknown>;
+	/**
+	 * Hidden manifests remain registered as governed execution targets, but
+	 * never enter ToolSearch, tool_load, or the Provider-visible product
+	 * catalog. Runtime-owned native tools may project onto them.
+	 */
+	modelVisible?: boolean;
+	when?: string[];
+	notFor?: string[];
+	input?: string;
+	output?: string;
+	does?: string;
 	profile?: string;
 	risk?: string;
+	alwaysAvailable?: boolean;
+	runtimeProjections?: Array<{
+		name: string;
+		operation: string;
+	}>;
 }
 
 export interface BackendToolCatalogDiff {
@@ -30,6 +56,8 @@ export interface ToolGatewayResponse {
 	ok: boolean;
 	result?: Record<string, unknown>;
 	approval?: Record<string, unknown>;
+	roomInvocationReceipt?: Record<string, unknown>;
+	roomExecutionReceipt?: Record<string, unknown>;
 	error?: string;
 }
 
@@ -39,16 +67,147 @@ interface GatewayFetchResponse {
 	json(): Promise<unknown>;
 }
 
+type GatewayWaiter = {
+	resolve(release: () => void): void;
+	reject(error: unknown): void;
+	signal?: AbortSignal;
+	onAbort?: () => void;
+};
+
+class GatewayRequestLimiter {
+	private active = 0;
+	private readonly waiting: GatewayWaiter[] = [];
+	private readonly limit: number;
+
+	constructor(limit: number) {
+		this.limit = limit;
+	}
+
+	async run<T>(signal: AbortSignal | undefined, task: () => Promise<T>): Promise<T> {
+		const release = await this.acquire(signal);
+		try {
+			return await task();
+		} finally {
+			release();
+		}
+	}
+
+	private acquire(signal: AbortSignal | undefined): Promise<() => void> {
+		if (signal?.aborted) return Promise.reject(abortReason(signal));
+		if (this.active < this.limit) {
+			this.active += 1;
+			return Promise.resolve(this.releaseOnce());
+		}
+		return new Promise((resolve, reject) => {
+			const waiter: GatewayWaiter = { resolve, reject, signal };
+			if (signal) {
+				waiter.onAbort = () => {
+					const index = this.waiting.indexOf(waiter);
+					if (index >= 0) this.waiting.splice(index, 1);
+					reject(abortReason(signal));
+				};
+				signal.addEventListener("abort", waiter.onAbort, { once: true });
+			}
+			this.waiting.push(waiter);
+		});
+	}
+
+	private releaseOnce(): () => void {
+		let released = false;
+		return () => {
+			if (released) return;
+			released = true;
+			this.active -= 1;
+			this.startNext();
+		};
+	}
+
+	private startNext(): void {
+		while (this.waiting.length > 0 && this.active < this.limit) {
+			const waiter = this.waiting.shift();
+			if (!waiter) return;
+			if (waiter.onAbort && waiter.signal) {
+				waiter.signal.removeEventListener("abort", waiter.onAbort);
+			}
+			if (waiter.signal?.aborted) {
+				waiter.reject(abortReason(waiter.signal));
+				continue;
+			}
+			this.active += 1;
+			waiter.resolve(this.releaseOnce());
+		}
+	}
+}
+
+const gatewayRequestLimiters = new WeakMap<BackendToolBridgeOptions, GatewayRequestLimiter>();
+
+function gatewayRequestLimiter(options: BackendToolBridgeOptions): GatewayRequestLimiter {
+	let limiter = gatewayRequestLimiters.get(options);
+	if (!limiter) {
+		limiter = new GatewayRequestLimiter(MAX_CONCURRENT_GATEWAY_REQUESTS);
+		gatewayRequestLimiters.set(options, limiter);
+	}
+	return limiter;
+}
+
+function abortReason(signal: AbortSignal): unknown {
+	return signal.reason ?? new Error("Tool gateway request aborted");
+}
+
 export class BackendToolRegistry {
 	private manifest: BackendToolManifest[] = [];
-	private disclosedNames = new Set<string>();
+	private automaticDisclosedNames = new Set<string>();
+	private explicitDisclosedNames = new Set<string>();
+	private loadReceiptIds = new Map<string, string>();
+
+	snapshot(): {
+		manifest: BackendToolManifest[];
+		explicitDisclosedNames: string[];
+		loadReceipts: Array<[string, string]>;
+	} {
+		return {
+			manifest: this.list(),
+			explicitDisclosedNames: [...this.explicitDisclosedNames],
+			loadReceipts: [...this.loadReceiptIds],
+		};
+	}
+
+	restore(snapshot: ReturnType<BackendToolRegistry["snapshot"]>): void {
+		this.sync(snapshot.manifest);
+		this.explicitDisclosedNames = new Set(
+			snapshot.explicitDisclosedNames.filter((name) => this.getDiscoverable(name) !== undefined),
+		);
+		this.loadReceiptIds = new Map(snapshot.loadReceipts.filter(([name]) => this.get(name) !== undefined));
+	}
+
+	clearExplicitDisclosures(): void {
+		this.explicitDisclosedNames.clear();
+		this.loadReceiptIds.clear();
+	}
 
 	list(): BackendToolManifest[] {
 		return structuredClone(this.manifest);
 	}
 
+	catalog(): BackendToolManifest[] {
+		return structuredClone(this.manifest.filter((tool) => tool.modelVisible !== false));
+	}
+
 	disclosed(): BackendToolManifest[] {
-		return this.manifest.filter((tool) => this.disclosedNames.has(tool.name)).map((tool) => structuredClone(tool));
+		const names = [...new Set([...this.automaticDisclosedNames, ...this.explicitDisclosedNames])];
+		return names.map((name) => this.get(name)).filter((tool): tool is BackendToolManifest => tool !== undefined);
+	}
+
+	automaticallyDisclosed(): BackendToolManifest[] {
+		return this.manifest
+			.filter((tool) => this.automaticDisclosedNames.has(tool.name))
+			.map((tool) => structuredClone(tool));
+	}
+
+	explicitlyDisclosed(): BackendToolManifest[] {
+		return [...this.explicitDisclosedNames]
+			.map((name) => this.get(name))
+			.filter((tool): tool is BackendToolManifest => tool !== undefined);
 	}
 
 	get(name: string): BackendToolManifest | undefined {
@@ -56,19 +215,56 @@ export class BackendToolRegistry {
 		return tool ? structuredClone(tool) : undefined;
 	}
 
+	getDiscoverable(name: string): BackendToolManifest | undefined {
+		const tool = this.manifest.find((candidate) => candidate.name === name && candidate.modelVisible !== false);
+		return tool ? structuredClone(tool) : undefined;
+	}
+
 	disclose(name: string): BackendToolManifest {
-		const tool = this.get(name);
+		const tool = this.getDiscoverable(name);
 		if (!tool) throw new RuntimeProtocolError("TOOL_NOT_FOUND", `Unknown or unavailable product tool: ${name}`);
-		this.disclosedNames.add(name);
+		this.explicitDisclosedNames.add(name);
 		return tool;
 	}
 
 	isDisclosed(name: string): boolean {
-		return this.disclosedNames.has(name);
+		return this.automaticDisclosedNames.has(name) || this.explicitDisclosedNames.has(name);
+	}
+
+	isAutomaticallyDisclosed(name: string): boolean {
+		return this.automaticDisclosedNames.has(name);
+	}
+
+	isExplicitlyDisclosed(name: string): boolean {
+		return this.explicitDisclosedNames.has(name);
+	}
+
+	recordLoadReceipt(name: string, receiptId: string): void {
+		if (!this.get(name)) throw new RuntimeProtocolError("TOOL_NOT_FOUND", `Unknown product tool: ${name}`);
+		if (!receiptId) throw new RuntimeProtocolError("INVALID_TOOL_RECEIPT", "tool_load receipt id is required");
+		this.loadReceiptIds.set(name, receiptId);
+	}
+
+	loadReceipt(name: string): string | undefined {
+		return this.loadReceiptIds.get(name);
+	}
+
+	governedLoadReceipts(): Array<{ name: string; receiptId: string }> {
+		return this.disclosed()
+			.map((tool) => ({ name: tool.name, receiptId: this.loadReceiptIds.get(tool.name) ?? "" }))
+			.filter((item) => item.receiptId.length > 0);
+	}
+
+	rebindableLoadReceipts(): Array<{ name: string; receiptId: string }> {
+		return [...this.loadReceiptIds].map(([name, receiptId]) => ({ name, receiptId }));
 	}
 
 	revision(): string {
 		return backendToolCatalogRevision(this.manifest);
+	}
+
+	catalogRevision(): string {
+		return backendToolCatalogRevision(this.catalog());
 	}
 
 	sync(value: unknown): BackendToolManifest[] {
@@ -79,6 +275,7 @@ export class BackendToolRegistry {
 			throw new RuntimeProtocolError("INVALID_TOOL_MANIFEST", `Tool manifest exceeds ${MAX_TOOLS} tools`);
 		}
 		const names = new Set<string>();
+		const runtimeProjectionOwners = new Map<string, string>();
 		const manifest = value
 			.map((item, index): BackendToolManifest => {
 				if (typeof item !== "object" || item === null || Array.isArray(item)) {
@@ -118,19 +315,212 @@ export class BackendToolRegistry {
 				if (record.risk !== undefined && typeof record.risk !== "string") {
 					throw new RuntimeProtocolError("INVALID_TOOL_MANIFEST", `Tool ${record.name} risk must be a string`);
 				}
+				if (record.alwaysAvailable !== undefined && typeof record.alwaysAvailable !== "boolean") {
+					throw new RuntimeProtocolError(
+						"INVALID_TOOL_MANIFEST",
+						`Tool ${record.name} alwaysAvailable must be a boolean`,
+					);
+				}
+				if (record.modelVisible !== undefined && typeof record.modelVisible !== "boolean") {
+					throw new RuntimeProtocolError(
+						"INVALID_TOOL_MANIFEST",
+						`Tool ${record.name} modelVisible must be a boolean`,
+					);
+				}
+				const runtimeProjections = validateRuntimeProjections(
+					record.name,
+					record.runtimeProjections,
+					record.parameters as Record<string, unknown>,
+				);
+				for (const projection of runtimeProjections) {
+					const existingOwner = runtimeProjectionOwners.get(projection.name);
+					if (existingOwner) {
+						throw new RuntimeProtocolError(
+							"INVALID_TOOL_MANIFEST",
+							`Runtime projection ${projection.name} is owned by both ${existingOwner} and ${record.name}`,
+						);
+					}
+					runtimeProjectionOwners.set(projection.name, record.name);
+				}
+				for (const key of ["when", "notFor"] as const) {
+					if (
+						record[key] !== undefined &&
+						(!Array.isArray(record[key]) ||
+							record[key].length === 0 ||
+							record[key].some((value) => typeof value !== "string" || !value.trim()))
+					) {
+						throw new RuntimeProtocolError(
+							"INVALID_TOOL_MANIFEST",
+							`Tool ${record.name} ${key} must be a non-empty string array`,
+						);
+					}
+				}
+				for (const key of ["input", "output", "does"] as const) {
+					if (record[key] !== undefined && (typeof record[key] !== "string" || !record[key].trim())) {
+						throw new RuntimeProtocolError(
+							"INVALID_TOOL_MANIFEST",
+							`Tool ${record.name} ${key} must be a non-empty string`,
+						);
+					}
+				}
 				return {
 					name: record.name,
 					description: record.description,
 					parameters: canonicalJson(record.parameters) as Record<string, unknown>,
+					...(record.modelVisible === false ? { modelVisible: false } : {}),
+					when: record.when as string[] | undefined,
+					notFor: record.notFor as string[] | undefined,
+					input: record.input as string | undefined,
+					...(typeof record.alwaysAvailable === "boolean" ? { alwaysAvailable: record.alwaysAvailable } : {}),
+					output: record.output as string | undefined,
+					does: record.does as string | undefined,
 					profile: record.profile,
 					risk: record.risk,
+					...(runtimeProjections.length > 0 ? { runtimeProjections } : {}),
 				};
 			})
 			.sort((left, right) => left.name.localeCompare(right.name));
-		this.disclosedNames = new Set([...this.disclosedNames].filter((name) => names.has(name)));
+		this.automaticDisclosedNames = new Set(
+			manifest
+				.filter((tool) => tool.alwaysAvailable === true && tool.modelVisible !== false)
+				.map((tool) => tool.name),
+		);
+		this.explicitDisclosedNames = new Set([...this.explicitDisclosedNames].filter((name) => names.has(name)));
+		this.loadReceiptIds = new Map([...this.loadReceiptIds].filter(([name]) => names.has(name)));
 		this.manifest = manifest;
 		return this.list();
 	}
+}
+
+function validateRuntimeProjections(
+	toolName: string,
+	value: unknown,
+	parameters: Record<string, unknown>,
+): NonNullable<BackendToolManifest["runtimeProjections"]> {
+	if (value === undefined) return [];
+	if (!Array.isArray(value) || value.length === 0 || value.length > 16) {
+		throw new RuntimeProtocolError(
+			"INVALID_TOOL_MANIFEST",
+			`Tool ${toolName} runtimeProjections must contain between one and sixteen entries`,
+		);
+	}
+	const operations = operationNames(parameters);
+	const names = new Set<string>();
+	return value.map((item, index) => {
+		if (typeof item !== "object" || item === null || Array.isArray(item)) {
+			throw new RuntimeProtocolError(
+				"INVALID_TOOL_MANIFEST",
+				`Tool ${toolName} runtime projection ${index} must be an object`,
+			);
+		}
+		const projection = item as Record<string, unknown>;
+		if (
+			typeof projection.name !== "string" ||
+			!TOOL_NAME_PATTERN.test(projection.name) ||
+			!RESERVED_RUNTIME_TOOL_NAMES.has(projection.name)
+		) {
+			throw new RuntimeProtocolError(
+				"INVALID_TOOL_MANIFEST",
+				`Tool ${toolName} runtime projection ${index} has an invalid runtime-owned name`,
+			);
+		}
+		if (
+			typeof projection.operation !== "string" ||
+			!projection.operation.trim() ||
+			!operations.has(projection.operation)
+		) {
+			throw new RuntimeProtocolError(
+				"INVALID_TOOL_MANIFEST",
+				`Tool ${toolName} runtime projection ${projection.name} targets an unavailable operation`,
+			);
+		}
+		if (names.has(projection.name)) {
+			throw new RuntimeProtocolError(
+				"INVALID_TOOL_MANIFEST",
+				`Tool ${toolName} runtime projections must have unique names`,
+			);
+		}
+		names.add(projection.name);
+		return {
+			name: projection.name,
+			operation: projection.operation,
+		};
+	});
+}
+
+function operationNames(parameters: Record<string, unknown>): Set<string> {
+	const names = new Set<string>();
+	const branches = Array.isArray(parameters.oneOf) ? parameters.oneOf : [];
+	for (const branch of branches) {
+		if (typeof branch !== "object" || branch === null || Array.isArray(branch)) continue;
+		const properties = (branch as Record<string, unknown>).properties;
+		if (typeof properties !== "object" || properties === null || Array.isArray(properties)) continue;
+		const operation = (properties as Record<string, unknown>).op;
+		if (typeof operation !== "object" || operation === null || Array.isArray(operation)) continue;
+		const value = (operation as Record<string, unknown>).const;
+		if (typeof value === "string" && value) names.add(value);
+	}
+	return names;
+}
+
+export function modelVisibleBackendToolParameters(tool: BackendToolManifest): Record<string, unknown> {
+	const hidden = new Set((tool.runtimeProjections ?? []).map((item) => item.operation));
+	if (hidden.size === 0) return structuredClone(tool.parameters);
+	const schema = structuredClone(tool.parameters);
+	const branches = Array.isArray(schema.oneOf) ? schema.oneOf : [];
+	const hiddenOnlyKeys = new Set<string>();
+	const visibleKeys = new Set<string>();
+	const visibleBranches: unknown[] = [];
+	for (const branch of branches) {
+		if (typeof branch !== "object" || branch === null || Array.isArray(branch)) {
+			visibleBranches.push(branch);
+			continue;
+		}
+		const record = branch as Record<string, unknown>;
+		const properties =
+			typeof record.properties === "object" && record.properties !== null && !Array.isArray(record.properties)
+				? (record.properties as Record<string, unknown>)
+				: {};
+		const operation = properties.op;
+		const operationName =
+			typeof operation === "object" && operation !== null && !Array.isArray(operation)
+				? (operation as Record<string, unknown>).const
+				: undefined;
+		const keys = new Set([
+			...Object.keys(properties),
+			...(Array.isArray(record.required)
+				? record.required.filter((item): item is string => typeof item === "string")
+				: []),
+		]);
+		if (typeof operationName === "string" && hidden.has(operationName)) {
+			for (const key of keys) hiddenOnlyKeys.add(key);
+			continue;
+		}
+		for (const key of keys) visibleKeys.add(key);
+		visibleBranches.push(branch);
+	}
+	schema.oneOf = visibleBranches;
+	if (typeof schema.properties === "object" && schema.properties !== null && !Array.isArray(schema.properties)) {
+		const properties = schema.properties as Record<string, unknown>;
+		for (const key of hiddenOnlyKeys) {
+			if (key !== "op" && !visibleKeys.has(key)) delete properties[key];
+		}
+		const operation = properties.op;
+		if (typeof operation === "object" && operation !== null && !Array.isArray(operation)) {
+			const record = operation as Record<string, unknown>;
+			if (Array.isArray(record.enum)) {
+				record.enum = record.enum.filter((item) => typeof item !== "string" || !hidden.has(item));
+			}
+		}
+	}
+	if (Array.isArray(schema.required)) {
+		const properties =
+			typeof schema.properties === "object" && schema.properties !== null && !Array.isArray(schema.properties)
+				? (schema.properties as Record<string, unknown>)
+				: {};
+		schema.required = schema.required.filter((item) => typeof item !== "string" || item in properties);
+	}
+	return schema;
 }
 
 function canonicalJson(value: unknown): unknown {
@@ -209,12 +599,36 @@ export interface BackendToolBridgeOptions {
 	registry: BackendToolRegistry;
 	gatewayUrl?: string;
 	gatewayToken?: string;
+	gatewayTimeoutMs?: number;
+	roomCapability?: Record<string, unknown>;
+	sourceLoopId?(): string;
+	resultStore?: ToolResultStore;
 	waitForDecision?(
 		kind: "approval" | "review",
 		targetId: string,
 		details: Record<string, unknown>,
 		signal?: AbortSignal,
 	): Promise<boolean>;
+}
+
+function boundedGatewaySignal(
+	signal: AbortSignal | undefined,
+	timeoutMs: number,
+): { signal: AbortSignal; cleanup(): void } {
+	const controller = new AbortController();
+	const abortFromCaller = () => controller.abort(signal?.reason ?? new Error("Tool gateway request aborted"));
+	if (signal?.aborted) abortFromCaller();
+	else signal?.addEventListener("abort", abortFromCaller, { once: true });
+	const timeout = setTimeout(() => {
+		controller.abort(new Error(`Tool gateway request timed out after ${timeoutMs}ms`));
+	}, timeoutMs);
+	return {
+		signal: controller.signal,
+		cleanup: () => {
+			clearTimeout(timeout);
+			signal?.removeEventListener("abort", abortFromCaller);
+		},
+	};
 }
 
 export async function requestProductGateway(
@@ -224,21 +638,222 @@ export async function requestProductGateway(
 	signal: AbortSignal | undefined,
 ): Promise<ToolGatewayResponse> {
 	if (!options.gatewayUrl) throw new Error("RAG_IME_TOOL_GATEWAY_URL is not configured");
-	const headers: Record<string, string> = { "Content-Type": "application/json" };
-	if (options.gatewayToken) headers["X-RAG-IME-Agent-Token"] = options.gatewayToken;
-	const executeSuffix = "/tool/execute";
-	const base = options.gatewayUrl.endsWith(executeSuffix)
-		? options.gatewayUrl.slice(0, -executeSuffix.length)
-		: options.gatewayUrl.replace(/\/$/u, "");
-	const response = (await fetch(path === "execute" ? options.gatewayUrl : `${base}/tool/${path}`, {
-		method: "POST",
-		headers,
-		body: JSON.stringify(body),
+	const gatewayUrl = options.gatewayUrl;
+	const timeoutMs =
+		Number.isSafeInteger(options.gatewayTimeoutMs) && Number(options.gatewayTimeoutMs) > 0
+			? Number(options.gatewayTimeoutMs)
+			: DEFAULT_GATEWAY_REQUEST_TIMEOUT_MS;
+	const bounded = boundedGatewaySignal(signal, timeoutMs);
+	try {
+		return await gatewayRequestLimiter(options).run(bounded.signal, async () => {
+			const headers: Record<string, string> = { "Content-Type": "application/json" };
+			if (options.gatewayToken) headers["X-RAG-IME-Agent-Token"] = options.gatewayToken;
+			const executeSuffix = "/tool/execute";
+			const base = gatewayUrl.endsWith(executeSuffix)
+				? gatewayUrl.slice(0, -executeSuffix.length)
+				: gatewayUrl.replace(/\/$/u, "");
+			const response = (await fetch(path === "execute" ? gatewayUrl : `${base}/tool/${path}`, {
+				method: "POST",
+				headers,
+				body: JSON.stringify(body),
+				signal: bounded.signal,
+			})) as GatewayFetchResponse;
+			const payload = (await response.json()) as ToolGatewayResponse;
+			if (!response.ok || !payload.ok) {
+				throw new Error(payload.error || `Tool gateway returned HTTP ${response.status}`);
+			}
+			return payload;
+		});
+	} finally {
+		bounded.cleanup();
+	}
+}
+
+export async function requestGovernedToolLoad(
+	options: BackendToolBridgeOptions,
+	toolName: string,
+	receiptId: string,
+	signal?: AbortSignal,
+): Promise<Record<string, unknown> | undefined> {
+	if (!options.roomCapability) return undefined;
+	if (!options.registry.getDiscoverable(toolName)) {
+		throw new RuntimeProtocolError("TOOL_NOT_FOUND", `Unknown product tool: ${toolName}`);
+	}
+	const governed = await requestProductGateway(
+		options,
+		"load",
+		{
+			sessionId: options.sessionId,
+			receiptId,
+			toolName,
+			createdAtMs: Date.now(),
+		},
 		signal,
-	})) as GatewayFetchResponse;
-	const payload = (await response.json()) as ToolGatewayResponse;
-	if (!response.ok || !payload.ok) throw new Error(payload.error || `Tool gateway returned HTTP ${response.status}`);
-	return payload;
+	);
+	const result = governed.result;
+	const governedReceiptId = typeof result?.receiptId === "string" ? result.receiptId : "";
+	if (!governedReceiptId) {
+		throw new RuntimeProtocolError("INVALID_TOOL_RECEIPT", `Room tool receipt load failed: ${toolName}`);
+	}
+	return result;
+}
+
+export async function requestGovernedToolLoads(
+	options: BackendToolBridgeOptions,
+	loads: ReadonlyArray<{ name: string; receiptId: string }>,
+	signal?: AbortSignal,
+): Promise<Array<Record<string, unknown> | undefined>> {
+	if (loads.length < 1 || loads.length > 4) {
+		throw new RuntimeProtocolError("INVALID_PARAMS", "Room tool load batch must contain one to four items");
+	}
+	if (!options.roomCapability) return loads.map(() => undefined);
+	if (loads.length === 1) {
+		return [await requestGovernedToolLoad(options, loads[0].name, loads[0].receiptId, signal)];
+	}
+	for (const load of loads) {
+		if (!options.registry.getDiscoverable(load.name)) {
+			throw new RuntimeProtocolError("TOOL_NOT_FOUND", `Unknown product tool: ${load.name}`);
+		}
+	}
+	const governed = await requestProductGateway(
+		options,
+		"load",
+		{
+			sessionId: options.sessionId,
+			loads: loads.map((load) => ({
+				receiptId: load.receiptId,
+				toolName: load.name,
+			})),
+			createdAtMs: Date.now(),
+		},
+		signal,
+	);
+	const items = governed.result?.items;
+	if (!Array.isArray(items) || items.length !== loads.length) {
+		throw new RuntimeProtocolError("INVALID_TOOL_RECEIPT", "Room tool load batch returned an invalid receipt set");
+	}
+	return items.map((item, index) => {
+		if (
+			typeof item !== "object" ||
+			item === null ||
+			Array.isArray(item) ||
+			(item as Record<string, unknown>).receiptId !== loads[index].receiptId ||
+			(item as Record<string, unknown>).toolName !== loads[index].name
+		) {
+			throw new RuntimeProtocolError(
+				"INVALID_TOOL_RECEIPT",
+				`Room tool load batch receipt does not match request: ${loads[index].name}`,
+			);
+		}
+		return item as Record<string, unknown>;
+	});
+}
+
+/**
+ * Preload only hidden execution targets owned by the resident native coding
+ * tools. This is deliberately separate from tool_load: the target schemas stay
+ * absent from ToolSearch and Provider context while Room authorization still
+ * receives an exact, hash-bound load receipt.
+ */
+export async function requestGovernedNativeTargetLoads(
+	options: BackendToolBridgeOptions,
+	loads: ReadonlyArray<{ name: string; receiptId: string }>,
+	signal?: AbortSignal,
+): Promise<Array<Record<string, unknown> | undefined>> {
+	if (loads.length < 1 || loads.length > 4) {
+		throw new RuntimeProtocolError("INVALID_PARAMS", "Native target load batch must contain one to four items");
+	}
+	if (!options.roomCapability) return loads.map(() => undefined);
+	const nativeNames = new Set<string>(NATIVE_WORKSPACE_TOOL_NAMES);
+	for (const load of loads) {
+		const target = options.registry.get(load.name);
+		if (
+			!target ||
+			target.modelVisible !== false ||
+			!target.runtimeProjections?.some((projection) => nativeNames.has(projection.name))
+		) {
+			throw new RuntimeProtocolError("TOOL_NOT_FOUND", `Unknown native coding target: ${load.name}`);
+		}
+	}
+	const governed = await requestProductGateway(
+		options,
+		"load",
+		{
+			sessionId: options.sessionId,
+			loads: loads.map((load) => ({
+				receiptId: load.receiptId,
+				toolName: load.name,
+			})),
+			createdAtMs: Date.now(),
+		},
+		signal,
+	);
+	const items = governed.result?.items;
+	if (!Array.isArray(items) || items.length !== loads.length) {
+		throw new RuntimeProtocolError(
+			"INVALID_TOOL_RECEIPT",
+			"Native target load batch returned an invalid receipt set",
+		);
+	}
+	return items.map((item, index) => {
+		if (
+			typeof item !== "object" ||
+			item === null ||
+			Array.isArray(item) ||
+			(item as Record<string, unknown>).receiptId !== loads[index].receiptId ||
+			(item as Record<string, unknown>).toolName !== loads[index].name
+		) {
+			throw new RuntimeProtocolError(
+				"INVALID_TOOL_RECEIPT",
+				`Native target load receipt does not match request: ${loads[index].name}`,
+			);
+		}
+		return item as Record<string, unknown>;
+	});
+}
+
+/** Rebind disclosed schemas to the active Dispatch without reinjecting them. */
+export async function rebindGovernedToolReceipts(
+	options: BackendToolBridgeOptions,
+	dispatchId: string,
+): Promise<Array<{ name: string; receiptId: string }>> {
+	if (!options.roomCapability || !options.gatewayUrl) return [];
+	const rebound: Array<{ name: string; receiptId: string }> = [];
+	const nativeNames = new Set<string>(NATIVE_WORKSPACE_TOOL_NAMES);
+	const nativeTargets: Array<{ name: string; receiptId: string }> = [];
+	const regularTargets: Array<{ name: string; receiptId: string }> = [];
+	for (const item of options.registry.rebindableLoadReceipts()) {
+		const manifest = options.registry.get(item.name);
+		const target = {
+			name: item.name,
+			receiptId: `load:rebind:${dispatchId}:${item.name}`,
+		};
+		if (
+			manifest?.modelVisible === false &&
+			manifest.runtimeProjections?.some((projection) => nativeNames.has(projection.name))
+		) {
+			nativeTargets.push(target);
+		} else {
+			regularTargets.push(target);
+		}
+	}
+	for (const item of regularTargets) {
+		const result = await requestGovernedToolLoad(options, item.name, item.receiptId);
+		const receiptId = String(result?.receiptId ?? "");
+		options.registry.recordLoadReceipt(item.name, receiptId);
+		rebound.push({ name: item.name, receiptId });
+	}
+	for (let index = 0; index < nativeTargets.length; index += 4) {
+		const batch = nativeTargets.slice(index, index + 4);
+		const receipts = await requestGovernedNativeTargetLoads(options, batch);
+		for (const [offset, result] of receipts.entries()) {
+			const item = batch[offset];
+			const receiptId = String(result?.receiptId ?? "");
+			options.registry.recordLoadReceipt(item.name, receiptId);
+			rebound.push({ name: item.name, receiptId });
+		}
+	}
+	return rebound;
 }
 
 async function executeGatewayTool(
@@ -247,33 +862,68 @@ async function executeGatewayTool(
 	toolCallId: string,
 	args: unknown,
 	signal: AbortSignal | undefined,
-): Promise<{ content: Array<{ type: "text"; text: string }>; details: unknown }> {
+	artifacts: ToolArtifactBuffer,
+	onLifecycle?: (stage: "response_received" | "waiting_approval" | "waiting_review") => void,
+): Promise<{
+	content: Array<{ type: "text"; text: string }>;
+	details: unknown;
+	terminate?: boolean;
+}> {
+	const prepared = artifacts.prepare(tool.name, args);
+	const gatewayOptions = gatewayOptionsForToolExecution(options, tool.name, prepared.arguments);
+	const sourceLoopId = gatewayOptions.sourceLoopId?.().trim() ?? "";
 	const payload = await requestProductGateway(
-		options,
+		gatewayOptions,
 		"execute",
 		{
 			schemaVersion: "rag-ime.agent-tool-call.v1",
 			sessionId: options.sessionId,
 			toolCallId,
 			tool: tool.name,
-			args,
+			args: prepared.arguments,
+			...(sourceLoopId ? { sourceLoopId } : {}),
+			...(options.roomCapability ? { roomCapability: options.roomCapability } : {}),
+			...(options.registry.loadReceipt(tool.name) ? { loadReceiptId: options.registry.loadReceipt(tool.name) } : {}),
 		},
 		signal,
 	);
-	const result = payload.result ?? {};
+	onLifecycle?.("response_received");
+	artifacts.acknowledge(prepared.deliveryKeys);
+	const result: Record<string, unknown> = {
+		...(payload.result ?? {}),
+		...(payload.roomInvocationReceipt ? { roomInvocationReceipt: payload.roomInvocationReceipt } : {}),
+		...(payload.roomExecutionReceipt ? { roomExecutionReceipt: payload.roomExecutionReceipt } : {}),
+	};
 	if (result.reviewRequired === true) {
 		const run = typeof result.run === "object" && result.run !== null ? (result.run as Record<string, unknown>) : {};
 		const runId = String(run.runId ?? result.runId ?? "");
 		if (!runId || !options.waitForDecision) throw new Error("Product review bridge is unavailable");
+		onLifecycle?.("waiting_review");
 		const reviewed = await options.waitForDecision("review", runId, result, signal);
 		const summary = reviewed
 			? "控制中心已完成本次草案审阅。本轮不要继续调用记忆维护工具，请简要确认后结束。"
 			: "用户暂缓了本次草案审阅，未应用变更。本轮不要继续调用记忆维护工具，请简要确认后结束。";
+		const agentBlocks = artifacts.capture(result);
 		return {
 			content: [
-				{ type: "text", text: JSON.stringify({ summary, reviewState: reviewed ? "reviewed" : "deferred", runId }) },
+				{
+					type: "text",
+					text: JSON.stringify(
+						modelVisibleResult(
+							{ summary, reviewState: reviewed ? "reviewed" : "deferred", runId },
+							options.resultStore,
+							tool.name,
+							prepared.arguments,
+						),
+					),
+				},
 			],
-			details: { ...result, reviewState: reviewed ? "reviewed" : "deferred", runId },
+			details: {
+				...result,
+				reviewState: reviewed ? "reviewed" : "deferred",
+				runId,
+				...(agentBlocks.length > 0 ? { agentBlocks } : {}),
+			},
 		};
 	}
 	if (result.approvalRequired === true) {
@@ -283,6 +933,7 @@ async function executeGatewayTool(
 				: {};
 		const approvalId = String(approval.approvalId ?? result.approvalId ?? "");
 		if (!approvalId || !options.waitForDecision) throw new Error("Product approval bridge is unavailable");
+		onLifecycle?.("waiting_approval");
 		const approved = await options.waitForDecision("approval", approvalId, result, signal);
 		let resolved: Record<string, unknown> = approval;
 		try {
@@ -309,39 +960,220 @@ async function executeGatewayTool(
 			receipt?.summary ??
 				(approvalState === "applied" ? "受控操作已应用。" : "用户拒绝、审批失效或操作失败，未应用变更。"),
 		);
+		const agentBlocks = artifacts.capture(result, resolved, receipt);
 		return {
-			content: [{ type: "text", text: JSON.stringify({ summary, approvalState, receipt: receipt ?? null }) }],
-			details: { ...result, approvalState, approval: resolved },
+			content: [
+				{
+					type: "text",
+					text: JSON.stringify(
+						modelVisibleToolGatewayResult(
+							{
+								summary,
+								approvalState,
+								receipt: receipt ?? null,
+							},
+							options.resultStore,
+							tool.name,
+							prepared.arguments,
+						),
+					),
+				},
+			],
+			details: {
+				...result,
+				approvalState,
+				approval: resolved,
+				...(agentBlocks.length > 0 ? { agentBlocks } : {}),
+			},
 		};
 	}
+	const agentBlocks = artifacts.capture(result);
 	return {
-		content: [{ type: "text", text: JSON.stringify(result) }],
-		details: { ...result, toolName: tool.name },
+		content: [
+			{
+				type: "text",
+				text: JSON.stringify(
+					modelVisibleToolGatewayResult(result, options.resultStore, tool.name, prepared.arguments),
+				),
+			},
+		],
+		details: { ...result, toolName: tool.name, ...(agentBlocks.length > 0 ? { agentBlocks } : {}) },
+		...(result.terminate === true ? { terminate: true } : {}),
+	};
+}
+
+function gatewayOptionsForToolExecution(
+	options: BackendToolBridgeOptions,
+	toolName: string,
+	args: unknown,
+): BackendToolBridgeOptions {
+	if (options.gatewayTimeoutMs !== undefined || toolName !== "room_partner") return options;
+	const operation =
+		typeof args === "object" && args !== null && !Array.isArray(args)
+			? String((args as Record<string, unknown>).op ?? "")
+			: "";
+	if (operation !== "delegate" && operation !== "delegate_batch") return options;
+	return {
+		...options,
+		gatewayTimeoutMs: ROOM_DELEGATION_GATEWAY_REQUEST_TIMEOUT_MS,
 	};
 }
 
 export function createBackendToolDefinition(
 	options: BackendToolBridgeOptions,
 	tool: BackendToolManifest,
+	artifacts = new ToolArtifactBuffer(),
 ): ToolDefinition {
 	return {
 		name: tool.name,
 		label: tool.name,
 		description: tool.description,
-		parameters: tool.parameters as ToolDefinition["parameters"],
+		parameters: modelVisibleBackendToolParameters(tool) as ToolDefinition["parameters"],
 		executionMode: "parallel",
-		execute: async (toolCallId, args, signal) => executeGatewayTool(options, tool, toolCallId, args, signal),
+		execute: async (toolCallId, args, signal) =>
+			executeGatewayTool(options, tool, toolCallId, args, signal, artifacts),
+	};
+}
+
+export function createProjectedBackendToolDefinition(
+	options: BackendToolBridgeOptions,
+	projection: {
+		definition: Omit<ToolDefinition<any, any, any>, "execute"> & {
+			execute?: ToolDefinition<any, any, any>["execute"];
+		};
+		targetToolName: string;
+		mapArguments(args: unknown): Record<string, unknown>;
+		projectModelResult?(result: Record<string, unknown>): unknown;
+		lifecycle?: {
+			label: string;
+			heartbeatMs?: number;
+		};
+	},
+	artifacts = new ToolArtifactBuffer(),
+): ToolDefinition<any, any, any> {
+	const target = options.registry.get(projection.targetToolName);
+	if (!target) {
+		throw new RuntimeProtocolError(
+			"TOOL_NOT_FOUND",
+			`Projected runtime tool target is unavailable: ${projection.targetToolName}`,
+		);
+	}
+	return {
+		...projection.definition,
+		executionMode: "parallel",
+		execute: async (toolCallId, args, signal, onUpdate) => {
+			const mappedArguments = projection.mapArguments(args);
+			const lifecycle = projection.lifecycle;
+			const startedAt = Date.now();
+			let lifecycleStage: "started" | "running" | "response_received" | "waiting_approval" | "waiting_review" =
+				"started";
+			const lifecycleSummary = (stage: typeof lifecycleStage, elapsedMs: number): string => {
+				if (!lifecycle) return "";
+				switch (stage) {
+					case "started":
+						return `${lifecycle.label}已开始，正在等待受控工作区返回`;
+					case "running":
+						return `${lifecycle.label}仍在执行，已持续 ${Math.max(1, Math.floor(elapsedMs / 1_000))} 秒`;
+					case "response_received":
+						return `${lifecycle.label}已返回结果，正在整理回执`;
+					case "waiting_approval":
+						return `${lifecycle.label}正在等待必要的操作确认`;
+					case "waiting_review":
+						return `${lifecycle.label}正在等待必要的独立复核`;
+				}
+			};
+			const emitLifecycle = (stage: typeof lifecycleStage): void => {
+				if (!lifecycle || !onUpdate) return;
+				lifecycleStage = stage;
+				const elapsedMs = Math.max(0, Date.now() - startedAt);
+				onUpdate({
+					// The JSON gateway currently returns one final document. Empty content
+					// keeps lifecycle progress distinct from real stdout/stderr or file data.
+					content: [],
+					details: {
+						schemaVersion: "rag-ime.projected-tool-lifecycle.v1",
+						toolName: projection.definition.name,
+						lifecycleStage: stage,
+						summary: lifecycleSummary(stage, elapsedMs),
+						elapsedMs,
+					},
+				});
+			};
+			emitLifecycle("started");
+			const heartbeatMs = Math.max(500, lifecycle?.heartbeatMs ?? 2_000);
+			const heartbeat =
+				lifecycle && onUpdate
+					? setInterval(() => {
+							emitLifecycle(
+								lifecycleStage === "started" || lifecycleStage === "running" ? "running" : lifecycleStage,
+							);
+						}, heartbeatMs)
+					: undefined;
+			let executed: Awaited<ReturnType<typeof executeGatewayTool>>;
+			try {
+				executed = await executeGatewayTool(
+					options,
+					target,
+					toolCallId,
+					mappedArguments,
+					signal,
+					artifacts,
+					emitLifecycle,
+				);
+			} finally {
+				if (heartbeat !== undefined) clearInterval(heartbeat);
+			}
+			if (!projection.projectModelResult) return executed;
+			const details =
+				typeof executed.details === "object" && executed.details !== null && !Array.isArray(executed.details)
+					? (executed.details as Record<string, unknown>)
+					: {};
+			const projected = projection.projectModelResult(details);
+			const evidenceRef = successfulProductEvidenceRef(details);
+			const projectedWithEvidence =
+				evidenceRef.length === 0
+					? projected
+					: typeof projected === "string"
+						? `[evidence ref: ${evidenceRef}]\n${projected}`
+						: typeof projected === "object" && projected !== null && !Array.isArray(projected)
+							? {
+									evidenceRef,
+									...Object.fromEntries(
+										Object.entries(projected as Record<string, unknown>).filter(
+											([key]) => key !== "evidenceRef",
+										),
+									),
+								}
+							: { evidenceRef, result: projected };
+			const visible = modelVisibleResult(
+				projectedWithEvidence,
+				options.resultStore,
+				projection.definition.name,
+				args,
+			);
+			return {
+				...executed,
+				content: [
+					{
+						type: "text",
+						text: typeof visible === "string" ? visible : JSON.stringify(visible),
+					},
+				],
+				details: evidenceRef ? { ...details, evidenceRef } : details,
+			};
+		},
 	};
 }
 
 export function createBackendToolExtension(options: BackendToolBridgeOptions): InlineExtension {
+	const artifacts = new ToolArtifactBuffer();
 	return {
 		name: "rag-ime-backend-tools",
 		factory(pi) {
 			// Register the complete session-authorized catalog for execution lookup.
 			// Provider visibility is narrowed separately by AgentSession.active tools.
 			for (const tool of options.registry.list()) {
-				pi.registerTool(createBackendToolDefinition(options, tool));
+				pi.registerTool(createBackendToolDefinition(options, tool, artifacts));
 			}
 		},
 	};

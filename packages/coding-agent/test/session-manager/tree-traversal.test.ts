@@ -523,6 +523,34 @@ describe("createBranchedSession", () => {
 		}
 	});
 
+	it("explicitly persists extension state before the first assistant message", () => {
+		const tempDir = join(tmpdir(), `session-extension-flush-${Date.now()}`);
+		mkdirSync(tempDir, { recursive: true });
+
+		try {
+			const session = SessionManager.create(tempDir, tempDir);
+			const file = session.getSessionFile();
+			expect(file).toBeDefined();
+
+			session.appendCustomEntry("preset-state", { goal: "Ship the optional Package" });
+			expect(existsSync(file!)).toBe(false);
+
+			session.flushPendingEntries();
+			expect(existsSync(file!)).toBe(true);
+			session.appendCustomEntry("preset-state", { plan: ["verify restart"] });
+
+			const reopened = SessionManager.open(file!, tempDir);
+			const customEntries = reopened.getEntries().filter((entry) => entry.type === "custom");
+			expect(customEntries).toHaveLength(2);
+			expect(customEntries.map((entry) => entry.data)).toEqual([
+				{ goal: "Ship the optional Package" },
+				{ plan: ["verify restart"] },
+			]);
+		} finally {
+			rmSync(tempDir, { recursive: true, force: true });
+		}
+	});
+
 	it("preserves tool and summary usage across a file-backed reload", () => {
 		const tempDir = join(tmpdir(), `session-usage-roundtrip-${Date.now()}`);
 		mkdirSync(tempDir, { recursive: true });

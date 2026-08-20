@@ -18,6 +18,7 @@
 	},
 	"files": [
 		"dist",
+		"pi-packages",
 		"README.md"
 	],
 	"scripts": {

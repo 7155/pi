@@ -61,21 +61,18 @@ export class BoundedSessionPool<T extends PooledSession> {
 			const existing = this.get(sessionId);
 			if (existing) return { session: existing, created: false };
 
-			let evictedSessionId: string | undefined;
+			let victim: [string, PoolEntry<T>] | undefined;
 			if (this.entries.size >= this.maxSessions) {
 				const idleEntries = [...this.entries.entries()]
 					.filter(([, entry]) => entry.session.isIdle)
 					.sort((left, right) => left[1].lastUsedAt - right[1].lastUsedAt);
-				const victim = idleEntries[0];
+				victim = idleEntries[0];
 				if (!victim) {
 					throw new RuntimeProtocolError(
 						"SESSION_CAPACITY",
 						`Runtime session limit (${this.maxSessions}) reached and all sessions are active`,
 					);
 				}
-				this.entries.delete(victim[0]);
-				await victim[1].session.dispose();
-				evictedSessionId = victim[0];
 			}
 
 			const session = await create();
@@ -83,8 +80,17 @@ export class BoundedSessionPool<T extends PooledSession> {
 				await session.dispose();
 				throw new Error("Session factory returned a mismatched externalSessionId");
 			}
+			if (victim) {
+				try {
+					await victim[1].session.dispose();
+				} catch (error) {
+					await session.dispose();
+					throw error;
+				}
+				this.entries.delete(victim[0]);
+			}
 			this.entries.set(sessionId, { session, lastUsedAt: Date.now() });
-			return { session, created: true, evictedSessionId };
+			return { session, created: true, evictedSessionId: victim?.[0] };
 		});
 	}
 

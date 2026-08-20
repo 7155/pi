@@ -31,6 +31,34 @@ describe("bounded session pool", () => {
 		await expect(pool.open("next", async () => session("next"))).rejects.toMatchObject({ code: "SESSION_CAPACITY" });
 	});
 
+	it("keeps the idle victim when replacement creation fails", async () => {
+		const pool = new BoundedSessionPool<PooledSession>(1);
+		const current = session("current");
+		await pool.open("current", async () => current);
+
+		await expect(
+			pool.open("replacement", async () => {
+				throw new Error("replacement failed");
+			}),
+		).rejects.toThrow("replacement failed");
+
+		expect(current.dispose).not.toHaveBeenCalled();
+		expect(pool.list()).toEqual([current]);
+	});
+
+	it("keeps the idle victim and disposes the candidate when eviction disposal fails", async () => {
+		const pool = new BoundedSessionPool<PooledSession>(1);
+		const current = session("current");
+		(current.dispose as ReturnType<typeof vi.fn>).mockRejectedValueOnce(new Error("dispose failed"));
+		const replacement = session("replacement");
+		await pool.open("current", async () => current);
+
+		await expect(pool.open("replacement", async () => replacement)).rejects.toThrow("dispose failed");
+
+		expect(replacement.dispose).toHaveBeenCalledOnce();
+		expect(pool.list()).toEqual([current]);
+	});
+
 	it("does not create the same session twice when open requests overlap", async () => {
 		const pool = new BoundedSessionPool<PooledSession>(2);
 		let releaseCreate: (() => void) | undefined;

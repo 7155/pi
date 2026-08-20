@@ -1012,6 +1012,18 @@ export class SessionManager {
 		return this.sessionFile;
 	}
 
+	/**
+	 * Explicitly persist entries that were intentionally created before the first
+	 * assistant message. Normal conversations still defer creating a Session file
+	 * until an assistant reply exists; product extensions can call this after a
+	 * durable command commits Session-owned state.
+	 */
+	flushPendingEntries(): void {
+		if (!this.persist || !this.sessionFile || this.flushed) return;
+		this._rewriteFile();
+		this.flushed = true;
+	}
+
 	_persist(entry: SessionEntry): void {
 		if (!this.persist || !this.sessionFile) return;
 

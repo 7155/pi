@@ -1,10 +1,14 @@
+import { createHash } from "node:crypto";
+import { existsSync } from "node:fs";
 import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { fileURLToPath } from "node:url";
 import type { SessionManager } from "@earendil-works/pi-coding-agent";
 import { ModelRuntime } from "@earendil-works/pi-coding-agent";
 import { describe, expect, it, vi } from "vitest";
 import { PiProductSession, restoreBackendToolDisclosures } from "../src/pi-session.ts";
+import { NativePiPackageManager } from "../src/native-package-manager.ts";
 import { BackendToolRegistry } from "../src/tool-bridge.ts";
 
 function manifest(risk: string, requireQuery = false) {
@@ -24,11 +28,269 @@ function manifest(risk: string, requireQuery = false) {
 }
 
 describe("PiProductSession catalog updates", () => {
+	it("loads one pinned Room Skill body before the Agent starts and returns its receipt", async () => {
+		const root = await mkdtemp(join(tmpdir(), "pi-runtime-required-room-skill-"));
+		const agentDir = join(root, "agent");
+		const sessionDir = join(root, "sessions");
+		const activePluginDir = join(root, "plugins", "active");
+		const skillDir = join(root, "product-skills", "structured-handoff");
+		const body = "# Structured Handoff\n\nCarry the exact remaining work and evidence to the next owner.";
+		const skillHash = createHash("sha256").update(body).digest("hex");
+		await Promise.all([
+			mkdir(agentDir, { recursive: true }),
+			mkdir(sessionDir, { recursive: true }),
+			mkdir(activePluginDir, { recursive: true }),
+			mkdir(skillDir, { recursive: true }),
+		]);
+		await writeFile(
+			join(skillDir, "SKILL.md"),
+			[
+				"---",
+				"name: structured-handoff",
+				"description: Hand off bounded work.",
+				"when:",
+				"  - another owner must continue",
+				"notFor:",
+				"  - final closure with no next owner",
+				"input: remaining work and evidence",
+				"output: an addressed handoff package",
+				"does: transfer exact ownership and next action",
+				"---",
+				"",
+				body,
+			].join("\n"),
+		);
+		const modelRuntime = await ModelRuntime.create({
+			authPath: join(root, "auth.json"),
+			modelsPath: null,
+			allowModelNetwork: false,
+		});
+		const productSession = await PiProductSession.create({
+			externalSessionId: "required-room-skill-test",
+			cwd: root,
+			sessionDir,
+			agentDir,
+			activePluginDir,
+			skillPaths: [skillDir],
+			piSkillPaths: [],
+			codexSkillPaths: [],
+			modelRuntime,
+			toolManifest: [],
+			systemPrompt: "stable managed prompt",
+			roomSkillPolicy: {
+				selection: "required",
+				skillId: "structured-handoff",
+				skillHash,
+			},
+			noContextFiles: true,
+			emitEvent: () => undefined,
+		});
+
+		try {
+			expect(productSession.roomSkillLoad).toEqual({
+				schemaVersion: "rag-ime.skill-load.v1",
+				name: "structured-handoff",
+				catalogRevision: expect.stringMatching(/^[a-f0-9]{64}$/u),
+				contentRevision: skillHash,
+				loadReason: "stage_required",
+			});
+			const internal = productSession as unknown as { session: { systemPrompt: string } };
+			expect(internal.session.systemPrompt).toContain("stable managed prompt");
+			expect(internal.session.systemPrompt).toContain(
+				`<loaded_skill name="structured-handoff" revision="sha256:${skillHash}">`,
+			);
+			expect(internal.session.systemPrompt).toContain(body);
+			expect(internal.session.systemPrompt).not.toContain("description: Hand off bounded work.");
+			expect(internal.session.systemPrompt.match(/<loaded_skill /gu)).toHaveLength(1);
+			// A required Room Skill is already active, so it must not remain in
+			// Pi's deferred Skill catalog or be loadable a second time.
+			expect(internal.session.systemPrompt).not.toContain("<available_skills>");
+			expect(productSession.snapshot()).toMatchObject({ roomSkillLoad: productSession.roomSkillLoad });
+		} finally {
+			await productSession.dispose();
+			await rm(root, { recursive: true, force: true });
+		}
+	});
+
+	it("starts a managed Room with one direct room_partner tool and a projected memory capture tool", async () => {
+		const root = await mkdtemp(join(tmpdir(), "pi-runtime-room-bootstrap-"));
+		const agentDir = join(root, "agent");
+		const sessionDir = join(root, "sessions");
+		const activePluginDir = join(root, "plugins", "active");
+		await Promise.all([
+			mkdir(agentDir, { recursive: true }),
+			mkdir(sessionDir, { recursive: true }),
+			mkdir(activePluginDir, { recursive: true }),
+		]);
+		const modelRuntime = await ModelRuntime.create({
+			authPath: join(root, "auth.json"),
+			modelsPath: null,
+			allowModelNetwork: false,
+		});
+		const fetchMock = vi.fn<typeof fetch>().mockImplementation(async (_url, init) => {
+			const request = JSON.parse(String(init?.body)) as { toolName?: string };
+			return new Response(
+				JSON.stringify({
+					ok: true,
+					result: { receiptId: `receipt:${request.toolName}` },
+				}),
+				{ status: 200, headers: { "Content-Type": "application/json" } },
+			);
+		});
+		vi.stubGlobal("fetch", fetchMock);
+		let productSession: PiProductSession | undefined;
+		try {
+			productSession = await PiProductSession.create({
+				externalSessionId: "room-bootstrap-session",
+				cwd: root,
+				sessionDir,
+				agentDir,
+				activePluginDir,
+				skillPaths: [],
+				piSkillPaths: [],
+				codexSkillPaths: [],
+				modelRuntime,
+				toolManifest: [
+					{
+						name: "room_partner",
+						description: "Coordinate Room Partners and publish Room results.",
+						parameters: {
+							type: "object",
+							properties: { op: { enum: ["list", "delegate", "post"] } },
+							required: ["op"],
+						},
+						alwaysAvailable: true,
+					},
+					{
+						name: "ime_memory",
+						description: "Use governed memory.",
+						parameters: {
+							type: "object",
+							oneOf: [
+								{
+									type: "object",
+									properties: {
+										op: { const: "capture" },
+										kind: { type: "string" },
+										claim: { type: "string" },
+										captureScope: { type: "string" },
+										reason: { type: "string" },
+									},
+								},
+							],
+						},
+						runtimeProjections: [
+							{
+								name: "memory_capture",
+								operation: "capture",
+							},
+						],
+					},
+				],
+				roomCapability: {
+					manifestId: "manifest:room-bootstrap",
+					manifestHash: "c".repeat(64),
+				},
+				toolGatewayUrl: "http://127.0.0.1:8766/api/agent/tool/execute",
+				noContextFiles: true,
+				emitEvent() {},
+			});
+
+			expect(productSession.snapshot()).toMatchObject({
+				disclosedBackendTools: ["room_partner"],
+				activeBackendTools: ["room_partner"],
+			});
+			const tools = new Map(productSession.listTools().map((tool) => [String(tool.name), tool]));
+			expect(tools.get("room_partner")).toMatchObject({ active: true });
+			expect(tools.get("memory_capture")).toMatchObject({ active: true });
+			expect(tools.get("ime_memory")).toMatchObject({ active: false });
+			const requests = fetchMock.mock.calls.map(([, init]) => JSON.parse(String(init?.body))) as Array<{
+				toolName: string;
+			}>;
+			expect(requests.map((request) => request.toolName)).toEqual(["ime_memory"]);
+		} finally {
+			await productSession?.dispose();
+			vi.unstubAllGlobals();
+			await rm(root, { recursive: true, force: true });
+		}
+	});
+
+	it("exposes the complete governed native workspace tool registry", async () => {
+		const root = await mkdtemp(join(tmpdir(), "pi-runtime-five-native-tools-"));
+		const agentDir = join(root, "agent");
+		const sessionDir = join(root, "sessions");
+		const activePluginDir = join(root, "plugins", "active");
+		await Promise.all([
+			mkdir(agentDir, { recursive: true }),
+			mkdir(sessionDir, { recursive: true }),
+			mkdir(activePluginDir, { recursive: true }),
+		]);
+		const modelRuntime = await ModelRuntime.create({
+			authPath: join(root, "auth.json"),
+			modelsPath: null,
+			allowModelNetwork: false,
+		});
+		const target = (name: string, runtimeProjections: Array<{ name: string; operation: string }>) => ({
+			name,
+			description: `Run ${name}.`,
+			parameters: {
+				type: "object",
+				oneOf: runtimeProjections.map(({ operation }) => ({
+					type: "object",
+					properties: { op: { const: operation } },
+					required: ["op"],
+				})),
+			},
+			modelVisible: false,
+			runtimeProjections,
+		});
+		const productSession = await PiProductSession.create({
+			externalSessionId: "five-native-tools-session",
+			cwd: root,
+			sessionDir,
+			agentDir,
+			activePluginDir,
+			skillPaths: [],
+			piSkillPaths: [],
+			codexSkillPaths: [],
+			modelRuntime,
+			toolManifest: [
+				target("workspace_read", [{ name: "read", operation: "read" }]),
+				target("workspace_search", [
+					{ name: "grep", operation: "search" },
+					{ name: "find", operation: "search" },
+				]),
+				target("workspace_list", [{ name: "ls", operation: "list" }]),
+				target("workspace_edit", [{ name: "edit", operation: "apply" }]),
+				target("workspace_write", [{ name: "write", operation: "apply" }]),
+				target("workspace_shell", [{ name: "bash", operation: "run" }]),
+			],
+			toolGatewayUrl: "http://127.0.0.1:8766/api/agent/tool/execute",
+			noContextFiles: true,
+			emitEvent() {},
+		});
+
+		try {
+			const tools = new Map(productSession.listTools().map((tool) => [String(tool.name), tool]));
+			expect(["read", "grep", "find", "ls", "edit", "write", "bash"].map((name) => tools.get(name)?.active)).toEqual(
+				[true, true, true, true, true, true, true],
+			);
+			expect(productSession.snapshot()).toMatchObject({
+				activeBackendTools: [],
+				disclosedBackendTools: [],
+			});
+		} finally {
+			await productSession.dispose();
+			await rm(root, { recursive: true, force: true });
+		}
+	});
+
 	it("loads product Skills always and Pi/Codex Skills only through their independent settings", async () => {
 		const root = await mkdtemp(join(tmpdir(), "pi-runtime-product-skills-"));
 		const agentDir = join(root, "agent");
 		const sessionDir = join(root, "sessions");
 		const activePluginDir = join(root, "plugins", "active");
+		const promptDir = join(agentDir, "prompts");
 		const ambientSkillDir = join(agentDir, "skills", "ambient-workspace-skill");
 		const productSkillDir = join(root, "product-skills", "rag-ime-product-skill");
 		const piSkillDir = join(root, "pi-skills", "pi-user-skill");
@@ -36,12 +298,17 @@ describe("PiProductSession catalog updates", () => {
 		await Promise.all([
 			mkdir(sessionDir, { recursive: true }),
 			mkdir(activePluginDir, { recursive: true }),
+			mkdir(promptDir, { recursive: true }),
 			mkdir(ambientSkillDir, { recursive: true }),
 			mkdir(productSkillDir, { recursive: true }),
 			mkdir(piSkillDir, { recursive: true }),
 			mkdir(codexSkillDir, { recursive: true }),
 		]);
 		await Promise.all([
+			writeFile(
+				join(promptDir, "init.md"),
+				"---\ndescription: Initialize project instructions.\n---\nCreate or update AGENTS.md.\n",
+			),
 			writeFile(
 				join(ambientSkillDir, "SKILL.md"),
 				"---\nname: ambient-workspace-skill\ndescription: Must remain outside the product catalog.\n---\n",
@@ -79,6 +346,7 @@ describe("PiProductSession catalog updates", () => {
 
 		try {
 			expect(productSession.listCommands()).toEqual([
+				expect.objectContaining({ name: "init", source: "prompt" }),
 				expect.objectContaining({ name: "skill:rag-ime-product-skill" }),
 			]);
 			expect(productSession.snapshot()).toMatchObject({
@@ -89,7 +357,7 @@ describe("PiProductSession catalog updates", () => {
 			expect(JSON.stringify(productSession.listCommands())).not.toContain("pi-user-skill");
 			expect(JSON.stringify(productSession.listCommands())).not.toContain("codex-user-skill");
 		} finally {
-			productSession.dispose();
+			await productSession.dispose();
 		}
 
 		const piSession = await PiProductSession.create({
@@ -99,12 +367,13 @@ describe("PiProductSession catalog updates", () => {
 		});
 		try {
 			expect(piSession.listCommands().map((command) => command.name)).toEqual([
+				"init",
 				"skill:rag-ime-product-skill",
 				"skill:pi-user-skill",
 			]);
 			expect(piSession.snapshot()).toMatchObject({ piSkillsEnabled: true, codexSkillsEnabled: false });
 		} finally {
-			piSession.dispose();
+			await piSession.dispose();
 		}
 
 		const codexSession = await PiProductSession.create({
@@ -114,12 +383,178 @@ describe("PiProductSession catalog updates", () => {
 		});
 		try {
 			expect(codexSession.listCommands().map((command) => command.name)).toEqual([
+				"init",
 				"skill:rag-ime-product-skill",
 				"skill:codex-user-skill",
 			]);
 			expect(codexSession.snapshot()).toMatchObject({ piSkillsEnabled: false, codexSkillsEnabled: true });
 		} finally {
-			codexSession.dispose();
+			await codexSession.dispose();
+			await rm(root, { recursive: true, force: true });
+		}
+	});
+
+	it("adds and removes enabled Pi Package capabilities on Session reload", async () => {
+		const root = await mkdtemp(join(tmpdir(), "pi-runtime-package-session-"));
+		const agentDir = join(root, "agent");
+		const sessionDir = join(root, "sessions");
+		const activePluginDir = join(root, "plugins", "active");
+		const manager = new NativePiPackageManager({
+			agentDir,
+			inboxRoot: join(root, "inbox"),
+			pluginsRoot: join(root, "plugins"),
+			approvalToken: "approved-by-product",
+		});
+		await manager.initialize();
+		await Promise.all([mkdir(sessionDir, { recursive: true }), mkdir(activePluginDir, { recursive: true })]);
+		const workflowSource = fileURLToPath(new URL("../pi-packages/session-workflow", import.meta.url));
+		const subagentSource = fileURLToPath(new URL("../pi-packages/subagent", import.meta.url));
+		const prepared = await manager.prepare(workflowSource);
+		const preview = await manager.previewInstall({
+			preparedPackageId: prepared.preparedPackageId,
+			expectedDigest: prepared.digest,
+			enable: true,
+		});
+		const installed = await manager.install({
+			preparedPackageId: prepared.preparedPackageId,
+			expectedDigest: prepared.digest,
+			enable: true,
+			approvalToken: "approved-by-product",
+			previewToken: preview.previewToken,
+			payloadSha256: preview.payloadSha256,
+			confirmText: "apply",
+		});
+		const preparedSubagent = await manager.prepare(subagentSource);
+		const subagentPreview = await manager.previewInstall({
+			preparedPackageId: preparedSubagent.preparedPackageId,
+			expectedDigest: preparedSubagent.digest,
+			enable: true,
+		});
+		const installedSubagent = await manager.install({
+			preparedPackageId: preparedSubagent.preparedPackageId,
+			expectedDigest: preparedSubagent.digest,
+			enable: true,
+			approvalToken: "approved-by-product",
+			previewToken: subagentPreview.previewToken,
+			payloadSha256: subagentPreview.payloadSha256,
+			confirmText: "apply",
+		});
+		const modelRuntime = await ModelRuntime.create({
+			authPath: join(root, "auth.json"),
+			modelsPath: null,
+			allowModelNetwork: false,
+		});
+		const productSession = await PiProductSession.create({
+			externalSessionId: "package-session-test",
+			cwd: root,
+			sessionDir,
+			agentDir,
+			activePluginDir,
+			skillPaths: [],
+			piSkillPaths: [],
+			codexSkillPaths: [],
+			modelRuntime,
+			toolManifest: [],
+			isPackageCapabilityEnabled: (capability) => manager.hasEnabledCapability(capability),
+			noContextFiles: true,
+			emitEvent: () => undefined,
+		});
+
+		try {
+			const internal = productSession as unknown as {
+				resourceLoader: { getExtensions(): { errors: Array<{ path: string; error: string }> } };
+				session: { sessionManager: { getSessionFile(): string | undefined } };
+			};
+			expect(internal.resourceLoader.getExtensions().errors).toEqual([]);
+			expect(manager.hasEnabledCapability("session-workflow")).toBe(true);
+			expect(manager.hasEnabledCapability("subagent")).toBe(true);
+			expect(productSession.listCommands().map((command) => command.name)).toEqual(
+				expect.arrayContaining([
+					"goal",
+					"plan",
+					"todos",
+					"workflow",
+					"subagents",
+					"skill:session-workflow",
+					"skill:subagent",
+				]),
+			);
+			expect(productSession.listTools().map((tool) => tool.name)).toEqual(
+				expect.arrayContaining(["session_workflow", "subagent"]),
+			);
+			const goal = await productSession.invokeCommand("/goal Ship the usable TUI");
+			expect(goal).toMatchObject({
+				schemaVersion: "rag-ime.pi-package-command-invocation.v1",
+				name: "goal",
+				handled: true,
+				result: {
+					schemaVersion: "rag-ime.pi-package-command-result.v1",
+					packageId: "@paw/pi-session-workflow",
+					command: "goal",
+					message: expect.stringContaining("Ship the usable TUI"),
+				},
+			});
+			const sessionFile = internal.session.sessionManager.getSessionFile();
+			expect(sessionFile).toBeDefined();
+			expect(existsSync(sessionFile!)).toBe(true);
+			const limits = await productSession.invokeCommand("/subagents");
+			expect(limits).toMatchObject({
+				name: "subagents",
+				result: {
+					packageId: "@paw/pi-subagent",
+					message: expect.stringContaining("4 concurrent"),
+				},
+			});
+			const disabled = await manager.setEnabled({
+				packageId: installed.id,
+				enabled: false,
+				expectedActiveDigest: installed.digest,
+				expectedEnabled: true,
+				approvalToken: "approved-by-product",
+			});
+			await productSession.reloadPlugins();
+			expect(manager.hasEnabledCapability("session-workflow")).toBe(false);
+			expect(productSession.listCommands().map((command) => command.name)).not.toEqual(
+				expect.arrayContaining(["goal", "plan", "todos", "workflow", "skill:session-workflow"]),
+			);
+			expect(productSession.listCommands().map((command) => command.name)).toEqual(
+				expect.arrayContaining(["subagents", "skill:subagent"]),
+			);
+			await expect(productSession.invokeCommand("/workflow")).rejects.toMatchObject({
+				code: "COMMAND_NOT_FOUND",
+			});
+			expect(productSession.listTools().map((tool) => tool.name)).not.toContain("session_workflow");
+			expect(productSession.listTools().map((tool) => tool.name)).toContain("subagent");
+			await manager.uninstall({
+				packageId: disabled.id,
+				expectedActiveDigest: disabled.digest,
+				expectedEnabled: false,
+				approvalToken: "approved-by-product",
+			});
+			await productSession.reloadPlugins();
+			expect(productSession.listCommands().map((command) => command.name)).not.toEqual(
+				expect.arrayContaining(["goal", "plan", "todos", "workflow", "skill:session-workflow"]),
+			);
+			const disabledSubagent = await manager.setEnabled({
+				packageId: installedSubagent.id,
+				enabled: false,
+				expectedActiveDigest: installedSubagent.digest,
+				expectedEnabled: true,
+				approvalToken: "approved-by-product",
+			});
+			await productSession.reloadPlugins();
+			expect(productSession.listCommands().map((command) => command.name)).not.toEqual(
+				expect.arrayContaining(["subagents", "skill:subagent"]),
+			);
+			expect(productSession.listTools().map((tool) => tool.name)).not.toContain("subagent");
+			await manager.uninstall({
+				packageId: disabledSubagent.id,
+				expectedActiveDigest: disabledSubagent.digest,
+				expectedEnabled: false,
+				approvalToken: "approved-by-product",
+			});
+		} finally {
+			await productSession.dispose();
 			await rm(root, { recursive: true, force: true });
 		}
 	});
@@ -132,6 +567,17 @@ describe("PiProductSession catalog updates", () => {
 				name: "settings.apply",
 				description: "Apply settings.",
 				parameters: { type: "object", properties: {} },
+			},
+			{
+				name: "workspace.read",
+				description: "Read workspace files.",
+				parameters: { type: "object", properties: {} },
+			},
+			{
+				name: "workspace.search",
+				description: "Internal governed search target.",
+				parameters: { type: "object", properties: {} },
+				modelVisible: false,
 			},
 		]);
 		const sessionManager = {
@@ -153,11 +599,39 @@ describe("PiProductSession catalog updates", () => {
 					type: "message",
 					message: { role: "toolResult", toolName: "unknown.tool", isError: false },
 				},
+				{
+					type: "message",
+					message: {
+						role: "toolResult",
+						toolName: "tool_load",
+						isError: false,
+						details: { tool: { name: "workspace.search" } },
+					},
+				},
+				{
+					type: "message",
+					message: {
+						role: "toolResult",
+						toolName: "tool_load",
+						isError: false,
+						details: {
+							schemaVersion: "rag-ime.tool-load-batch.v1",
+							tools: [
+								{
+									tool: { name: "workspace.read" },
+									governedReceipt: { receiptId: "receipt:workspace-read" },
+								},
+								{ tool: { name: "missing.tool" } },
+							],
+						},
+					},
+				},
 			],
 		} as unknown as SessionManager;
 
-		expect(restoreBackendToolDisclosures(registry, sessionManager)).toEqual(["settings.apply"]);
-		expect(registry.disclosed().map((tool) => tool.name)).toEqual(["settings.apply"]);
+		expect(restoreBackendToolDisclosures(registry, sessionManager)).toEqual(["settings.apply", "workspace.read"]);
+		expect(registry.disclosed().map((tool) => tool.name)).toEqual(["settings.apply", "workspace.read"]);
+		expect(registry.loadReceipt("workspace.read")).toBe("receipt:workspace-read");
 	});
 
 	it("keeps permission-only changes in the incremental suffix and reloads only real schema changes", async () => {
@@ -214,9 +688,11 @@ describe("PiProductSession catalog updates", () => {
 			);
 			const internal = productSession as unknown as {
 				session: {
+					readonly isIdle: boolean;
 					reload(): Promise<void>;
 					agent: { resolveToolForExecution?: (name: string) => unknown };
 				};
+				onSessionEvent(event: { type: string }): void;
 			};
 			expect(internal.session.agent.resolveToolForExecution?.("memory.query")).toBeDefined();
 			const reload = vi.spyOn(internal.session, "reload").mockResolvedValue(undefined);
@@ -259,8 +735,24 @@ describe("PiProductSession catalog updates", () => {
 					}),
 				]),
 			);
+
+			const stableRegistry = productSession.toolRegistry.snapshot();
+			reload.mockRejectedValueOnce(new Error("extension reload failed"));
+			await expect(productSession.syncTools(manifest("approval", false))).rejects.toThrow(
+				"extension reload failed",
+			);
+			expect(productSession.toolRegistry.snapshot()).toEqual(stableRegistry);
+
+			const isIdle = vi.spyOn(internal.session, "isIdle", "get").mockReturnValue(false);
+			const reloadCount = reload.mock.calls.length;
+			await productSession.reloadPlugins();
+			expect(reload).toHaveBeenCalledTimes(reloadCount);
+			isIdle.mockReturnValue(true);
+			internal.onSessionEvent({ type: "agent_settled" });
+			await vi.waitFor(() => expect(reload).toHaveBeenCalledTimes(reloadCount + 1));
+			isIdle.mockRestore();
 		} finally {
-			productSession.dispose();
+			await productSession.dispose();
 			await rm(root, { recursive: true, force: true });
 		}
 	});

@@ -59,6 +59,40 @@ Skill content here.`,
 			expect(skills.some((s) => s.name === "test-skill")).toBe(true);
 		});
 
+		it("should prefer an explicit additional skill over an ambient skill with the same name", async () => {
+			const ambientSkillDir = join(agentDir, "skills", "managed-skill");
+			const explicitSkillDir = join(tempDir, "managed-skills", "managed-skill");
+			mkdirSync(ambientSkillDir, { recursive: true });
+			mkdirSync(explicitSkillDir, { recursive: true });
+			writeFileSync(
+				join(ambientSkillDir, "SKILL.md"),
+				`---
+name: managed-skill
+description: Ambient copy
+---
+Ambient body`,
+			);
+			writeFileSync(
+				join(explicitSkillDir, "SKILL.md"),
+				`---
+name: managed-skill
+description: Explicit managed copy
+---
+Explicit body`,
+			);
+
+			const loader = new DefaultResourceLoader({
+				cwd,
+				agentDir,
+				additionalSkillPaths: [explicitSkillDir],
+			});
+			await loader.reload();
+
+			const skill = loader.getSkills().skills.find((item) => item.name === "managed-skill");
+			expect(skill?.filePath).toBe(join(explicitSkillDir, "SKILL.md"));
+			expect(skill?.description).toBe("Explicit managed copy");
+		});
+
 		it("should ignore extra markdown files in auto-discovered skill dirs", async () => {
 			const skillDir = join(agentDir, "skills", "pi-skills", "browser-tools");
 			mkdirSync(skillDir, { recursive: true });

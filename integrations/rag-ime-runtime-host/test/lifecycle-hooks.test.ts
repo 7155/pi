@@ -51,7 +51,6 @@ describe("lifecycle hooks", () => {
 				gatewayUrl: "http://127.0.0.1:8766/api/agent/tool/execute",
 				gatewayToken: "token",
 			},
-			now: () => new Date("2026-07-19T02:00:00.000Z"),
 			setTimer: ((callback: () => void) => {
 				idleCallback = callback;
 				return 1;
@@ -68,6 +67,7 @@ describe("lifecycle hooks", () => {
 		})) as { systemPrompt?: string };
 		expect(start.systemPrompt).toContain('type="lifecycle_hook"');
 		expect(start.systemPrompt).toContain("无事实则跳过");
+		expect(start.systemPrompt).not.toContain("current_time");
 		const firstBody = fetchBody(fetchMock, 0);
 		expect(firstBody.eventType).toBe("session_start");
 		expect(firstBody.eventId).toMatch(/^lifecycle:session_start:[a-f0-9]{40}$/);
@@ -89,6 +89,63 @@ describe("lifecycle hooks", () => {
 			facts: [],
 			reason: "no_governed_fact_candidate",
 		});
+	});
+
+	it("keeps managed Room compaction audit-only and leaves one recovery owner", async () => {
+		const fetchMock = vi.fn(async () => ({
+			ok: true,
+			status: 200,
+			json: async () => ({
+				ok: true,
+				result: { nextTurnContext: "generic lifecycle recovery that must not be injected" },
+			}),
+		}));
+		vi.stubGlobal("fetch", fetchMock);
+		const handlers = new Map<string, Handler>();
+		const controller = createLifecycleHookController({
+			bridge: {
+				sessionId: "agent:managed-room",
+				registry: {} as never,
+				gatewayUrl: "http://127.0.0.1:8766/api/agent/tool/execute",
+			},
+			isManagedRoom: () => true,
+		});
+		controller.extension({
+			on: (name: string, handler: Handler) => handlers.set(name, handler),
+		} as never);
+
+		const result = await handlers.get("session_compact")?.(
+			{
+				reason: "manual",
+				willRetry: false,
+				compactionEntry: {
+					id: "compaction:room:1",
+					summary: "原始需求、当前任务、验收、阻塞、交接和精确回执",
+				},
+			},
+			{
+				getSystemPrompt: () => 'base\n<rag-ime-context type="lifecycle_hook">stale duplicate</rag-ime-context>',
+			},
+		);
+
+		const body = fetchBody(fetchMock, 0);
+		expect(body.eventType).toBe("compaction");
+		expect(body.payload).toMatchObject({
+			auditOnly: true,
+			contextOwner: "room_context_epoch",
+			facts: [],
+			summaryLength: 23,
+		});
+		expect(body.payload.summarySha256).toMatch(/^[a-f0-9]{64}$/);
+		expect(body.payload).not.toHaveProperty("summary");
+		expect(result).toBeUndefined();
+		const nextStart = (await handlers.get("before_agent_start")?.({
+			prompt: "continue managed Room",
+			systemPrompt: 'base\n<rag-ime-context type="lifecycle_hook">stale duplicate</rag-ime-context>',
+		})) as { systemPrompt?: string };
+		expect(nextStart.systemPrompt).toBe("base");
+		expect(nextStart.systemPrompt).not.toContain("lifecycle_hook");
+		expect(nextStart.systemPrompt).not.toContain("generic lifecycle recovery");
 	});
 
 	it("reports tool failures without replacing the original result", async () => {
@@ -145,6 +202,39 @@ describe("lifecycle hooks", () => {
 			isError: true,
 		});
 		expect(fetchBody(fetchMock, 1).eventId).toBe(body.eventId);
+	});
+
+	it("does not collapse turn_end events when Pi resets turnIndex for a new agent run", async () => {
+		const fetchMock = vi.fn(async () => ({
+			ok: true,
+			status: 200,
+			json: async () => ({ ok: true, result: {} }),
+		}));
+		vi.stubGlobal("fetch", fetchMock);
+		const handlers = new Map<string, Handler>();
+		const controller = createLifecycleHookController({
+			bridge: {
+				sessionId: "agent:turn-identity",
+				registry: {} as never,
+				gatewayUrl: "http://127.0.0.1:8766/api/agent/tool/execute",
+			},
+		});
+		controller.extension({ on: (name: string, handler: Handler) => handlers.set(name, handler) } as never);
+
+		for (const summary of ["first", "second"]) {
+			await handlers.get("agent_start")?.({ type: "agent_start" });
+			await handlers.get("turn_end")?.({
+				turnIndex: 0,
+				message: { content: [{ type: "text", text: summary }] },
+				toolResults: [],
+			});
+		}
+
+		const first = fetchBody(fetchMock, 0);
+		const second = fetchBody(fetchMock, 1);
+		expect(first.eventType).toBe("turn_end");
+		expect(second.eventType).toBe("turn_end");
+		expect(first.eventId).not.toBe(second.eventId);
 	});
 
 	it("retries the same stable completion event before the next available hook request", async () => {

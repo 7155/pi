@@ -10,9 +10,13 @@ export type RuntimeMethod =
 	| "tools.list"
 	| "tools.sync"
 	| "session.open"
+	| "session.control_state"
+	| "session.settlement.get"
+	| "session.await_settled"
 	| "session.snapshot"
 	| "session.debug.context"
 	| "session.commands"
+	| "session.command.invoke"
 	| "session.fork.candidates"
 	| "session.fork"
 	| "session.rewind"
@@ -24,15 +28,22 @@ export type RuntimeMethod =
 	| "session.model.set"
 	| "session.thinking.set"
 	| "session.close"
+	| "room.dispatch"
+	| "room.cancel"
 	| "approval.resolve"
 	| "review.resolve"
 	| "ui.resolve"
+	| "plugins.catalog"
 	| "plugins.list"
 	| "plugins.create"
+	| "plugins.package.create"
+	| "plugins.package.prepare"
 	| "plugins.validate"
+	| "plugins.install.preview"
 	| "plugins.install"
 	| "plugins.enable"
 	| "plugins.disable"
+	| "plugins.uninstall"
 	| "plugins.rollback";
 
 export interface RuntimeRequest {
@@ -40,6 +51,54 @@ export interface RuntimeRequest {
 	id: string;
 	method: RuntimeMethod;
 	params?: Record<string, unknown>;
+}
+
+export interface RoomCancelParams {
+	cancelId: string;
+	sessionId: string;
+	rootId: string;
+	dispatchId: string;
+	generation: number;
+	turnId: string;
+	capabilityEpoch: number;
+}
+
+export function parseRoomCancelParams(params: Record<string, unknown>): RoomCancelParams {
+	const requiredString = (key: keyof RoomCancelParams): string => {
+		const value = params[key];
+		if (typeof value !== "string" || value.trim().length === 0 || value.length > 240) {
+			throw new RuntimeProtocolError("INVALID_PARAMS", `${key} must be a non-empty string`);
+		}
+		return value.trim();
+	};
+	const requiredInteger = (key: "generation" | "capabilityEpoch"): number => {
+		const value = params[key];
+		if (typeof value !== "number" || !Number.isSafeInteger(value) || value < 0) {
+			throw new RuntimeProtocolError("INVALID_PARAMS", `${key} must be a non-negative safe integer`);
+		}
+		return value;
+	};
+	return {
+		cancelId: requiredString("cancelId"),
+		sessionId: requiredString("sessionId"),
+		rootId: requiredString("rootId"),
+		dispatchId: requiredString("dispatchId"),
+		generation: requiredInteger("generation"),
+		turnId: requiredString("turnId"),
+		capabilityEpoch: requiredInteger("capabilityEpoch"),
+	};
+}
+
+export function sameRoomCancelLineage(left: RoomCancelParams, right: RoomCancelParams): boolean {
+	return (
+		left.cancelId === right.cancelId &&
+		left.sessionId === right.sessionId &&
+		left.rootId === right.rootId &&
+		left.dispatchId === right.dispatchId &&
+		left.generation === right.generation &&
+		left.turnId === right.turnId &&
+		left.capabilityEpoch === right.capabilityEpoch
+	);
 }
 
 export interface RuntimeError {
@@ -144,9 +203,13 @@ const RUNTIME_METHODS = new Set<RuntimeMethod>([
 	"tools.list",
 	"tools.sync",
 	"session.open",
+	"session.control_state",
+	"session.settlement.get",
+	"session.await_settled",
 	"session.snapshot",
 	"session.debug.context",
 	"session.commands",
+	"session.command.invoke",
 	"session.fork.candidates",
 	"session.fork",
 	"session.rewind",
@@ -158,14 +221,21 @@ const RUNTIME_METHODS = new Set<RuntimeMethod>([
 	"session.model.set",
 	"session.thinking.set",
 	"session.close",
+	"room.dispatch",
+	"room.cancel",
 	"approval.resolve",
 	"review.resolve",
 	"ui.resolve",
+	"plugins.catalog",
 	"plugins.list",
 	"plugins.create",
+	"plugins.package.create",
+	"plugins.package.prepare",
 	"plugins.validate",
+	"plugins.install.preview",
 	"plugins.install",
 	"plugins.enable",
 	"plugins.disable",
+	"plugins.uninstall",
 	"plugins.rollback",
 ]);
