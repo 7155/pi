@@ -63,6 +63,17 @@ function hiddenMutationTarget(runtimeName: "edit" | "write"): BackendToolManifes
 					path: { type: "string" },
 					resourceRevision: { type: "string", pattern: "^(?:sha256:[0-9a-f]{64}|missing)$" },
 					content: { type: "string" },
+					workDocument: {
+						type: "object",
+						additionalProperties: false,
+						required: ["authorityKind", "authorityId", "authorityRevision"],
+						properties: {
+							authorityKind: { type: "string", enum: ["session_goal", "room_work_item"] },
+							authorityId: { type: "string" },
+							authorityRevision: { type: "integer" },
+							title: { type: "string" },
+						},
+					},
 				};
 	const required =
 		runtimeName === "edit"
@@ -468,15 +479,23 @@ describe("governed Pi-native workspace tools", () => {
 			undefined,
 			{} as never,
 		);
-		const writeResult = await definitions
-			.get("write")
-			?.execute(
-				"call-write",
-				{ path: "created.ts", resourceRevision: "missing", content: "export {};\n" },
-				undefined,
-				undefined,
-				{} as never,
-			);
+		const writeResult = await definitions.get("write")?.execute(
+			"call-write",
+			{
+				path: "created.ts",
+				resourceRevision: "missing",
+				content: "export {};\n",
+				workDocument: {
+					authorityKind: "session_goal",
+					authorityId: "goal:test",
+					authorityRevision: 1,
+					title: "Root",
+				},
+			},
+			undefined,
+			undefined,
+			{} as never,
+		);
 
 		expect(readResult?.content[0]).toEqual({
 			type: "text",
@@ -510,6 +529,12 @@ describe("governed Pi-native workspace tools", () => {
 				path: "created.ts",
 				resourceRevision: "missing",
 				content: "export {};\n",
+				workDocument: {
+					authorityKind: "session_goal",
+					authorityId: "goal:test",
+					authorityRevision: 1,
+					title: "Root",
+				},
 			},
 		});
 		for (const name of ["edit", "write"] as const) {
@@ -519,6 +544,7 @@ describe("governed Pi-native workspace tools", () => {
 			};
 			expect(parameters.required).toContain("resourceRevision");
 			expect(parameters.properties).not.toHaveProperty("op");
+			if (name === "write") expect(parameters.properties).toHaveProperty("workDocument");
 		}
 	});
 

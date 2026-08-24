@@ -10,11 +10,11 @@ export class SerializedJsonlOutput {
 	}
 
 	emit(value: unknown): void {
-		const record = `${JSON.stringify(value)}\n`;
 		this.tail = this.tail.then(
 			() =>
 				new Promise<void>((resolve, reject) => {
 					try {
+						const record = `${JSON.stringify(value)}\n`;
 						this.write(record, (error) => {
 							if (error) reject(error);
 							else resolve();

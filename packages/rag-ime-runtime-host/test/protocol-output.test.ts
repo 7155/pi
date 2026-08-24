@@ -1,7 +1,32 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { SerializedJsonlOutput } from "../src/protocol-output.ts";
 
 describe("SerializedJsonlOutput", () => {
+	it("does not stringify queued records until the preceding write finishes", async () => {
+		const records: string[] = [];
+		let finishFirstWrite: (() => void) | undefined;
+		const output = new SerializedJsonlOutput((record, callback) => {
+			records.push(record);
+			if (!finishFirstWrite) {
+				finishFirstWrite = () => callback();
+			} else {
+				callback();
+			}
+			return false;
+		});
+		const queuedToJson = vi.fn(() => ({ id: "queued" }));
+
+		output.emit({ id: "active" });
+		await vi.waitFor(() => expect(records).toHaveLength(1));
+		output.emit({ toJSON: queuedToJson });
+
+		expect(queuedToJson).not.toHaveBeenCalled();
+		finishFirstWrite?.();
+		await output.settle();
+		expect(queuedToJson).toHaveBeenCalledOnce();
+		expect(records.map((record) => JSON.parse(record))).toEqual([{ id: "active" }, { id: "queued" }]);
+	});
+
 	it("keeps concurrent large Runtime events and responses as complete ordered JSONL records", async () => {
 		const records: string[] = [];
 		let activeWrites = 0;

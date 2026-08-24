@@ -443,6 +443,7 @@ export function createNativeWorkspaceToolsExtension(
 					path: input.path,
 					resourceRevision: input.resourceRevision,
 					content: input.content,
+					workDocument: input.workDocument,
 				}),
 				formatMutationResult,
 				artifacts,

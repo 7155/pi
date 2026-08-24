@@ -328,6 +328,7 @@ function persistedActiveTurn(value: unknown): ActiveTurn | undefined {
 	if (!value || typeof value !== "object" || Array.isArray(value)) return undefined;
 	const source = value as Record<string, unknown>;
 	if (source.schemaVersion !== "rag-ime.pi-turn-binding.v1" || typeof source.turnId !== "string") return undefined;
+	if (source.state === "retired") return undefined;
 	const turnId = source.turnId.trim();
 	if (!turnId) return undefined;
 	return {
@@ -362,6 +363,40 @@ interface PublicCompactionState {
 }
 
 function toSerializableEvent(event: AgentSessionEvent): Record<string, unknown> {
+	if (event.type === "message_update") {
+		// Provider updates carry the same cumulative message in both fields. Keep
+		// the Runtime stream delta-sized, except for the public thinking summary.
+		const message = event.message as unknown as Record<string, unknown>;
+		const update = event.assistantMessageEvent as unknown as Record<string, unknown>;
+		const { partial: _partial, ...publicUpdate } = update;
+		const api = typeof message.api === "string" ? message.api : "";
+		const publicThinking =
+			update.type === "thinking_end" &&
+			(api === "openai-responses" || api === "openai-codex-responses") &&
+			typeof update.content === "string" &&
+			update.content
+				? [{ type: "thinking", thinking: update.content }]
+				: [];
+		const publicMessage =
+			update.type === "thinking_end"
+				? {
+						role: message.role,
+						...(api ? { api } : {}),
+						...(typeof message.responseId === "string" ? { responseId: message.responseId } : {}),
+						timestamp: message.timestamp,
+						content: publicThinking,
+					}
+				: {
+						role: message.role,
+						...(typeof message.responseId === "string" ? { responseId: message.responseId } : {}),
+						timestamp: message.timestamp,
+					};
+		return {
+			type: event.type,
+			message: publicMessage,
+			assistantMessageEvent: publicUpdate,
+		};
+	}
 	return { ...(event as unknown as Record<string, unknown>) };
 }
 
@@ -2000,6 +2035,7 @@ export class PiProductSession implements PooledSession {
 	}
 
 	private async abortWithTurnId(turnId: string): Promise<PiSessionAbortReceipt> {
+		const activeTurn = this.activeTurn;
 		const cancelledUIRequestIds = [...this.pendingUIRequests.keys()];
 		for (const pending of [...this.pendingUIRequests.values()]) pending.cancel();
 
@@ -2007,6 +2043,31 @@ export class PiProductSession implements PooledSession {
 		for (const pending of [...this.pendingDecisions.values()]) pending.resolve(false);
 
 		const lifecycle = await this.session.abort();
+		if (
+			activeTurn?.turnId === turnId &&
+			this.activeTurn?.turnId === turnId &&
+			this.session.isIdle &&
+			lifecycle.idle &&
+			lifecycle.drained
+		) {
+			// A Runtime process cannot resume in-flight Provider work after a crash.
+			// Explicit abort therefore retires the recovered product binding only
+			// after the native Session proves that every operation is drained. Keep
+			// the append-only transcript intact and do not synthesize a successful
+			// Agent settlement for work that never completed.
+			this.session.sessionManager.appendDurableCustomEntry(TURN_BINDING_CUSTOM_TYPE, {
+				schemaVersion: "rag-ime.pi-turn-binding.v1",
+				...activeTurn,
+				state: "retired",
+				reason: "explicit_abort",
+				retiredAtMs: Date.now(),
+			});
+			this.activeTurn = undefined;
+			if (this.activeRoom?.runtimeTurnId === turnId) this.activeRoom = undefined;
+			this.session.setRetryLimitOverride(undefined);
+			this.transientContext = "";
+			this.providerContextJournal.clearTurnContext();
+		}
 		return {
 			schemaVersion: "rag-ime.pi-session-abort-receipt.v1",
 			sessionId: this.externalSessionId,
