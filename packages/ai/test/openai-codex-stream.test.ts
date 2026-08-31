@@ -190,8 +190,16 @@ describe("openai-codex streaming", () => {
 			systemPrompt: "You are a helpful assistant.",
 			messages: [{ role: "user", content: "Say hello", timestamp: Date.now() }],
 		};
+		let requestPayload: Record<string, unknown> | undefined;
 
-		const streamResult = streamOpenAICodexResponses(model, context, { apiKey: token, transport: "sse" });
+		const streamResult = streamOpenAICodexResponses(model, context, {
+			apiKey: token,
+			transport: "sse",
+			maxTokens: 4096,
+			onPayload: (payload) => {
+				requestPayload = payload as Record<string, unknown>;
+			},
+		});
 		let sawTextDelta = false;
 		let sawDone = false;
 
@@ -207,6 +215,7 @@ describe("openai-codex streaming", () => {
 
 		expect(sawTextDelta).toBe(true);
 		expect(sawDone).toBe(true);
+		expect(requestPayload?.max_output_tokens).toBe(4096);
 	});
 
 	it("completes after response.completed even when the SSE body stays open", async () => {
@@ -1327,10 +1336,12 @@ describe("openai-codex streaming", () => {
 			apiKey: token,
 			sessionId: "session-auto",
 			transport: "auto",
+			maxTokens: 4096,
 		}).result();
 
 		expect(result.endTurn).toBe(false);
 		expect(sentBodies).toHaveLength(1);
+		expect((sentBodies[0] as Record<string, unknown>).max_output_tokens).toBe(4096);
 		expect(capturedWebSocketHeaders?.["session-id"]).toBe("session-auto");
 		expect(capturedWebSocketHeaders?.session_id).toBeUndefined();
 		expect(capturedWebSocketHeaders?.["x-client-request-id"]).toBe("session-auto");
@@ -2090,6 +2101,7 @@ describe("openai-codex streaming", () => {
 			apiKey: token,
 			sessionId: "session-1",
 			transport: "websocket-cached",
+			maxTokens: 4096,
 		}).result();
 
 		const secondContext: Context = {
@@ -2112,15 +2124,18 @@ describe("openai-codex streaming", () => {
 			apiKey: token,
 			sessionId: "session-1",
 			transport: "websocket-cached",
+			maxTokens: 4096,
 		}).result();
 
 		expect(sentBodies).toHaveLength(2);
 		const firstBody = sentBodies[0] as { input: unknown[]; previous_response_id?: string; store?: boolean };
 		const secondBody = sentBodies[1] as { input: unknown[]; previous_response_id?: string; store?: boolean };
 		expect(firstBody.store).toBe(false);
+		expect((firstBody as Record<string, unknown>).max_output_tokens).toBe(4096);
 		expect(firstBody.previous_response_id).toBeUndefined();
 		expect(firstBody.input).toEqual([{ role: "user", content: [{ type: "input_text", text: "Use the tool" }] }]);
 		expect(secondBody.store).toBe(false);
+		expect((secondBody as Record<string, unknown>).max_output_tokens).toBe(4096);
 		expect(secondBody.previous_response_id).toBe("resp_1");
 		expect(secondBody.input).toEqual([
 			{ type: "custom_tool_call_output", call_id: "call_1", output: "real result" },

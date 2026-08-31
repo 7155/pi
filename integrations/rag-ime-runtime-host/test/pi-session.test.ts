@@ -64,6 +64,39 @@ function assistantWith(
 }
 
 describe("native Pi conversation fork", () => {
+	it("applies a bounded Provider output budget when selecting a model", async () => {
+		const productSession = Object.create(PiProductSession.prototype) as PiProductSession;
+		const model = {
+			id: "gpt-5.6-luna",
+			name: "GPT-5.6 Luna",
+			api: "openai-codex-responses",
+			provider: "openai-codex",
+			baseUrl: "https://chatgpt.com/backend-api",
+			reasoning: true,
+			input: ["text"],
+			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+			contextWindow: 372_000,
+			maxTokens: 128_000,
+		};
+		const setModel = vi.fn(async () => undefined);
+		Object.assign(productSession as unknown as Record<string, unknown>, {
+			session: {
+				isIdle: true,
+				modelRuntime: { getModel: () => model },
+				setModel,
+			},
+		});
+
+		const selected = await productSession.setModel(
+			"openai-codex",
+			"gpt-5.6-luna",
+			16_384,
+		);
+
+		expect(setModel).toHaveBeenCalledWith({ ...model, maxTokens: 16_384 });
+		expect(selected.maxTokens).toBe(16_384);
+	});
+
 	it("creates a distinct transcript at the selected user anchor without mutating the source", async () => {
 		const root = await mkdtemp(join(tmpdir(), "pi-runtime-host-fork-"));
 		try {

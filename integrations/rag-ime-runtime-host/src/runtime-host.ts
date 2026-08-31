@@ -168,6 +168,15 @@ function optionalTimeoutMs(params: Record<string, unknown>): number {
 	return value;
 }
 
+function optionalMaxTokens(params: Record<string, unknown>): number | undefined {
+	const value = params.maxTokens;
+	if (value === undefined || value === null) return undefined;
+	if (typeof value !== "number" || !Number.isSafeInteger(value) || value < 16 || value > 262_144) {
+		throw new RuntimeProtocolError("INVALID_PARAMS", "maxTokens must be an integer between 16 and 262144");
+	}
+	return value;
+}
+
 function requiredGeneration(params: Record<string, unknown>): number {
 	return requiredNonNegativeInteger(params, "generation");
 }
@@ -963,6 +972,7 @@ export class RagImeRuntimeHost {
 				return this.session(params).setModel(
 					requiredString(params, "provider", 80),
 					requiredString(params, "modelId", 200),
+					optionalMaxTokens(params),
 				);
 			case "session.thinking.set": {
 				const level = requiredString(params, "level", 20);

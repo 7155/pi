@@ -1,6 +1,7 @@
 import { mkdir, mkdtemp, realpath, rm, symlink, writeFile } from "node:fs/promises";
 import { homedir, tmpdir } from "node:os";
 import { delimiter, join, resolve } from "node:path";
+import { ModelRuntime } from "@earendil-works/pi-coding-agent";
 import { Agent, EnvHttpProxyAgent, getGlobalDispatcher, setGlobalDispatcher } from "undici";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
@@ -137,6 +138,78 @@ describe("runtime host provider transport", () => {
 			} else {
 				process.env.HTTPS_PROXY = originalHttpsProxy;
 			}
+			await rm(root, { recursive: true, force: true });
+		}
+	});
+});
+
+describe("runtime host bounded model selection", () => {
+	it("applies and reports the Provider output budget through session.model.set", async () => {
+		const root = await mkdtemp(join(tmpdir(), "rag-ime-runtime-model-budget-"));
+		let host: RagImeRuntimeHost | undefined;
+		try {
+			await writeFile(
+				join(root, "auth.json"),
+				JSON.stringify({ anthropic: { type: "api_key", key: "test-key" } }),
+			);
+			const modelRuntime = await ModelRuntime.create({
+				authPath: join(root, "auth.json"),
+				modelsPath: null,
+				allowModelNetwork: false,
+			});
+			const selected = modelRuntime
+				.getModels()
+				.find((candidate) => candidate.provider === "anthropic" && candidate.maxTokens >= 16_384);
+			expect(selected).toBeDefined();
+			host = await RagImeRuntimeHost.create({
+				agentDir: join(root, "agent"),
+				sessionDir: join(root, "sessions"),
+				pluginsRoot: join(root, "plugins"),
+				pluginInbox: join(root, "plugin-inbox"),
+				maxSessions: 1,
+				modelRuntime,
+				emitEvent: () => undefined,
+			});
+			await host.handle({
+				protocolVersion: "2",
+				id: "open",
+				method: "session.open",
+				params: {
+					sessionId: "session:model-budget",
+					cwd: root,
+					provider: selected?.provider,
+					modelId: selected?.id,
+				},
+			});
+
+			await expect(
+				host.handle({
+					protocolVersion: "2",
+					id: "select",
+					method: "session.model.set",
+					params: {
+						sessionId: "session:model-budget",
+						provider: selected?.provider,
+						modelId: selected?.id,
+						maxTokens: 16_384,
+					},
+				}),
+			).resolves.toMatchObject({ maxTokens: 16_384 });
+			await expect(
+				host.handle({
+					protocolVersion: "2",
+					id: "invalid-select",
+					method: "session.model.set",
+					params: {
+						sessionId: "session:model-budget",
+						provider: selected?.provider,
+						modelId: selected?.id,
+						maxTokens: 15,
+					},
+				}),
+			).rejects.toThrow("maxTokens must be an integer between 16 and 262144");
+		} finally {
+			await host?.dispose();
 			await rm(root, { recursive: true, force: true });
 		}
 	});

@@ -89,6 +89,7 @@ interface RequestBody {
 	tools?: OpenAITool[];
 	tool_choice?: OpenAICodexResponsesOptions["toolChoice"];
 	parallel_tool_calls?: boolean;
+	max_output_tokens?: number;
 	temperature?: number;
 	reasoning?: { effort?: string; summary?: string };
 	service_tier?: ResponseCreateParamsStreaming["service_tier"];
@@ -561,6 +562,10 @@ function buildRequestBody(
 
 	if (options?.temperature !== undefined) {
 		body.temperature = options.temperature;
+	}
+
+	if (options?.maxTokens !== undefined) {
+		body.max_output_tokens = Math.max(16, Math.floor(options.maxTokens));
 	}
 
 	if (options?.serviceTier !== undefined) {

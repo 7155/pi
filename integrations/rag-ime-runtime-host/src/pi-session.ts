@@ -2370,14 +2370,21 @@ export class PiProductSession implements PooledSession {
 		};
 	}
 
-	async setModel(provider: string, modelId: string): Promise<Record<string, unknown>> {
+	async setModel(provider: string, modelId: string, maxTokens?: number): Promise<Record<string, unknown>> {
 		if (!this.session.isIdle) {
 			throw new RuntimeProtocolError("SESSION_BUSY", "Session must be idle before changing models");
 		}
 		const model = this.session.modelRuntime.getModel(provider, modelId);
 		if (!model) throw new RuntimeProtocolError("MODEL_NOT_FOUND", `Model not found: ${provider}/${modelId}`);
-		await this.session.setModel(model);
-		return publicSessionModel(model);
+		const selected =
+			maxTokens === undefined
+				? model
+				: {
+						...model,
+						maxTokens: Math.min(maxTokens, model.maxTokens > 0 ? model.maxTokens : maxTokens),
+					};
+		await this.session.setModel(selected);
+		return publicSessionModel(selected);
 	}
 
 	setThinkingLevel(level: NonNullable<CreateAgentSessionOptions["thinkingLevel"]>): Record<string, unknown> {
