@@ -564,10 +564,6 @@ function buildRequestBody(
 		body.temperature = options.temperature;
 	}
 
-	if (options?.maxTokens !== undefined) {
-		body.max_output_tokens = Math.max(16, Math.floor(options.maxTokens));
-	}
-
 	if (options?.serviceTier !== undefined) {
 		body.service_tier = options.serviceTier;
 	}
