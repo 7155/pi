@@ -1007,8 +1007,7 @@ function gatewayOptionsForToolExecution(
 	toolName: string,
 	args: unknown,
 ): BackendToolBridgeOptions {
-	if (options.gatewayTimeoutMs !== undefined) return options;
-	if (toolName === "workspace_shell") {
+	if (options.gatewayTimeoutMs === undefined && toolName === "workspace_shell") {
 		const requested = typeof args === "object" && args !== null && !Array.isArray(args)
 			? (args as Record<string, unknown>).timeoutSeconds : undefined;
 		// Match the governed shell's 120-second cap, plus time for queueing and
@@ -1017,7 +1016,7 @@ function gatewayOptionsForToolExecution(
 			? Math.max(1, Math.min(120, requested)) : 30;
 		return { ...options, gatewayTimeoutMs: seconds * 1_000 + DEFAULT_GATEWAY_REQUEST_TIMEOUT_MS };
 	}
-	if (toolName !== "room_partner") return options;
+	if (options.gatewayTimeoutMs !== undefined || toolName !== "room_partner") return options;
 	const operation =
 		typeof args === "object" && args !== null && !Array.isArray(args)
 			? String((args as Record<string, unknown>).op ?? "")
