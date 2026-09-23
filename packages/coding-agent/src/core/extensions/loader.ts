@@ -516,6 +516,8 @@ async function loadExtensionModule(extensionPath: string, cacheToken?: Extension
 			: await getBuiltNodeModuleResolution();
 	const jiti = createJitiImpl(import.meta.url, {
 		moduleCache: false,
+		// Installed runtime generations are immutable; keep transforms in user state.
+		fsCache: path.join(getAgentDir(), "cache", "jiti"),
 		...resolutionOptions,
 	});
 
