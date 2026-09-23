@@ -5,7 +5,7 @@ Weasel product. It is deliberately kept outside upstream Pi's `packages/*`
 workspace so product policy and protocol code do not alter upstream package or
 lockfile ownership.
 
-The integration targets Pi `0.84.2` and exposes a versioned JSONL protocol over
+The integration targets Pi `0.87.1` and exposes a versioned JSONL protocol over
 stdin/stdout. Callers must not parse or edit Pi session files directly.
 
 ## Ownership boundary
