@@ -1,0 +1,14 @@
+{
+  "name": "@paw/pi-session-workflow",
+  "version": "0.1.0",
+  "description": "Optional Session-local Goal, Plan, Todo, and Workflow controls for Pi",
+  "private": true,
+  "type": "module",
+  "pi": {
+    "extensions": ["./index.ts"],
+    "skills": ["./skills"]
+  },
+  "paw": {
+    "capabilities": ["session-workflow"]
+  }
+}

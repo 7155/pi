@@ -1,0 +1,90 @@
+import { describe, expect, it } from "vitest";
+import { pendingRoomCancellationSurfaces, roomCancellationSurfaces } from "../src/cancellation-receipts.ts";
+
+describe("Room cancellation receipts", () => {
+	it("keeps pending and failed runtime operations visible instead of claiming termination", () => {
+		const surfaces = roomCancellationSurfaces("session:1", ["room-continuation"], {
+			schemaVersion: "rag-ime.pi-session-abort-receipt.v1",
+			sessionId: "session:1",
+			turnId: "turn:1",
+			cancelledDecisionIds: [],
+			cancelledUIRequestIds: [],
+			lifecycle: {
+				schemaVersion: "pi.agent-abort-receipt.v1",
+				source: "runtime_host_adapter",
+				scopeId: "scope:1",
+				generation: 2,
+				reason: "user_abort",
+				cancelledContinuationIds: ["agent-continuation"],
+				cancelledOperationIds: ["provider"],
+				failedOperationIds: ["tool:1"],
+				operations: [
+					{ operationId: "provider", kind: "provider", registeredAt: 1 },
+					{ operationId: "tool:1", kind: "tool", registeredAt: 2 },
+					{ operationId: "auto-compaction", kind: "auto_compaction", registeredAt: 3 },
+				],
+				pendingOperations: [{ operationId: "auto-compaction", kind: "auto_compaction", registeredAt: 3 }],
+				drained: false,
+				idle: false,
+			},
+		});
+
+		expect(surfaces.provider.state).toBe("terminated");
+		expect(surfaces.tool.state).toBe("unknown");
+		expect(surfaces.compaction.state).toBe("requested");
+		expect(surfaces.session.state).toBe("requested");
+		expect(surfaces.continuation.targetIds).toEqual(["session:1", "room-continuation", "agent-continuation"]);
+		expect(pendingRoomCancellationSurfaces(surfaces)).toEqual(["tool", "compaction", "session"]);
+	});
+
+	it("maps every registered Agent lifecycle kind to its exact Room cancellation surface", () => {
+		const operationKinds = [
+			["provider:1", "provider"],
+			["tool:1", "tool"],
+			["exec:1", "bash_process"],
+			["retry:1", "retry_sleep"],
+			["manual-compaction:1", "manual_compaction"],
+			["auto-compaction:1", "auto_compaction"],
+			["branch-summary:1", "branch_summary"],
+			["timer:1", "continuation_timer"],
+		] as const;
+		const surfaces = roomCancellationSurfaces("session:all", ["room-continuation:1"], {
+			schemaVersion: "rag-ime.pi-session-abort-receipt.v1",
+			sessionId: "session:all",
+			turnId: "turn:all",
+			cancelledDecisionIds: [],
+			cancelledUIRequestIds: [],
+			lifecycle: {
+				schemaVersion: "pi.agent-abort-receipt.v1",
+				source: "runtime_host_adapter",
+				scopeId: "scope:all",
+				generation: 3,
+				reason: "user_abort",
+				cancelledContinuationIds: ["agent-continuation:1"],
+				cancelledOperationIds: operationKinds.map(([operationId]) => operationId),
+				failedOperationIds: [],
+				operations: operationKinds.map(([operationId, kind], index) => ({
+					operationId,
+					kind,
+					registeredAt: index + 1,
+				})),
+				pendingOperations: [],
+				drained: true,
+				idle: true,
+			},
+		});
+
+		expect(pendingRoomCancellationSurfaces(surfaces)).toEqual([]);
+		expect(surfaces.provider.targetIds).toContain("provider:1");
+		expect(surfaces.tool.targetIds).toContain("tool:1");
+		expect(surfaces.exec.targetIds).toContain("exec:1");
+		expect(surfaces.retry.targetIds).toContain("retry:1");
+		expect(surfaces.compaction.targetIds).toEqual(
+			expect.arrayContaining(["manual-compaction:1", "auto-compaction:1"]),
+		);
+		expect(surfaces.branch_summary.targetIds).toContain("branch-summary:1");
+		expect(surfaces.timer.targetIds).toContain("timer:1");
+		expect(surfaces.continuation.targetIds).toEqual(["session:all", "room-continuation:1", "agent-continuation:1"]);
+		expect(surfaces.session.targetIds).toEqual(["session:all", "turn:all"]);
+	});
+});

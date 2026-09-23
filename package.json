@@ -23,6 +23,7 @@
 		"check:pinned-deps": "node scripts/check-pinned-deps.mjs",
 		"check:runtime-deps": "node scripts/check-runtime-deps.mjs",
 		"check:package-install": "node scripts/coding-agent-consumer.mjs",
+		"check:rag-ime-runtime-host": "tsgo --noEmit -p integrations/rag-ime-runtime-host/tsconfig.build.json && tsgo --noEmit -p integrations/rag-ime-runtime-host/tsconfig.packages.json",
 		"check:shrinkwrap": "node scripts/generate-coding-agent-shrinkwrap.mjs --check",
 		"check:install-lock:coding-agent": "node scripts/generate-coding-agent-install-lock.mjs --check",
 		"check:ts-imports": "node scripts/check-ts-relative-imports.mjs",
@@ -36,7 +37,8 @@
 		"check:model-catalog": "node scripts/publish-model-catalog.mjs --input .artifacts/model-catalog --dry-run",
 		"profile:tui": "node scripts/profile-coding-agent-node.mjs --mode tui",
 		"profile:rpc": "node scripts/profile-coding-agent-node.mjs --mode rpc",
-		"test": "npm run test:scripts && npm run test --workspaces --if-present",
+		"test": "npm run test:scripts && npm run test --workspaces --if-present && npm run test:rag-ime-runtime-host",
+		"test:rag-ime-runtime-host": "vitest --run --config integrations/rag-ime-runtime-host/vitest.config.ts",
 		"test:scripts": "node --test scripts/*.test.mjs",
 		"version:patch": "npm version patch --workspaces --no-git-tag-version --no-workspaces-update && node scripts/sync-versions.js && npm install --package-lock-only --ignore-scripts",
 		"version:minor": "npm version minor --workspaces --no-git-tag-version --no-workspaces-update && node scripts/sync-versions.js && npm install --package-lock-only --ignore-scripts",
@@ -52,7 +54,8 @@
 		"release:minor": "node scripts/release.mjs minor",
 		"release:major": "node scripts/release.mjs major",
 		"release:fix-links": "node scripts/release-notes.mjs fix-github-releases",
-		"prepare": "husky"
+		"prepare": "husky",
+		"build:rag-ime-runtime-host": "tsgo -p integrations/rag-ime-runtime-host/tsconfig.build.json && shx chmod +x integrations/rag-ime-runtime-host/dist/cli.js"
 	},
 	"devDependencies": {
 		"@anthropic-ai/sandbox-runtime": "0.0.26",

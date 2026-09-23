@@ -96,6 +96,7 @@ interface RequestBody {
 	tools?: OpenAITool[];
 	tool_choice?: OpenAICodexResponsesOptions["toolChoice"];
 	parallel_tool_calls?: boolean;
+	max_output_tokens?: number;
 	temperature?: number;
 	reasoning?: { effort?: string; summary?: string };
 	service_tier?: ResponseCreateParamsStreaming["service_tier"];
