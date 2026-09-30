@@ -24,6 +24,27 @@ describe("AuthStorage", () => {
 		writeFileSync(authJsonPath, JSON.stringify(data));
 	}
 
+	test("atomically rotates SIWC credentials with owner-only permissions, retaining other providers", async () => {
+		writeAuthJson({ other: { type: "api_key", key: "unchanged" } });
+		const storage = AuthStorage.create(authJsonPath);
+		const before = statSync(authJsonPath).ino;
+		await storage.modify("openai-chatgpt", async () => ({
+			type: "oauth",
+			access: "new-access",
+			refresh: "new-refresh",
+			expires: 3600000,
+		}));
+		const after = statSync(authJsonPath);
+		if (process.platform !== "win32") {
+			expect(after.mode & 0o777).toBe(0o600);
+			expect(after.ino).not.toBe(before);
+		}
+		expect(JSON.parse(readFileSync(authJsonPath, "utf8"))).toMatchObject({
+			other: { key: "unchanged" },
+			"openai-chatgpt": { access: "new-access", refresh: "new-refresh" },
+		});
+	});
+
 	test("reads and resolves stored API-key credentials", async () => {
 		const original = process.env.TEST_AUTH_STORAGE_KEY;
 		process.env.TEST_AUTH_STORAGE_KEY = "environment-key";

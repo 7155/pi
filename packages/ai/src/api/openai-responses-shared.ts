@@ -107,6 +107,8 @@ function convertToolResultOutput<TApi extends Api>(
 }
 
 export interface OpenAIResponsesStreamOptions {
+	/** SIWC requires response.completed; incomplete output must not execute tools. */
+	requireCompleted?: boolean;
 	serviceTier?: ResponseCreateParamsStreaming["service_tier"];
 	grammarToolInputProperties?: ReadonlyMap<string, string>;
 	resolveServiceTier?: (
@@ -740,6 +742,14 @@ export async function processResponsesStream<TApi extends Api>(
 			}
 		} else if (event.type === "response.completed" || event.type === "response.incomplete") {
 			finalizeResponse(event.response);
+			if (
+				options?.requireCompleted &&
+				(event.type !== "response.completed" || event.response.status !== "completed")
+			) {
+				throw new Error(
+					`ChatGPT response incomplete: ${event.response.incomplete_details?.reason ?? event.response.status}`,
+				);
+			}
 		} else if (event.type === "error") {
 			throw new Error(`Error Code ${event.code}: ${event.message}` || "Unknown error");
 		} else if (event.type === "response.failed") {

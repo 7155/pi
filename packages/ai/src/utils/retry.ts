@@ -5,6 +5,14 @@ function buildProviderErrorPattern(patterns: readonly string[]): RegExp {
 }
 
 const NON_RETRYABLE_PROVIDER_LIMIT_ERROR_PATTERN = buildProviderErrorPattern([
+	// SIWC plan/policy errors need a user or configuration change.
+	"subscription_sharing_usage_limit_exceeded",
+	"subscription_sharing_user_not_eligible",
+	"subscription_sharing_unsupported_capability",
+	"subscription_sharing_route_not_supported",
+	"subscription_sharing_invalid_user",
+	"chatpass_v2_scope_not_authorized",
+	"chatpass_v2_invalid_authorization_context",
 	// OpenCode Go/free-tier limits returned as 429 JSON error types by OpenCode's
 	// Zen API. These are subscription/account limits, not transient throttles.
 	"GoUsageLimitError",
@@ -24,6 +32,8 @@ const NON_RETRYABLE_PROVIDER_LIMIT_ERROR_PATTERN = buildProviderErrorPattern([
 ]);
 
 const RETRYABLE_PROVIDER_ERROR_PATTERN = buildProviderErrorPattern([
+	"subscription_sharing_usage_unavailable",
+	"subscription_sharing_user_unavailable",
 	// Generic provider load, HTTP status, and server-side transient failures.
 	"overloaded",
 	"currently experiencing high demand",

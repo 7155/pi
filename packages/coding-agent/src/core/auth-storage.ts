@@ -3,8 +3,20 @@
  * Provider auth orchestration belongs to ModelRuntime and pi-ai Models.
  */
 
+import { randomUUID } from "node:crypto";
 import type { AuthOperationOptions, Credential, CredentialInfo, CredentialStore } from "@earendil-works/pi-ai";
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from "fs";
+import {
+	closeSync,
+	existsSync,
+	fsyncSync,
+	lstatSync,
+	mkdirSync,
+	openSync,
+	readFileSync,
+	renameSync,
+	unlinkSync,
+	writeFileSync,
+} from "fs";
 import { dirname, join } from "path";
 import lockfile from "proper-lockfile";
 import { setTimeout as sleep } from "timers/promises";
@@ -19,6 +31,8 @@ type AuthStorageData = Record<string, Credential>;
 type LockResult<T> = {
 	result: T;
 	next?: string;
+	/** SIWC requires protected atomic token rotation. Other stores retain their existing ACL behavior. */
+	protectedAtomic?: boolean;
 };
 
 // The mode applies only on creation so administrator-managed modes and ACLs remain intact.
@@ -66,6 +80,24 @@ export class FileAuthStorageBackend implements AuthStorageBackend {
 		}
 	}
 
+	private writeProtectedAtomic(next: string): void {
+		if (lstatSync(this.authPath).isSymbolicLink())
+			throw new Error("SIWC credential storage cannot be a symbolic link");
+		const temporary = `${this.authPath}.${randomUUID()}.tmp`;
+		let fd: number | undefined;
+		try {
+			fd = openSync(temporary, "wx", 0o600);
+			writeFileSync(fd, next, "utf8");
+			fsyncSync(fd);
+			closeSync(fd);
+			fd = undefined;
+			renameSync(temporary, this.authPath);
+		} finally {
+			if (fd !== undefined) closeSync(fd);
+			if (existsSync(temporary)) unlinkSync(temporary);
+		}
+	}
+
 	private acquireLockSyncWithRetry(path: string): () => void {
 		const maxAttempts = 10;
 		const delayMs = 20;
@@ -101,9 +133,10 @@ export class FileAuthStorageBackend implements AuthStorageBackend {
 		try {
 			release = this.acquireLockSyncWithRetry(this.authPath);
 			const current = existsSync(this.authPath) ? readFileSync(this.authPath, "utf-8") : undefined;
-			const { result, next } = fn(current);
+			const { result, next, protectedAtomic } = fn(current);
 			if (next !== undefined) {
-				writeFileSync(this.authPath, next, AUTH_FILE_WRITE_OPTIONS);
+				if (protectedAtomic) this.writeProtectedAtomic(next);
+				else writeFileSync(this.authPath, next, AUTH_FILE_WRITE_OPTIONS);
 			}
 			return result;
 		} finally {
@@ -180,11 +213,12 @@ export class FileAuthStorageBackend implements AuthStorageBackend {
 			throwIfCompromised();
 			options?.signal?.throwIfAborted();
 			const current = existsSync(this.authPath) ? readFileSync(this.authPath, "utf-8") : undefined;
-			const { result, next } = await fn(current);
+			const { result, next, protectedAtomic } = await fn(current);
 			throwIfCompromised();
 			options?.signal?.throwIfAborted();
 			if (next !== undefined) {
-				writeFileSync(this.authPath, next, AUTH_FILE_WRITE_OPTIONS);
+				if (protectedAtomic) this.writeProtectedAtomic(next);
+				else writeFileSync(this.authPath, next, AUTH_FILE_WRITE_OPTIONS);
 			}
 			throwIfCompromised();
 			return result;
@@ -464,7 +498,7 @@ export class AuthStorage implements CredentialStore {
 
 			const merged: AuthStorageData = { ...currentData, [provider]: next };
 			latestData = merged;
-			return { result: next, next: JSON.stringify(merged, null, 2) };
+			return { result: next, next: JSON.stringify(merged, null, 2), protectedAtomic: "openai-chatgpt" in merged };
 		}, options);
 		this.updateReadState(latestData, revision);
 		return result;
@@ -476,7 +510,11 @@ export class AuthStorage implements CredentialStore {
 			const currentData = this.parseStorageData(content);
 			delete currentData[provider];
 			latestData = currentData;
-			return { result: undefined, next: JSON.stringify(currentData, null, 2) };
+			return {
+				result: undefined,
+				next: JSON.stringify(currentData, null, 2),
+				protectedAtomic: "openai-chatgpt" in currentData,
+			};
 		}, options);
 		this.updateReadState(latestData);
 	}
