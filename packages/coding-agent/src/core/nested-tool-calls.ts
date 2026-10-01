@@ -145,6 +145,8 @@ export interface NestedToolCallHost {
 /** Calls below one model-issued call share its recorder. */
 interface CallScope {
 	recorder: NestedCallRecorder;
+	/** Physical child calls, shared by all descendants of a model-issued call. */
+	pending: Set<Promise<AgentToolCallOutcome>>;
 	nextId: number;
 	/** Set inside a call that holds the exclusive queue, so its own nested calls do not wait on it. */
 	holdsQueue: boolean;
@@ -172,7 +174,7 @@ export class NestedToolCallRunner {
 	 * Run `name` on behalf of the call `callerId`. The nested call gets the id `<callerId>/<n>`.
 	 * Never rejects for tool failures: they come back as `isError: true`.
 	 */
-	async execute(
+	execute(
 		callerId: string,
 		name: string,
 		args: unknown,
@@ -180,9 +182,25 @@ export class NestedToolCallRunner {
 	): Promise<AgentToolCallOutcome> {
 		let scope = this.scopes.get(callerId);
 		if (!scope) {
-			scope = { recorder: new NestedCallRecorder(), nextId: 1, holdsQueue: false };
+			scope = { recorder: new NestedCallRecorder(), pending: new Set(), nextId: 1, holdsQueue: false };
 			this.scopes.set(callerId, scope);
 		}
+		const promise = this.executeCall(callerId, name, args, options, scope);
+		scope.pending.add(promise);
+		void promise.then(
+			() => scope.pending.delete(promise),
+			() => scope.pending.delete(promise),
+		);
+		return promise;
+	}
+
+	private async executeCall(
+		callerId: string,
+		name: string,
+		args: unknown,
+		options: NestedToolCallOptions,
+		scope: CallScope,
+	): Promise<AgentToolCallOutcome> {
 		const toolCall: AgentToolCall = {
 			type: "toolCall",
 			id: `${callerId}/${scope.nextId++}`,
@@ -212,6 +230,7 @@ export class NestedToolCallRunner {
 		}
 		this.scopes.set(toolCall.id, {
 			recorder: scope.recorder,
+			pending: scope.pending,
 			nextId: 1,
 			holdsQueue: scope.holdsQueue || exclusive,
 		});
@@ -245,6 +264,13 @@ export class NestedToolCallRunner {
 			parentToolCallId: callerId,
 		});
 		return outcome;
+	}
+
+	/** Abort acknowledgement does not prove that a child's tool pipeline drained. */
+	async drain(toolCallId: string): Promise<void> {
+		const scope = this.scopes.get(toolCallId);
+		if (!scope) return;
+		while (scope.pending.size > 0) await Promise.allSettled([...scope.pending]);
 	}
 
 	/** Remove and return the record of the nested calls a model-issued call made. */

@@ -1070,6 +1070,7 @@ export class AgentSession {
 		if (this._nestedToolCalls) {
 			if (event.type === "message_start" && event.message.role === "toolResult") {
 				const message = event.message;
+				await this._nestedToolCalls.drain(message.toolCallId);
 				const summary = this._nestedToolCalls.takeRecord(message.toolCallId);
 				if (summary?.calls) message.nestedCalls = summary.calls;
 				if (summary?.usage) {

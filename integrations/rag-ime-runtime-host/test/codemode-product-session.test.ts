@@ -53,7 +53,8 @@ describe("managed native codemode", () => {
 			if (body.tool !== "product_probe") return new Response(JSON.stringify({ ok: true, result: {} }), { status: 200, headers: { "Content-Type": "application/json" } });
 			requests.push(body); concurrent++; maxConcurrent = Math.max(maxConcurrent, concurrent);
 			if ((body.args as {value:number}).value === 999) {
-                await new Promise((_resolve, reject) => init?.signal?.addEventListener("abort", () => { concurrent--; reject(new DOMException("Aborted", "AbortError")); }, {once: true}));
+                await new Promise((_resolve, reject) => init?.signal?.addEventListener("abort", () => { // Physical drain may follow abort acknowledgement; parent settlement must wait.
+                    setTimeout(() => { concurrent--; reject(new DOMException("Aborted", "AbortError")); }, 100); }, {once: true}));
             }
             await new Promise(resolve => setTimeout(resolve, 20)); concurrent--;
 			return new Response(JSON.stringify((body.args as {value:number}).value === -1 ? {ok:false,error:"probe failed"} : { ok: true, result: { value: (body.args as { value: number }).value } }), {
