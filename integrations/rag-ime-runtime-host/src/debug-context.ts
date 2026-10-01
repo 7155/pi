@@ -1,6 +1,6 @@
 import { createHash } from "node:crypto";
 import type { Dirent } from "node:fs";
-import { mkdir, readdir, readFile, rename, stat, unlink, writeFile } from "node:fs/promises";
+import { mkdir, open, readdir, rename, stat, unlink, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { getCurrentSystemPrompt } from "@earendil-works/pi-ai";
 import type { ExtensionFactory } from "@earendil-works/pi-coding-agent";
@@ -19,6 +19,7 @@ export interface PiDebugProviderExchange {
 }
 
 export interface PiDebugContextDelta {
+	omitted?: boolean;
 	baseCallIndex?: number;
 	commonPrefixMessages: number;
 	removedMessageCount: number;
@@ -123,6 +124,15 @@ export interface PiDebugContextRecord {
 	modelCalls: PiDebugModelCall[];
 	toolExecutions: PiDebugToolExecution[];
 	toolBatches: PiDebugToolBatch[];
+	inspectionOmissions?: PiDebugContextOmission[];
+}
+
+export interface PiDebugContextOmission {
+	reason: string;
+	limitBytes: number;
+	path?: string;
+	turnId?: string;
+	bytes?: number;
 }
 
 export interface PiDebugContextSummary {
@@ -134,6 +144,7 @@ export interface PiDebugContextSummary {
 	providerRequestCount: number;
 	toolCallCount: number;
 	runningToolCount: number;
+	omitted?: boolean;
 }
 
 export interface PiDebugContextStorageOptions {
@@ -151,6 +162,10 @@ export interface PiDebugContextStorageStatus {
 	fileCount: number;
 	lastPersistedAtMs?: number;
 	error?: string;
+	limits: { captureBytes: number; snapshotBytes: number; retainedBytes: number };
+	retainedBytes: number;
+	omissions: PiDebugContextOmission[];
+	omissionCount: number;
 }
 
 const MAX_TURNS = 8;
@@ -158,7 +173,14 @@ const MAX_CALLS_PER_TURN = 12;
 const MAX_CONFIGURED_CALLS_PER_TURN = 256;
 const MAX_TOOLS_PER_TURN = 96;
 const MAX_TOOL_UPDATES = 12;
-const MAX_SERIALIZED_CHARS = 6_000_000;
+// The archive quota is not a heap budget. Count repeated references and object
+// overhead before cloning/serializing; a multi-GiB archive must stay lazy.
+const MAX_CAPTURE_BYTES = 1024 * 1024;
+const MAX_SNAPSHOT_BYTES = 16 * 1024 * 1024;
+const MAX_RETAINED_BYTES = 32 * 1024 * 1024;
+const MAX_INSPECTION_NODES = 65_536;
+const MAX_INSPECTION_DEPTH = 64;
+const MAX_OMISSIONS = 32;
 const DEFAULT_STORAGE_BYTES = 5 * 1024 * 1024 * 1024;
 const MAX_STORAGE_BYTES = 64 * 1024 * 1024 * 1024;
 let storageTaskQueue: Promise<void> = Promise.resolve();
@@ -188,6 +210,12 @@ export class PiDebugContextRecorder {
 	private lifecycleTurnId: string | undefined;
 	private lifecycleSequence = 0;
 	private readonly contributionRefs: Array<Record<string, unknown>>;
+	private readonly omissions: PiDebugContextOmission[] = [];
+	private readonly deferredSnapshots = new Set<string>();
+	private omissionCount = 0;
+	private retainedBytes = 0;
+	private readonly pendingRecords = new Map<string, PiDebugContextRecord>();
+	private persistenceQueued = false;
 
 	constructor(
 		sessionId: string,
@@ -201,7 +229,7 @@ export class PiDebugContextRecorder {
 		this.storageMaxBytes = Math.min(MAX_STORAGE_BYTES, Math.max(1, requestedMax || DEFAULT_STORAGE_BYTES));
 		const requestedCalls = Number.isFinite(storage.maxCallsPerTurn) ? Math.floor(storage.maxCallsPerTurn ?? 0) : 0;
 		this.maxCallsPerTurn = Math.min(MAX_CONFIGURED_CALLS_PER_TURN, Math.max(1, requestedCalls || MAX_CALLS_PER_TURN));
-		this.contributionRefs = cloneForInspection(storage.contributionRefs ?? []) as Array<Record<string, unknown>>;
+		this.contributionRefs = inspectionRecords(storage.contributionRefs ?? []);
 		this.pendingPersistence = this.queueStorageTask(() => this.restorePersistedRecords());
 	}
 
@@ -210,16 +238,18 @@ export class PiDebugContextRecorder {
 			const refreshToolSurface = (record: PiDebugContextRecord): void => {
 				const activeTools = pi.getActiveTools();
 				const activeSet = new Set(activeTools);
-				record.activeTools = [...activeTools];
-				record.toolSchemas = pi
-					.getAllTools()
-					.filter((tool) => activeSet.has(tool.name))
-					.map((tool) => ({
-						name: tool.name,
-						description: tool.description,
-						parameters: cloneForInspection(tool.parameters),
-						promptGuidelines: tool.promptGuidelines,
-					}));
+				record.activeTools = stringArray(cloneForInspection(activeTools));
+				record.toolSchemas = inspectionRecords(
+					pi
+						.getAllTools()
+						.filter((tool) => activeSet.has(tool.name))
+						.map((tool) => ({
+							name: tool.name,
+							description: tool.description,
+							parameters: tool.parameters,
+							promptGuidelines: tool.promptGuidelines,
+						})),
+				);
 			};
 			pi.on("before_agent_start", (event, context) => {
 				const identity = this.activeTurn();
@@ -237,8 +267,8 @@ export class PiDebugContextRecorder {
 					clientMessageId: identity.clientMessageId ?? "",
 					capturedAtMs: now,
 					updatedAtMs: now,
-					prompt: cloneForInspection(event.prompt) as string,
-					systemPrompt: cloneForInspection(event.systemPrompt) as string,
+					prompt: inspectionText(event.prompt),
+					systemPrompt: inspectionText(event.systemPrompt),
 					systemPromptOptions: cloneForInspection(event.systemPromptOptions),
 					model: context.model
 						? {
@@ -250,13 +280,15 @@ export class PiDebugContextRecorder {
 								maxTokens: context.model.maxTokens,
 							}
 						: undefined,
-					activeTools: [...activeTools],
+					activeTools: stringArray(cloneForInspection(activeTools)),
 					toolSchemas: [],
-					skillCatalog: (promptOptions?.skills ?? []).map((skill) => ({
-						name: String(skill.name ?? ""),
-						description: String(skill.description ?? ""),
-						source: cloneForInspection(skill.sourceInfo),
-					})),
+					skillCatalog: inspectionRecords(
+						(promptOptions?.skills ?? []).map((skill) => ({
+							name: String(skill.name ?? ""),
+							description: String(skill.description ?? ""),
+							source: skill.sourceInfo,
+						})),
+					),
 					loadedSkillReceipts: [],
 					contributionRefs: structuredClone(this.contributionRefs),
 					contextWindows: [],
@@ -281,7 +313,7 @@ export class PiDebugContextRecorder {
 				const record = this.current();
 				if (!record) return;
 				const now = Date.now();
-				const messages = cloneForInspection(event.messages);
+				const messages = this.capture(event.messages);
 				const previousIndex = this.providerCallSequence || undefined;
 				const index = ++this.providerCallSequence;
 				record.contextWindows.push({ index, capturedAtMs: now, messages });
@@ -298,6 +330,7 @@ export class PiDebugContextRecorder {
 				this.previousContextMessages = messages;
 				if (record.modelCalls.length > this.maxCallsPerTurn) record.modelCalls.shift();
 				record.updatedAtMs = now;
+				this.trim();
 			});
 
 			pi.on("provider_context_inspection", (event) => {
@@ -307,10 +340,13 @@ export class PiDebugContextRecorder {
 				const call = record.lifecycle
 					? this.startModelCall(record, now, event.context.messages)
 					: this.ensureModelCall(record, now);
-				call.providerContext = cloneForInspection(event.context);
+				call.providerContext = this.capture(event.context);
 				call.updatedAtMs = now;
 				if (record.lifecycle) {
-					record.systemPrompt = getCurrentSystemPrompt(event.context.messages);
+					const messages = plainRecord(call.providerContext)?.messages;
+					record.systemPrompt = Array.isArray(messages)
+						? inspectionText(getCurrentSystemPrompt(messages as typeof event.context.messages))
+						: "[diagnostic provider context omitted]";
 					record.model = {
 						provider: event.model.provider,
 						id: event.model.id,
@@ -321,6 +357,7 @@ export class PiDebugContextRecorder {
 					};
 				}
 				record.updatedAtMs = now;
+				this.trim();
 			});
 
 			pi.on("before_provider_request", (event) => {
@@ -329,24 +366,26 @@ export class PiDebugContextRecorder {
 				const now = Date.now();
 				refreshToolSurface(record);
 				const index = (record.providerRequestReceipts.at(-1)?.index ?? 0) + 1;
+				const payload = this.capture(event.payload);
 				record.providerRequestReceipts.push({
 					schemaVersion: "rag-ime.provider-request-receipt.v1",
 					index,
 					capturedAtMs: now,
 					model: structuredClone(record.model ?? {}),
 					streamOptions: {},
-					payload: cloneForInspection(event.payload),
+					payload,
 				});
 				if (record.providerRequestReceipts.length > this.maxCallsPerTurn) {
 					record.providerRequestReceipts.shift();
 				}
-				const payload = cloneForInspection(event.payload);
 				record.providerRequests.push({ index, capturedAtMs: now, payload });
 				if (record.providerRequests.length > this.maxCallsPerTurn) record.providerRequests.shift();
 				const call = this.ensureModelCall(record, now);
 				call.providerExchanges.push({ index, capturedAtMs: now, payload });
+				if (call.providerExchanges.length > this.maxCallsPerTurn) call.providerExchanges.shift();
 				call.updatedAtMs = now;
 				record.updatedAtMs = now;
+				this.trim();
 			});
 
 			pi.on("after_provider_response", (event) => {
@@ -361,9 +400,10 @@ export class PiDebugContextRecorder {
 						capturedAtMs: now,
 					};
 					call.providerExchanges.push(exchange);
+					if (call.providerExchanges.length > this.maxCallsPerTurn) call.providerExchanges.shift();
 				}
 				exchange.status = event.status;
-				exchange.headers = cloneForInspection(event.headers) as Record<string, unknown>;
+				exchange.headers = this.capture(event.headers) as Record<string, unknown>;
 				call.updatedAtMs = now;
 				record.updatedAtMs = now;
 				this.schedulePersist(250);
@@ -375,7 +415,7 @@ export class PiDebugContextRecorder {
 				if (!record) return;
 				const now = Date.now();
 				const call = this.ensureModelCall(record, now);
-				call.assistantMessage = cloneForInspection(event.message);
+				call.assistantMessage = this.capture(event.message);
 				const usage = numericUsage((event.message as { usage?: unknown }).usage);
 				const request = record.providerRequestReceipts.at(-1);
 				if (request) request.usage = usage;
@@ -415,7 +455,7 @@ export class PiDebugContextRecorder {
 					runtimeTurnIndex: this.runtimeTurnIndex,
 					startedAtMs: now,
 					startSequence: ++this.eventSequence,
-					args: cloneForInspection(event.args),
+					args: this.capture(event.args),
 					status: "running",
 					updates: [],
 				});
@@ -428,7 +468,7 @@ export class PiDebugContextRecorder {
 				const tool = record?.toolExecutions.find((item) => item.toolCallId === event.toolCallId);
 				if (!record || !tool) return;
 				const now = Date.now();
-				tool.updates.push({ capturedAtMs: now, partialResult: cloneForInspection(event.partialResult) });
+				tool.updates.push({ capturedAtMs: now, partialResult: this.capture(event.partialResult) });
 				if (tool.updates.length > MAX_TOOL_UPDATES) tool.updates.shift();
 				this.refreshToolBatches(record, now);
 			});
@@ -440,12 +480,12 @@ export class PiDebugContextRecorder {
 				const now = Date.now();
 				tool.endedAtMs = now;
 				tool.endSequence = ++this.eventSequence;
-				tool.result = cloneForInspection(event.result);
+				tool.result = this.capture(event.result);
 				tool.isError = event.isError;
 				tool.status = event.isError ? "failed" : "completed";
 				if (event.toolName === "skill_load" && !event.isError) {
 					const details = (event.result as { details?: unknown } | undefined)?.details;
-					const receipt = cloneForInspection(details);
+					const receipt = this.capture(details);
 					if (receipt && typeof receipt === "object" && !Array.isArray(receipt)) {
 						record.loadedSkillReceipts.push(receipt as Record<string, unknown>);
 					}
@@ -468,9 +508,9 @@ export class PiDebugContextRecorder {
 	}
 
 	get(turnId?: string): PiDebugContextRecord | undefined {
+		this.trim();
 		const record = turnId ? this.records.get(turnId) : [...this.records.values()].at(-1);
-		// Every field is sanitized when captured. Preserve the record contract here:
-		// cloneForInspection() may replace a large value with a truncation receipt.
+		// trim() enforces the whole-record budget before allocating the UI copy.
 		return record ? structuredClone(record) : undefined;
 	}
 
@@ -487,7 +527,7 @@ export class PiDebugContextRecorder {
 			clientMessageId: "",
 			lifecycle: {
 				kind,
-				reason: details.reason,
+				reason: details.reason === undefined ? undefined : inspectionText(details.reason),
 				status: "running",
 			},
 			capturedAtMs: now,
@@ -518,7 +558,7 @@ export class PiDebugContextRecorder {
 		if (!record || record.lifecycle?.kind !== kind) return;
 		const now = Date.now();
 		record.lifecycle.status = status;
-		record.lifecycle.error = error;
+		record.lifecycle.error = error === undefined ? undefined : inspectionText(error);
 		record.updatedAtMs = now;
 		const call = record.modelCalls.at(-1);
 		if (call && call.completedAtMs === undefined) {
@@ -530,6 +570,7 @@ export class PiDebugContextRecorder {
 	}
 
 	list(): PiDebugContextSummary[] {
+		this.trim();
 		return [...this.records.values()].reverse().map((record) => ({
 			turnId: record.turnId,
 			clientMessageId: record.clientMessageId,
@@ -539,6 +580,7 @@ export class PiDebugContextRecorder {
 			providerRequestCount: record.providerRequests.length,
 			toolCallCount: record.toolExecutions.length,
 			runningToolCount: record.toolExecutions.filter((tool) => tool.status === "running").length,
+			...(record.inspectionOmissions?.length ? { omitted: true } : {}),
 		}));
 	}
 
@@ -564,6 +606,14 @@ export class PiDebugContextRecorder {
 			maxBytes: this.storageMaxBytes,
 			usedBytes: this.storageUsedBytes,
 			fileCount: this.storageFileCount,
+			limits: {
+				captureBytes: MAX_CAPTURE_BYTES,
+				snapshotBytes: Math.min(MAX_SNAPSHOT_BYTES, this.storageMaxBytes),
+				retainedBytes: MAX_RETAINED_BYTES,
+			},
+			retainedBytes: this.retainedBytes,
+			omissions: this.omissions.map((item) => ({ ...item })),
+			omissionCount: this.omissionCount,
 			lastPersistedAtMs: this.lastPersistedAtMs,
 			...(this.storageError ? { error: this.storageError } : {}),
 		};
@@ -576,6 +626,7 @@ export class PiDebugContextRecorder {
 		}
 		this.queuePersist([...this.records.values()].at(-1));
 		this.records.clear();
+		this.retainedBytes = 0;
 		this.runtimeTurnIndex = undefined;
 		this.eventSequence = 0;
 		this.providerCallSequence = 0;
@@ -610,7 +661,7 @@ export class PiDebugContextRecorder {
 	private startModelCall(record: PiDebugContextRecord, now: number, messages: unknown): PiDebugModelCall {
 		const previousIndex = this.providerCallSequence || undefined;
 		const index = ++this.providerCallSequence;
-		const contextMessages = cloneForInspection(messages);
+		const contextMessages = this.capture(messages);
 		const call: PiDebugModelCall = {
 			index,
 			runtimeTurnIndex: this.runtimeTurnIndex,
@@ -622,6 +673,7 @@ export class PiDebugContextRecorder {
 		};
 		this.previousContextMessages = contextMessages;
 		record.modelCalls.push(call);
+		if (record.modelCalls.length > this.maxCallsPerTurn) record.modelCalls.shift();
 		return call;
 	}
 
@@ -633,9 +685,11 @@ export class PiDebugContextRecorder {
 	private refreshToolBatches(record: PiDebugContextRecord, now: number): void {
 		record.toolBatches = buildToolBatches(record.toolExecutions);
 		record.updatedAtMs = now;
+		this.trim();
 	}
 
 	private schedulePersist(delayMs: number): void {
+		this.trim();
 		if (!this.storageDirectory) return;
 		if (this.persistTimer) clearTimeout(this.persistTimer);
 		this.persistTimer = setTimeout(() => {
@@ -647,7 +701,43 @@ export class PiDebugContextRecorder {
 
 	private queuePersist(record: PiDebugContextRecord | undefined): void {
 		if (!record || !this.storageDirectory) return;
-		this.pendingPersistence = this.queueStorageTask(() => this.persistRecord(record));
+		this.trim();
+		// Coalesce repeated checkpoints. A slow disk must not retain an unbounded
+		// chain of closures holding retired Session records.
+		this.pendingRecords.set(record.turnId, record);
+		while (this.pendingRecords.size > MAX_TURNS) {
+			const oldest = this.pendingRecords.keys().next().value;
+			if (!oldest) break;
+			this.pendingRecords.delete(oldest);
+			this.noteOmission({ reason: "persistence_queue_budget", turnId: oldest, limitBytes: MAX_RETAINED_BYTES });
+		}
+		let queuedBytes = 0;
+		for (const pending of [...this.pendingRecords.values()].reverse()) {
+			const measured = inspectionSize(pending, MAX_SNAPSHOT_BYTES);
+			queuedBytes += measured.bytes;
+			if (measured.reason || queuedBytes > MAX_RETAINED_BYTES) {
+				this.pendingRecords.delete(pending.turnId);
+				this.noteOmission({
+					reason: "persistence_queue_budget",
+					turnId: pending.turnId,
+					limitBytes: MAX_RETAINED_BYTES,
+				});
+			}
+		}
+		if (this.persistenceQueued) return;
+		this.persistenceQueued = true;
+		this.pendingPersistence = this.queueStorageTask(async () => {
+			try {
+				while (this.pendingRecords.size) {
+					const next = this.pendingRecords.values().next().value;
+					if (!next) break;
+					this.pendingRecords.delete(next.turnId);
+					await this.persistRecord(next);
+				}
+			} finally {
+				this.persistenceQueued = false;
+			}
+		});
 	}
 
 	private queueStorageTask(task: () => Promise<void>): Promise<void> {
@@ -664,6 +754,12 @@ export class PiDebugContextRecorder {
 	private async persistRecord(record: PiDebugContextRecord): Promise<void> {
 		let temporary = "";
 		try {
+			const limit = Math.min(MAX_SNAPSHOT_BYTES, this.storageMaxBytes);
+			const measured = inspectionSize(record, limit - 1);
+			if (measured.reason) {
+				this.noteOmission({ reason: "serialization_budget", turnId: record.turnId, limitBytes: limit });
+				return;
+			}
 			const serialized = `${JSON.stringify(record)}\n`;
 			const size = Buffer.byteLength(serialized);
 			if (size > this.storageMaxBytes) {
@@ -696,6 +792,10 @@ export class PiDebugContextRecorder {
 		let used = files.reduce((total, item) => total + item.size, 0);
 		for (const file of files.sort((left, right) => left.modifiedAtMs - right.modifiedAtMs)) {
 			if (used + incomingBytes <= this.storageMaxBytes) break;
+			// Deferring an unsafe historical input is not permission to erase it on
+			// the next checkpoint. The archive may instead become temporarily full.
+			if (file.size > Math.min(MAX_SNAPSHOT_BYTES, this.storageMaxBytes) || this.deferredSnapshots.has(file.path))
+				continue;
 			try {
 				await unlink(file.path);
 				used -= file.size;
@@ -714,16 +814,67 @@ export class PiDebugContextRecorder {
 			const sessionDirectory = join(this.storageDirectory, safePathSegment(this.sessionId));
 			const latest = (await storedDebugFiles(sessionDirectory))
 				.sort((left, right) => right.modifiedAtMs - left.modifiedAtMs)
-				.slice(0, MAX_TURNS)
-				.reverse();
+				.slice(0, MAX_TURNS);
 			const restored: PiDebugContextRecord[] = [];
+			const snapshotLimit = Math.min(MAX_SNAPSHOT_BYTES, this.storageMaxBytes);
+			const restoreLimit = Math.min(MAX_RETAINED_BYTES, this.storageMaxBytes);
+			let readBytes = 0;
+			let retainedBytes = 0;
 			for (const file of latest) {
+				const remaining = restoreLimit - Math.max(readBytes, retainedBytes);
+				if (file.size > Math.min(snapshotLimit, remaining)) {
+					this.noteOmission({
+						reason: file.size > snapshotLimit ? "snapshot_byte_budget" : "restore_byte_budget",
+						path: file.path,
+						bytes: file.size,
+						limitBytes: file.size > snapshotLimit ? snapshotLimit : restoreLimit,
+					});
+					continue;
+				}
 				try {
-					const parsed = JSON.parse(await readFile(file.path, "utf8")) as unknown;
+					const loaded = await readDebugSnapshot(file.path, Math.min(snapshotLimit, remaining));
+					readBytes += loaded.bytes;
+					if (loaded.text === undefined) {
+						this.noteOmission({
+							reason: "snapshot_changed_or_oversized",
+							path: file.path,
+							bytes: loaded.bytes,
+							limitBytes: snapshotLimit,
+						});
+						continue;
+					}
+					const parsed = JSON.parse(loaded.text) as unknown;
+					const measured = inspectionSize(parsed, Math.min(snapshotLimit, restoreLimit - retainedBytes));
+					if (measured.reason) {
+						this.noteOmission({
+							reason: `restore_${measured.reason}`,
+							path: file.path,
+							bytes: loaded.bytes,
+							limitBytes: restoreLimit,
+						});
+						continue;
+					}
 					const normalized = normalizeDebugContextRecord(parsed, this.maxCallsPerTurn);
-					if (normalized?.sessionId === this.sessionId) restored.push(normalized);
+					if (normalized?.sessionId !== this.sessionId) continue;
+					const normalizedSize = inspectionSize(normalized, Math.min(snapshotLimit, restoreLimit - retainedBytes));
+					if (normalizedSize.reason) {
+						this.noteOmission({
+							reason: "restore_byte_budget",
+							path: file.path,
+							bytes: loaded.bytes,
+							limitBytes: restoreLimit,
+						});
+						continue;
+					}
+					retainedBytes += normalizedSize.bytes;
+					restored.push(normalized);
 				} catch {
-					// A damaged snapshot must not hide the remaining usable history.
+					this.noteOmission({
+						reason: "snapshot_unavailable",
+						path: file.path,
+						bytes: file.size,
+						limitBytes: snapshotLimit,
+					});
 				}
 			}
 			const merged = [...restored, ...this.records.values()].sort(
@@ -751,6 +902,123 @@ export class PiDebugContextRecorder {
 			if (typeof oldest !== "string") break;
 			this.records.delete(oldest);
 		}
+		const sizes = new Map<string, number>();
+		for (const record of this.records.values()) {
+			let measured = inspectionSize(record, MAX_SNAPSHOT_BYTES);
+			if (measured.reason) {
+				this.omitRecordBodies(record);
+				measured = inspectionSize(record, MAX_SNAPSHOT_BYTES);
+			}
+			if (measured.reason) {
+				this.records.delete(record.turnId);
+				this.noteOmission({
+					reason: "retained_record_budget",
+					turnId: record.turnId,
+					limitBytes: MAX_SNAPSHOT_BYTES,
+				});
+				continue;
+			}
+			sizes.set(record.turnId, measured.bytes);
+		}
+		let retained = [...sizes.values()].reduce((sum, size) => sum + size, 0);
+		for (const record of this.records.values()) {
+			if (retained <= MAX_RETAINED_BYTES) break;
+			retained -= sizes.get(record.turnId) ?? 0;
+			this.omitRecordBodies(record);
+			const measured = inspectionSize(record, MAX_SNAPSHOT_BYTES);
+			if (measured.reason) {
+				this.records.delete(record.turnId);
+				this.noteOmission({
+					reason: "retained_session_budget",
+					turnId: record.turnId,
+					limitBytes: MAX_RETAINED_BYTES,
+				});
+			} else {
+				retained += measured.bytes;
+				sizes.set(record.turnId, measured.bytes);
+			}
+		}
+		for (const record of this.records.values()) {
+			if (retained <= MAX_RETAINED_BYTES) break;
+			this.records.delete(record.turnId);
+			retained -= sizes.get(record.turnId) ?? 0;
+			this.noteOmission({
+				reason: "retained_session_budget",
+				turnId: record.turnId,
+				limitBytes: MAX_RETAINED_BYTES,
+			});
+		}
+		this.retainedBytes = retained;
+	}
+
+	private omitRecordBodies(record: PiDebugContextRecord): void {
+		const receipt = { omitted: true, reason: "retained_byte_budget", limitBytes: MAX_SNAPSHOT_BYTES };
+		for (const window of record.contextWindows) window.messages = receipt;
+		for (const request of record.providerRequests) request.payload = receipt;
+		for (const request of record.providerRequestReceipts) request.payload = receipt;
+		for (const call of record.modelCalls) {
+			if (this.previousContextMessages === call.contextMessages) this.previousContextMessages = receipt;
+			call.contextMessages = receipt;
+			call.providerContext = receipt;
+			call.contextDelta = { ...call.contextDelta, addedMessages: [], omitted: true };
+			if (call.assistantMessage !== undefined) call.assistantMessage = receipt;
+			for (const exchange of call.providerExchanges) {
+				if (exchange.payload !== undefined) exchange.payload = receipt;
+			}
+		}
+		for (const tool of record.toolExecutions) {
+			tool.args = receipt;
+			if (tool.result !== undefined) tool.result = receipt;
+			for (const update of tool.updates) update.partialResult = receipt;
+		}
+		// Keep load receipts: their existing consumer supplies skill recovery metadata.
+		if (!record.inspectionOmissions?.some((item) => item.reason === receipt.reason)) {
+			record.inspectionOmissions = [
+				...(record.inspectionOmissions ?? []),
+				{ reason: receipt.reason, limitBytes: receipt.limitBytes },
+			].slice(-MAX_OMISSIONS);
+		}
+		this.noteOmission({ reason: receipt.reason, turnId: record.turnId, limitBytes: receipt.limitBytes });
+	}
+
+	private noteOmission(omission: PiDebugContextOmission): void {
+		if (omission.path) this.deferredSnapshots.add(omission.path);
+		this.omissionCount += 1;
+		this.omissions.push(omission);
+		if (this.omissions.length > MAX_OMISSIONS) this.omissions.shift();
+	}
+
+	private capture(value: unknown): unknown {
+		const captured = cloneForInspection(value);
+		const receipt = plainRecord(captured);
+		if (receipt?.omitted === true && typeof receipt.reason === "string") {
+			const record = this.current();
+			const omission = { reason: receipt.reason, limitBytes: MAX_CAPTURE_BYTES };
+			if (record && !record.inspectionOmissions?.some((item) => item.reason === omission.reason)) {
+				record.inspectionOmissions = [...(record.inspectionOmissions ?? []), omission].slice(-MAX_OMISSIONS);
+			}
+			this.noteOmission({ ...omission, turnId: record?.turnId });
+		}
+		return captured;
+	}
+}
+
+async function readDebugSnapshot(path: string, maxBytes: number): Promise<{ text?: string; bytes: number }> {
+	const file = await open(path, "r");
+	try {
+		const metadata = await file.stat();
+		if (!metadata.isFile() || metadata.size > maxBytes) return { bytes: 0 };
+		// A bounded read also handles a file growing or being replaced after stat.
+		const buffer = Buffer.alloc(metadata.size + 1);
+		let used = 0;
+		while (used < buffer.length) {
+			const result = await file.read(buffer, used, buffer.length - used, used);
+			if (!result.bytesRead) break;
+			used += result.bytesRead;
+		}
+		return used > metadata.size ? { bytes: used } : { bytes: used, text: buffer.toString("utf8", 0, used) };
+	} finally {
+		await file.close();
 	}
 }
 
@@ -863,6 +1131,12 @@ function normalizeDebugContextRecord(
 		modelCalls,
 		toolExecutions,
 		toolBatches: buildToolBatches(toolExecutions),
+		inspectionOmissions: recordArray(record.inspectionOmissions)
+			.slice(-MAX_OMISSIONS)
+			.map((item) => ({
+				reason: typeof item.reason === "string" ? item.reason.slice(0, 128) : "historical_omission",
+				limitBytes: finiteNumber(item.limitBytes, MAX_SNAPSHOT_BYTES),
+			})),
 	};
 }
 
@@ -893,6 +1167,7 @@ function normalizeModelCalls(
 				contextMessages,
 				providerContext: call.providerContext,
 				contextDelta: {
+					...(contextDeltaRecord?.omitted === true || fallbackDelta.omitted ? { omitted: true } : {}),
 					baseCallIndex: optionalFiniteNumber(contextDeltaRecord?.baseCallIndex),
 					commonPrefixMessages: finiteNumber(
 						contextDeltaRecord?.commonPrefixMessages,
@@ -1019,6 +1294,21 @@ export function buildToolBatches(tools: PiDebugToolExecution[]): PiDebugToolBatc
 }
 
 function contextDelta(previousValue: unknown, currentValue: unknown, baseCallIndex?: number): PiDebugContextDelta {
+	if (!Array.isArray(currentValue) || (previousValue !== undefined && !Array.isArray(previousValue))) {
+		return {
+			omitted: true,
+			baseCallIndex,
+			commonPrefixMessages: 0,
+			removedMessageCount: 0,
+			addedMessageCount: 0,
+			addedMessages: [],
+			prefixBytes: 0,
+			prefixSha256: "",
+			currentBytes: 0,
+			deltaBytes: 0,
+			duplicateBytes: 0,
+		};
+	}
 	const previous = Array.isArray(previousValue) ? previousValue : [];
 	const current = Array.isArray(currentValue) ? currentValue : [];
 	let commonPrefixMessages = 0;
@@ -1099,6 +1389,11 @@ function safeReasoningInspectionValue(value: unknown): unknown {
 }
 
 function cloneForInspection(value: unknown): unknown {
+	if (value === undefined) return undefined;
+	const measured = inspectionSize(value, MAX_CAPTURE_BYTES);
+	if (measured.reason) {
+		return { omitted: true, truncated: true, reason: `capture_${measured.reason}`, limitBytes: MAX_CAPTURE_BYTES };
+	}
 	let serialized: string;
 	try {
 		serialized = JSON.stringify(value, function inspectionReplacer(key, item) {
@@ -1132,14 +1427,99 @@ function cloneForInspection(value: unknown): unknown {
 			return item;
 		});
 	} catch (error) {
-		return { unavailable: true, error: error instanceof Error ? error.message : String(error) };
+		return { unavailable: true, error: (error instanceof Error ? error.message : String(error)).slice(0, 256) };
 	}
-	if (serialized.length > MAX_SERIALIZED_CHARS) {
+	if (serialized === undefined) return undefined;
+	if (Buffer.byteLength(serialized) > MAX_CAPTURE_BYTES) {
 		return {
+			omitted: true,
 			truncated: true,
-			originalChars: serialized.length,
-			jsonPreview: serialized.slice(0, MAX_SERIALIZED_CHARS),
+			reason: "capture_byte_budget",
+			limitBytes: MAX_CAPTURE_BYTES,
 		};
 	}
 	return JSON.parse(serialized) as unknown;
+}
+
+function inspectionText(value: string): string {
+	const cloned = cloneForInspection(value);
+	return typeof cloned === "string" ? cloned : `[diagnostic body omitted: ${JSON.stringify(cloned)}]`;
+}
+
+function inspectionRecords(value: unknown[]): Array<Record<string, unknown>> {
+	const cloned = cloneForInspection(value);
+	return Array.isArray(cloned) ? recordArray(cloned) : [plainRecord(cloned) ?? { omitted: true }];
+}
+
+/** Conservative serialized bytes plus container/key overhead, without cloning,
+ * invoking getters/toJSON, or allocating an unbounded serialized intermediate. */
+function inspectionSize(value: unknown, limit: number): { bytes: number; reason?: string } {
+	let bytes = 0;
+	let nodes = 0;
+	let reason: string | undefined;
+	const ancestors = new Set<object>();
+	const add = (count: number): void => {
+		bytes += count;
+		if (bytes > limit) throw new Error("byte_budget");
+	};
+	const stringBytes = (text: string): void => {
+		if (text.length > limit - bytes) throw new Error("byte_budget");
+		add(Buffer.byteLength(text) + 2);
+		const escapes = /["\\\u0000-\u001f\uD800-\uDFFF]/gu;
+		for (let match = escapes.exec(text); match; match = escapes.exec(text)) {
+			const code = match[0].charCodeAt(0);
+			add(code >= 0xd800 ? 3 : code < 0x20 ? 5 : 1);
+		}
+	};
+	const visit = (item: unknown, depth: number): void => {
+		if (++nodes > MAX_INSPECTION_NODES || depth > MAX_INSPECTION_DEPTH) throw new Error("structure_budget");
+		if (typeof item === "string") {
+			stringBytes(item);
+			return;
+		}
+		if (!item || typeof item !== "object") {
+			if (typeof item === "bigint") {
+				if (item > 2n ** 4096n || item < -(2n ** 4096n)) throw new Error("structure_budget");
+				stringBytes(item.toString());
+				return;
+			}
+			add(32);
+			return;
+		}
+		const prototype = Object.getPrototypeOf(item);
+		if (prototype !== Object.prototype && prototype !== Array.prototype && prototype !== null) {
+			throw new Error("unsupported_value");
+		}
+		const toJSON = Object.getOwnPropertyDescriptor(item, "toJSON");
+		if (toJSON && (!Object.hasOwn(toJSON, "value") || typeof toJSON.value === "function")) {
+			throw new Error("unsupported_value");
+		}
+		if (ancestors.has(item)) throw new Error("unsupported_value");
+		ancestors.add(item);
+		add(64);
+		if (Array.isArray(item)) {
+			if (item.length > MAX_INSPECTION_NODES - nodes) throw new Error("structure_budget");
+			for (let index = 0; index < item.length; index += 1) {
+				add(32);
+				const property = Object.getOwnPropertyDescriptor(item, String(index));
+				if (property && !Object.hasOwn(property, "value")) throw new Error("unsupported_value");
+				visit(property?.value, depth + 1);
+			}
+		} else
+			for (const key in item) {
+				if (!Object.hasOwn(item, key)) continue;
+				const property = Object.getOwnPropertyDescriptor(item, key);
+				if (!property || !Object.hasOwn(property, "value")) throw new Error("unsupported_value");
+				add(32);
+				stringBytes(key);
+				visit(property.value, depth + 1);
+			}
+		ancestors.delete(item);
+	};
+	try {
+		visit(value, 0);
+	} catch (error) {
+		reason = error instanceof Error ? error.message : "unsupported_value";
+	}
+	return { bytes: reason ? Math.max(limit + 1, bytes) : bytes, ...(reason ? { reason } : {}) };
 }

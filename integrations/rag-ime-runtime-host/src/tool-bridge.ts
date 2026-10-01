@@ -981,6 +981,7 @@ async function executeGatewayTool(
 			],
 			details: {
 				...result,
+				toolName: tool.name,
 				approvalState,
 				approval: resolved,
 				...(agentBlocks.length > 0 ? { agentBlocks } : {}),
@@ -1007,6 +1008,17 @@ function gatewayOptionsForToolExecution(
 	toolName: string,
 	args: unknown,
 ): BackendToolBridgeOptions {
+	if (options.gatewayTimeoutMs === undefined && toolName === "browser" &&
+		typeof args === "object" && args !== null && !Array.isArray(args) &&
+		(args as Record<string, unknown>).op === "run") {
+		const requested = (args as Record<string, unknown>).timeoutMs;
+		// BrowserControl owns the 1–120 second script limit (60 seconds by
+		// default). Transport must allow that limit plus receipt delivery;
+		// otherwise a still-running owned script looks like a failed call.
+		const scriptMs = typeof requested === "number" && Number.isFinite(requested) && requested !== 0
+			? Math.max(1_000, Math.min(120_000, Math.trunc(requested))) : 60_000;
+		return { ...options, gatewayTimeoutMs: scriptMs + DEFAULT_GATEWAY_REQUEST_TIMEOUT_MS };
+	}
 	if (options.gatewayTimeoutMs === undefined && toolName === "workspace_shell") {
 		const requested = typeof args === "object" && args !== null && !Array.isArray(args)
 			? (args as Record<string, unknown>).timeoutSeconds : undefined;
@@ -1174,11 +1186,29 @@ export function createProjectedBackendToolDefinition(
 	};
 }
 
-export function createBackendToolExtension(options: BackendToolBridgeOptions): InlineExtension {
+export function createBackendToolExtension(options: BackendToolBridgeOptions): Extract<InlineExtension, { factory: unknown }> {
 	const artifacts = new ToolArtifactBuffer();
 	return {
 		name: "rag-ime-backend-tools",
 		factory(pi) {
+			// HTTP admission can succeed while the owned tool receipt reports a
+			// failed operation. Preserve its content/details, but let Pi's normal
+			// result hook carry that failure into the transcript and loop guard.
+			pi.on?.("tool_result", (event) => {
+				const details = event.details;
+				if (!details || typeof details !== "object" || Array.isArray(details)) return;
+				const receipt = details as Record<string, unknown>;
+				if (typeof receipt.toolName !== "string" || !options.registry.get(receipt.toolName)) return;
+				if (receipt.ok === false) return { isError: true };
+				const approval = receipt.approval;
+				if (approval && typeof approval === "object" && !Array.isArray(approval)) {
+					const owned = approval as Record<string, unknown>;
+					if (owned.schemaVersion === "rag-ime.agent-approval.v1"
+						&& owned.toolId === receipt.toolName && owned.state === "failed") {
+						return { isError: true };
+					}
+				}
+			});
 			// Register the complete session-authorized catalog for execution lookup.
 			// Provider visibility is narrowed separately by AgentSession.active tools.
 			for (const tool of options.registry.list()) {

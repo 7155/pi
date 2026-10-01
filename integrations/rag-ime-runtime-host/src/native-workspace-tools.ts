@@ -166,9 +166,23 @@ function formatReadResult(details: Record<string, unknown>): string {
 	const end = number(details.endLine);
 	const next = number(details.nextLineOffset);
 	const revisionNote = revision ? `[resourceRevision: ${revision}]\n` : "";
+	// Keep the body byte-for-byte while making the actual paging receipt visible
+	// to the model, including explicit null/false on the terminal managed page.
+	// Missing metadata is unknown; never synthesize an end-of-resource claim.
+	const page: Record<string, unknown> = {};
+	for (const key of ["startLine", "endLine", "contentBytes", "size"]) {
+		const value = number(details[key]);
+		if (value !== undefined) page[key] = value;
+	}
+	if (details.lineLayout === "bounded_segments" || details.lineLayout === "physical_lines") {
+		page.lineLayout = details.lineLayout;
+	}
+	if (next !== undefined || details.nextLineOffset === null) page.nextLineOffset = next ?? null;
+	if (typeof details.truncated === "boolean") page.truncated = details.truncated;
+	const pageNote = Object.keys(page).length ? `[readPage: ${JSON.stringify(page)}]\n` : "";
 	const note =
 		next !== undefined ? `\n\n[Showing lines ${start ?? "?"}-${end ?? "?"}. Continue with offset=${next}.]` : "";
-	return `${revisionNote}${content}${note}` || text(details.summary);
+	return `${revisionNote}${pageNote}${content}${note}` || text(details.summary);
 }
 
 function formatGrepResult(details: Record<string, unknown>): string {

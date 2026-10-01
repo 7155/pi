@@ -23,6 +23,9 @@ describe("runtime host primitive capabilities", () => {
 			sessionSettlementGet: true,
 			sessionContinuationQueue: true,
 			sessionCancelOperationRegistry: true,
+			sessionExactTurnCancel: true,
+			sessionRetiredTurnRecovery: true,
+			sessionInterruptedTurnRecovery: true,
 			sessionCancelOperations: {
 				provider: true,
 				tool: true,
@@ -53,7 +56,7 @@ describe("runtime host metadata and workspace boundaries", () => {
 			});
 			await expect(
 				host.handle({ protocolVersion: "2", id: "hello", method: "hello", params: {} }),
-			).resolves.toMatchObject({ piVersion: "0.87.1" });
+			).resolves.toMatchObject({ piVersion: "0.99.2" });
 		} finally {
 			await host?.dispose();
 			await rm(root, { recursive: true, force: true });

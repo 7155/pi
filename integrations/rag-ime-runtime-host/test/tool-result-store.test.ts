@@ -240,6 +240,57 @@ describe("ToolResultStore", () => {
 });
 
 describe("governed Pi-native workspace tools", () => {
+	it.each([
+		{
+			label: "continuation",
+			page: { startLine: 1, endLine: 1, contentBytes: 40_960, size: 218_842, nextLineOffset: 2, truncated: true },
+			note: "\n\n[Showing lines 1-1. Continue with offset=2.]",
+		},
+		{
+			label: "terminal page",
+			page: { startLine: 6, endLine: 6, contentBytes: 14_042, size: 218_842, nextLineOffset: null, truncated: false },
+			note: "",
+		},
+		{
+			label: "ordinary result without page metadata",
+			page: {},
+			note: "",
+		},
+	])("exposes only actual read metadata for $label and preserves the returned body", async ({ page, note }) => {
+		const registry = new BackendToolRegistry();
+		registry.sync([hiddenTarget("workspace_read", "read", "read")]);
+		const definitions = new Map<string, ToolDefinition<any, any, any>>();
+		const extension = createNativeWorkspaceToolsExtension({
+			sessionId: "session-native-read-pagination",
+			registry,
+			gatewayUrl: "http://127.0.0.1:8768/api/agent/tool/execute",
+			cwd: "/workspace",
+			resultStore: temporaryStore(),
+		});
+		const factory = typeof extension === "function" ? extension : extension.factory;
+		factory({
+			registerTool(definition: ToolDefinition<any, any, any>) {
+				definitions.set(definition.name, definition);
+			},
+		} as never);
+		const body = '{"receipt":"完整回执\\nwith no inserted newline"}';
+		const receipt = { content: body, resourceRevision: "f".repeat(64), ...page };
+		vi.stubGlobal("fetch", vi.fn<typeof fetch>().mockResolvedValue(new Response(
+			JSON.stringify({ ok: true, result: receipt }),
+			{ status: 200, headers: { "Content-Type": "application/json" } },
+		)));
+
+		const result = await definitions.get("read")?.execute(
+			"call-read-pagination", { path: "media://managed-receipt", offset: 1 }, undefined, undefined, {} as never,
+		);
+		const metadata = Object.keys(page).length ? `[readPage: ${JSON.stringify(page)}]\n` : "";
+		expect(result?.content[0]).toEqual({
+			type: "text",
+			text: `[resourceRevision: ${receipt.resourceRevision}]\n${metadata}${body}${note}`,
+		});
+		expect(result?.details).toMatchObject(receipt);
+	});
+
 	it("streams truthful lifecycle updates while a governed bash request is still pending", async () => {
 		vi.useFakeTimers();
 		const registry = new BackendToolRegistry();
@@ -533,7 +584,7 @@ describe("governed Pi-native workspace tools", () => {
 
 		expect(readResult?.content[0]).toEqual({
 			type: "text",
-			text: `[resourceRevision: ${revision}]\nconst before = true;\n`,
+			text: `[resourceRevision: ${revision}]\n[readPage: {"startLine":1,"endLine":1}]\nconst before = true;\n`,
 		});
 		expect(editResult?.content[0]).toEqual({
 			type: "text",

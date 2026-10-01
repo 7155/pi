@@ -5,7 +5,7 @@ Weasel product. It is deliberately kept outside upstream Pi's `packages/*`
 workspace so product policy and protocol code do not alter upstream package or
 lockfile ownership.
 
-The integration targets Pi `0.87.1` and exposes a versioned JSONL protocol over
+The integration targets Pi `0.99.2` and exposes a versioned JSONL protocol over
 stdin/stdout. Callers must not parse or edit Pi session files directly.
 
 ## Ownership boundary
@@ -35,6 +35,22 @@ The CLI uses strict byte-oriented JSONL framing:
 The host maintains a bounded LRU session pool. Eviction closes a Pi SDK session
 without deleting its persisted transcript, allowing later recovery through the
 normal session manager.
+
+## Native programmatic tool calling
+
+Product Sessions load Pi's built-in `codemode` extension. `session.open`
+accepts `codemodeMode`: `on` (default, normal tools plus code), `only` (code
+exposes the callable catalog), or `off`. `session.codemode.set` changes the
+actual mode only while idle and returns the effective `codemodeMode`.
+Snapshots and fork profiles preserve that state. The sandbox calls the same
+registered tools through the original product Gateway; nested calls keep
+`parentToolCallId` and Pi persists their exact arguments in
+`ToolResultMessage.nestedCalls`. The extension's optional model helpers are
+disabled so they cannot bypass the product's model and Room routing.
+
+The relocated Runtime payload must include the native codemode worker and
+QuickJS WASM. The explicit test-only `codemode` scenario exercises these
+assets through normal Session RPC; it is not a live model or Room acceptance.
 
 ## Stable prompt prefix and discovery
 

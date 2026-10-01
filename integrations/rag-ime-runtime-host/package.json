@@ -1,6 +1,6 @@
 {
 	"name": "@earendil-works/pi-rag-ime-runtime-host",
-	"version": "0.87.1",
+	"version": "0.99.2",
 	"description": "Product-owned Pi runtime adapter for Wisdom Weasel and PAW integrations",
 	"license": "MIT",
 	"type": "module",
@@ -27,8 +27,8 @@
 		"test": "cd ../.. && npm run test:rag-ime-runtime-host"
 	},
 	"dependencies": {
-		"@earendil-works/pi-ai": "0.87.1",
-		"@earendil-works/pi-coding-agent": "0.87.1"
+		"@earendil-works/pi-ai": "0.99.2",
+		"@earendil-works/pi-coding-agent": "0.99.2"
 	},
 	"engines": {
 		"node": ">=22.19.0"

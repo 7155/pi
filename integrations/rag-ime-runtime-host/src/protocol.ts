@@ -26,6 +26,7 @@ export type RuntimeMethod =
 	| "session.abort"
 	| "session.compact"
 	| "session.model.set"
+	| "session.codemode.set"
 	| "session.thinking.set"
 	| "session.close"
 	| "room.dispatch"
@@ -219,6 +220,7 @@ const RUNTIME_METHODS = new Set<RuntimeMethod>([
 	"session.abort",
 	"session.compact",
 	"session.model.set",
+	"session.codemode.set",
 	"session.thinking.set",
 	"session.close",
 	"room.dispatch",

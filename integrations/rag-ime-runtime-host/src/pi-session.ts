@@ -8,6 +8,7 @@ import {
 	type AgentSessionEvent,
 	type CreateAgentSessionOptions,
 	createAgentSession,
+	createCodemodeExtension,
 	DefaultResourceLoader,
 	type ExtensionUIContext,
 	type ExtensionUIDialogOptions,
@@ -86,6 +87,7 @@ export interface PiSessionOpenOptions {
 	provider?: string;
 	modelId?: string;
 	thinkingLevel?: NonNullable<CreateAgentSessionOptions["thinkingLevel"]>;
+	codemodeMode?: "on" | "only" | "off";
 	toolManifest?: unknown;
 	roomCapability?: Record<string, unknown>;
 	toolGatewayUrl?: string;
@@ -122,6 +124,7 @@ export interface PiForkRuntimeProfile {
 	provider?: string;
 	modelId?: string;
 	thinkingLevel?: NonNullable<CreateAgentSessionOptions["thinkingLevel"]>;
+	codemodeMode: "on" | "only" | "off";
 	toolManifest: BackendToolManifest[];
 	roomCapability?: Record<string, unknown>;
 	systemPrompt: string;
@@ -344,11 +347,13 @@ export interface ActiveTurn {
 
 const TURN_BINDING_CUSTOM_TYPE = "rag-ime.pi-turn-binding";
 const PACKAGE_COMMAND_RESULT_CUSTOM_TYPE = "paw-pi-package-command-result";
+const EXACT_TURN_CANCEL_CUSTOM_TYPE = "rag-ime.pi-exact-turn-cancel";
 
 function persistedActiveTurn(value: unknown): ActiveTurn | undefined {
 	if (!value || typeof value !== "object" || Array.isArray(value)) return undefined;
 	const source = value as Record<string, unknown>;
 	if (source.schemaVersion !== "rag-ime.pi-turn-binding.v1" || typeof source.turnId !== "string") return undefined;
+	if (source.state === "retired") return undefined;
 	const turnId = source.turnId.trim();
 	if (!turnId) return undefined;
 	return {
@@ -367,6 +372,20 @@ export interface PiSessionAbortReceipt {
 	lifecycle: PiAgentAbortReceipt;
 }
 
+export interface PiExactTurnCancelReceipt {
+	schemaVersion: "rag-ime.pi-exact-turn-cancel.v1";
+	sessionId: string;
+	turnId: string;
+	clientMessageId: string;
+	cancelId: string;
+	state: "accepted" | "rejected" | "unknown";
+	receiptId?: string;
+	phase?: "requested" | "settled" | "failed";
+	reason?: string;
+	runtimeReceipt?: PiSessionAbortReceipt;
+	persistencePending?: boolean;
+}
+
 export interface PiAgentAbortOperation {
 	operationId: string;
 	kind: string;
@@ -378,7 +397,7 @@ export interface PiAgentAbortReceipt {
 	schemaVersion: "pi.agent-abort-receipt.v1";
 	scopeId: string;
 	generation: number;
-	reason: "user_abort";
+	reason: "user_abort" | "retired_turn_recovery" | "interrupted_turn_recovery";
 	cancelledContinuationIds: string[];
 	cancelledOperationIds: string[];
 	failedOperationIds: string[];
@@ -496,6 +515,8 @@ export class PiProductSession implements PooledSession {
 	readonly noContextFiles: boolean;
 	readonly piSkillsEnabled: boolean;
 	readonly codexSkillsEnabled: boolean;
+	private readonly codemodeState: { mode: "on" | "only" | "off" };
+	get codemodeMode(): "on" | "only" | "off" { return this.codemodeState.mode; }
 	private roomCapability?: Record<string, unknown>;
 	private readonly session: AgentSession;
 	private readonly resourceLoader: DefaultResourceLoader;
@@ -513,6 +534,7 @@ export class PiProductSession implements PooledSession {
 	private disposePromise: Promise<void> | undefined;
 	private sequence = 0;
 	private activeTurn: ActiveTurn | undefined;
+	private recoveredTurnBindingId: string | undefined;
 	private activeRoom: ActiveRoomDispatch | undefined;
 	private roomContext = "";
 	private roomRecoveryContext = "";
@@ -525,6 +547,7 @@ export class PiProductSession implements PooledSession {
 	private roomToolCost = 0;
 	private settlementGeneration = 0;
 	private abortGeneration = 0;
+	private abortingTurnIds?: Set<string>;
 	private activeSourceLoopId = "";
 	private sourceLoopOrdinal = 0;
 	private readonly roomContinuationIds = new Set<string>();
@@ -544,6 +567,7 @@ export class PiProductSession implements PooledSession {
 		}
 	>();
 	private readonly appliedRoomCancels = new Map<string, AppliedRoomCancel>();
+	private exactTurnCancels?: Map<string, PiExactTurnCancelReceipt>;
 
 	private constructor(
 		options: PiSessionOpenOptions,
@@ -557,8 +581,10 @@ export class PiProductSession implements PooledSession {
 		thresholdCompactionContinuation: ThresholdCompactionContinuationController,
 		backendBridge: BackendToolBridgeOptions,
 		roomSkillLoad: RoomSkillLoadReceipt | undefined,
+		codemodeState: { mode: "on" | "only" | "off" },
 	) {
 		this.externalSessionId = options.externalSessionId;
+		this.codemodeState = codemodeState;
 		this.cwd = options.cwd;
 		this.noContextFiles = options.noContextFiles ?? false;
 		this.piSkillsEnabled = options.piSkillsEnabled ?? false;
@@ -592,6 +618,7 @@ export class PiProductSession implements PooledSession {
 			const recoveredSettlement = recoveredTurn ? this.turnSettlements.get(recoveredTurn.turnId) : undefined;
 			if (recoveredTurn && (!recoveredSettlement || recoveredSettlement.receipt.disposition === "suspended")) {
 				this.activeTurn = recoveredTurn;
+				this.recoveredTurnBindingId = latestTurnBinding.id;
 			}
 		}
 		this.backendBridge = backendBridge;
@@ -666,6 +693,8 @@ export class PiProductSession implements PooledSession {
 
 	static async create(options: PiSessionOpenOptions): Promise<PiProductSession> {
 		const roomBound = options.roomCapability !== undefined;
+		const codemodeMode = options.codemodeMode ?? "on";
+		const codemodeState = { mode: codemodeMode };
 		const registry = new BackendToolRegistry();
 		if (options.toolManifest !== undefined) registry.sync(options.toolManifest);
 		const sessionManager =
@@ -805,6 +834,11 @@ export class PiProductSession implements PooledSession {
 					},
 				),
 			extensionFactories: [
+				{
+					name: "builtin:codemode",
+					builtin: true,
+					factory: createCodemodeExtension({ get mode() { return codemodeState.mode === "only" ? "only" : "on"; }, models: false }),
+				},
 				...(roomBound
 					? []
 					: [
@@ -952,6 +986,9 @@ export class PiProductSession implements PooledSession {
 		// The manifest is already filtered by the Session permission policy. Keep
 		// every authorized tool routable while Provider schemas stay progressive.
 		created.session.setRegisteredToolExecutionEnabled(true);
+		if (codemodeMode !== "off") {
+			created.session.setActiveToolsByName([...created.session.getActiveToolNames(), "codemode"]);
+		}
 		applyBackendToolDisclosure(created.session, registry, roomBound);
 		productSession = new PiProductSession(
 			options,
@@ -965,6 +1002,7 @@ export class PiProductSession implements PooledSession {
 			thresholdCompactionContinuation,
 			backendBridge,
 			roomSkillLoad,
+			codemodeState,
 		);
 		productSession.sessionContext = options.sessionContext?.trim() ?? "";
 		productSession.roomContext = options.roomContext?.trim() ?? "";
@@ -1239,14 +1277,18 @@ export class PiProductSession implements PooledSession {
 		const entries = this.session.sessionManager.getBranch();
 		const assistant = terminalAssistant(messages);
 		const nativeStopReason = typeof assistant?.stopReason === "string" ? assistant.stopReason : "";
-		const disposition: AgentSettledReceiptV2["disposition"] = !assistant
+		// Aborting during a tool leaves the preceding assistant at toolUse.
+		// The native agent_settled event proves drain; the exact accepted abort
+		// identity supplies the cause without rewriting that historical message.
+		const abortRequested = this.abortingTurnIds?.has(turn.turnId) === true;
+		const disposition: AgentSettledReceiptV2["disposition"] = abortRequested ? "aborted" : !assistant
 			? "failed"
 			: nativeStopReason === "error"
 				? "failed"
 				: nativeStopReason === "aborted"
 					? "aborted"
 					: "completed";
-		const stopReason = nativeStopReason || "missing_assistant_message";
+		const stopReason = abortRequested ? "user_abort" : nativeStopReason || "missing_assistant_message";
 		const terminalContinuationIds = [...this.roomContinuationIds];
 		const finalMessage = assistant
 			? structuredClone(assistant)
@@ -1300,6 +1342,7 @@ export class PiProductSession implements PooledSession {
 	}
 
 	private onSessionEvent(event: AgentSessionEvent): void {
+		if (event.type === "agent_start") this.recoveredTurnBindingId = undefined;
 		const turn = this.activeTurn;
 		if (event.type === "message_start" && event.message.role === "assistant") {
 			const timestamp = Number((event.message as unknown as Record<string, unknown>).timestamp);
@@ -1311,6 +1354,7 @@ export class PiProductSession implements PooledSession {
 		let settlementReceipt: AgentSettledReceiptV2 | undefined;
 		if (event.type === "agent_settled" && turn?.turnId) {
 			settlementReceipt = this.createSettlementReceipt(turn);
+			this.abortingTurnIds?.delete(turn.turnId);
 			const previous = this.turnSettlements.get(turn.turnId, turn.clientMessageId);
 			const settlement = this.turnSettlements.record(turn, settlementReceipt);
 			if (previous?.receipt.receiptId !== settlement.receipt.receiptId) {
@@ -1528,6 +1572,7 @@ export class PiProductSession implements PooledSession {
 			sessionName: this.session.sessionName,
 			model: this.session.model ? publicSessionModel(this.session.model) : undefined,
 			thinkingLevel: this.session.thinkingLevel,
+			codemodeMode: this.codemodeMode,
 			isIdle: this.session.isIdle,
 			isCompacting: this.session.isCompacting,
 			telemetry: this.telemetry(),
@@ -1815,6 +1860,7 @@ export class PiProductSession implements PooledSession {
 			provider: this.session.model?.provider,
 			modelId: this.session.model?.id,
 			thinkingLevel: this.session.thinkingLevel,
+			codemodeMode: this.codemodeMode,
 			toolManifest: this.toolRegistry.list(),
 			roomCapability: this.roomCapability ? structuredClone(this.roomCapability) : undefined,
 			systemPrompt: this.session.systemPrompt,
@@ -1906,6 +1952,7 @@ export class PiProductSession implements PooledSession {
 		this.progressGuard().reset();
 		this.thresholdCompactionContinuation?.beginExternalPrompt();
 		const turn = { turnId: randomUUID(), clientMessageId: options.clientMessageId };
+		this.recoveredTurnBindingId = undefined;
 		this.activeTurn = turn;
 		// Publish the product turn identity before Pi starts its native run so the
 		// terminal agent_settled event can be fenced to this exact request.
@@ -2263,7 +2310,39 @@ export class PiProductSession implements PooledSession {
 		};
 	}
 
+	private recoveryResourcesDrained(): boolean {
+		return !this.activeRoom && !this.disposePromise && !this.pluginReloadInFlight &&
+			this.session.isIdle === true && this.session.isStreaming === false &&
+			this.session.isRetrying === false && this.session.isCompacting === false && this.session.isBashRunning === false &&
+			this.session.pendingMessageCount === 0 && this.session.agent.state.isStreaming === false &&
+			this.session.agent.state.pendingToolCalls.size === 0 && !this.session.agent.hasQueuedMessages() &&
+			this.pendingDecisions.size === 0 && this.pendingUIRequests.size === 0 && this.roomContinuationIds.size === 0;
+	}
+
+	private retireDrainedTurn(activeTurn: ActiveTurn): void {
+		const turnId = activeTurn.turnId;
+		// Retire only the drained turn observed before abort. Keep a durable
+		// tombstone so reopening a crashed Session cannot revive its binding.
+		this.session.sessionManager.appendCustomEntry(TURN_BINDING_CUSTOM_TYPE, {
+			schemaVersion: "rag-ime.pi-turn-binding.v1",
+			...activeTurn,
+			state: "retired",
+			reason: "explicit_abort",
+			retiredAtMs: Date.now(),
+		});
+		this.session.sessionManager.flushPendingEntries();
+		this.activeTurn = undefined;
+		if (this.activeRoom?.runtimeTurnId === turnId) this.activeRoom = undefined;
+		this.transientContext = "";
+		this.providerContextJournal.clearTurnContext();
+		this.recoveredTurnBindingId = undefined;
+	}
+
 	private async abortWithTurnId(turnId: string): Promise<PiSessionAbortReceipt> {
+		const activeTurn = this.activeTurn;
+		if (activeTurn?.turnId === turnId && !this.session.isIdle) {
+			(this.abortingTurnIds ??= new Set()).add(turnId);
+		}
 		const cancelledUIRequestIds = [...this.pendingUIRequests.keys()];
 		for (const pending of [...this.pendingUIRequests.values()]) pending.cancel();
 
@@ -2318,6 +2397,9 @@ export class PiProductSession implements PooledSession {
 			idle,
 			source: "runtime_host_adapter",
 		};
+		if (activeTurn?.turnId === turnId && this.activeTurn?.turnId === turnId && idle && lifecycle.drained) {
+			this.retireDrainedTurn(activeTurn);
+		}
 		return {
 			schemaVersion: "rag-ime.pi-session-abort-receipt.v1",
 			sessionId: this.externalSessionId,
@@ -2330,6 +2412,185 @@ export class PiProductSession implements PooledSession {
 
 	abort(): Promise<PiSessionAbortReceipt> {
 		return this.abortWithTurnId(this.activeTurn?.turnId ?? "");
+	}
+
+	abortExact(options: {
+		turnId: string;
+		clientMessageId: string;
+		cancelId: string;
+		lookupOnly?: boolean;
+		recoverRetiredOnly?: boolean;
+		recoverInterruptedOnly?: boolean;
+	}): PiExactTurnCancelReceipt {
+		const { turnId, clientMessageId, cancelId } = options;
+		if (!turnId || !clientMessageId || !cancelId) {
+			throw new RuntimeProtocolError("INVALID_PARAMS", "Exact cancellation requires turn, command and cancel identities");
+		}
+		if (options.recoverRetiredOnly && options.recoverInterruptedOnly) {
+			throw new RuntimeProtocolError("INVALID_PARAMS", "Choose one exact recovery phase");
+		}
+		const receipts = (this.exactTurnCancels ??= new Map());
+		let previous = receipts.get(cancelId);
+		if (!previous) {
+			for (const entry of [...this.session.sessionManager.getEntries()].reverse()) {
+				if (entry.type !== "custom" || entry.customType !== EXACT_TURN_CANCEL_CUSTOM_TYPE) continue;
+				const value = objectRecord(entry.data);
+				if (value?.cancelId !== cancelId || value.sessionId !== this.externalSessionId) continue;
+				if (value.schemaVersion !== "rag-ime.pi-exact-turn-cancel.v1" ||
+					(value.state !== "accepted" && value.state !== "rejected") ||
+					typeof value.receiptId !== "string" || !value.receiptId ||
+					typeof value.turnId !== "string" || typeof value.clientMessageId !== "string") {
+					throw new RuntimeProtocolError("INVALID_CANCEL_RECEIPT", "Persisted cancellation receipt is invalid");
+				}
+				previous = value as unknown as PiExactTurnCancelReceipt;
+				receipts.set(cancelId, previous);
+				break;
+			}
+		}
+		if (previous) {
+			if (previous.turnId !== turnId || previous.clientMessageId !== clientMessageId) {
+				throw new RuntimeProtocolError("CANCEL_IDENTITY_MISMATCH", "Cancellation identity was reused for a different turn");
+			}
+			return structuredClone(previous);
+		}
+		const receipt: PiExactTurnCancelReceipt = {
+			schemaVersion: "rag-ime.pi-exact-turn-cancel.v1", sessionId: this.externalSessionId,
+			turnId, clientMessageId, cancelId, state: "unknown",
+		};
+		if (options.lookupOnly) return receipt;
+		if (options.recoverInterruptedOnly) {
+			const latest = [...this.session.sessionManager.getBranch()].reverse()
+				.find(entry => entry.type === "custom" && entry.customType === TURN_BINDING_CUSTOM_TYPE);
+			const binding = latest?.type === "custom" ? objectRecord(latest.data) : undefined;
+			const reject = (reason: string): PiExactTurnCancelReceipt => ({ ...receipt, state: "rejected", reason });
+			if (!latest?.id || latest.id !== this.recoveredTurnBindingId ||
+				binding?.schemaVersion !== "rag-ime.pi-turn-binding.v1" || binding.state === "retired" ||
+				binding.turnId !== turnId || binding.clientMessageId !== clientMessageId ||
+				this.activeTurn?.turnId !== turnId || this.activeTurn.clientMessageId !== clientMessageId ||
+				this.turnSettlements.get(turnId, clientMessageId)) {
+				return reject("requested_turn_is_not_the_cold_recovered_binding");
+			}
+			if (!this.recoveryResourcesDrained()) return reject("interrupted_turn_resources_not_drained");
+			// No await, cancellation control or queue clearing between the actual
+			// resource check and retirement. A newly active turn cannot be cancelled.
+			this.retireDrainedTurn(this.activeTurn);
+			receipt.state = "accepted";
+			receipt.phase = "settled";
+			receipt.receiptId = `pi-exact-cancel:interrupted:${sha256Json([this.externalSessionId, turnId, clientMessageId, cancelId])}`;
+			receipt.runtimeReceipt = {
+				schemaVersion: "rag-ime.pi-session-abort-receipt.v1", sessionId: this.externalSessionId, turnId,
+				cancelledDecisionIds: [], cancelledUIRequestIds: [], lifecycle: {
+					schemaVersion: "pi.agent-abort-receipt.v1", scopeId: `${this.session.sessionId}:${turnId}`,
+					generation: ++this.abortGeneration, reason: "interrupted_turn_recovery", source: "runtime_host_adapter",
+					cancelledContinuationIds: [], cancelledOperationIds: [], failedOperationIds: [],
+					operations: [], pendingOperations: [], drained: true, idle: true,
+				},
+			};
+			receipts.set(cancelId, receipt);
+			try {
+				this.session.sessionManager.appendCustomEntry(EXACT_TURN_CANCEL_CUSTOM_TYPE, structuredClone(receipt));
+				this.session.sessionManager.flushPendingEntries();
+			} catch { receipt.persistencePending = true; }
+			return structuredClone(receipt);
+		}
+		if (options.recoverRetiredOnly) {
+			// This is journal repair, never a fallback to aborting a live turn.
+			// Only the latest binding on this transcript branch may be repaired.
+			const entries = this.session.sessionManager.getBranch();
+			const latest = [...entries].reverse().find(entry => entry.type === "custom" && entry.customType === TURN_BINDING_CUSTOM_TYPE);
+			const binding = latest?.type === "custom" ? objectRecord(latest.data) : undefined;
+			const reject = (reason: string): PiExactTurnCancelReceipt => ({ ...receipt, state: "rejected", reason });
+			if (!latest?.id || binding?.schemaVersion !== "rag-ime.pi-turn-binding.v1" ||
+				binding.state !== "retired" || binding.reason !== "explicit_abort" ||
+				binding.turnId !== turnId || binding.clientMessageId !== clientMessageId ||
+				typeof binding.retiredAtMs !== "number" || !Number.isFinite(binding.retiredAtMs)) {
+				return reject("requested_turn_is_not_the_latest_retired_binding");
+			}
+			if (this.activeTurn || !this.recoveryResourcesDrained()) {
+				// Do not persist transient rejection: the same recovery identity may
+				// be checked again after the actual Runtime resources have drained.
+				return reject("retired_turn_resources_not_drained");
+			}
+			let settlement = this.turnSettlements.get(turnId, clientMessageId);
+			if (!settlement) {
+				for (const entry of [...entries].reverse()) {
+					if (entry.type !== "custom" || entry.customType !== TURN_SETTLEMENT_CUSTOM_TYPE) continue;
+					const value = persistedTurnSettlement(entry.data);
+					if (value?.sessionId === this.externalSessionId && value.runtimeSessionId === this.session.sessionId &&
+						value.turnId === turnId && value.clientMessageId === clientMessageId) { settlement = value; break; }
+				}
+			}
+			if (settlement && settlement.receipt.disposition !== "aborted") return reject("turn_already_has_a_settlement");
+			if (!settlement) {
+				const recovered = this.createSettlementReceipt({ turnId, clientMessageId });
+				recovered.receiptId = `pi-settled:retired:${sha256Json([this.externalSessionId, this.session.sessionId, turnId, clientMessageId, latest.id])}`;
+				recovered.disposition = "aborted";
+				recovered.aborted = true;
+				recovered.stopReason = "retired_turn_recovered";
+				// A prior assistant message is not this retired turn's final result.
+				delete recovered.finalMessage;
+				settlement = { schemaVersion: "rag-ime.pi-turn-settlement.v1", sessionId: this.externalSessionId,
+					runtimeSessionId: this.session.sessionId, turnId, clientMessageId, receipt: recovered };
+				this.session.sessionManager.appendCustomEntry(TURN_SETTLEMENT_CUSTOM_TYPE, settlement);
+			}
+			// Flush before resolving any waiter or claiming successful recovery.
+			// A retry can finish flushing the same journal entry after storage failure.
+			this.session.sessionManager.flushPendingEntries();
+			this.turnSettlements.restore(settlement);
+			receipt.state = "accepted";
+			receipt.phase = "settled";
+			receipt.receiptId = `pi-exact-cancel:retired:${sha256Json([this.externalSessionId, turnId, clientMessageId, cancelId])}`;
+			receipt.runtimeReceipt = {
+				schemaVersion: "rag-ime.pi-session-abort-receipt.v1", sessionId: this.externalSessionId, turnId,
+				cancelledDecisionIds: [], cancelledUIRequestIds: [], lifecycle: {
+					schemaVersion: "pi.agent-abort-receipt.v1", scopeId: settlement.receipt.scopeId,
+					generation: ++this.abortGeneration, reason: "retired_turn_recovery", source: "runtime_host_adapter",
+					cancelledContinuationIds: [], cancelledOperationIds: [], failedOperationIds: [],
+					operations: [], pendingOperations: [], drained: true, idle: true,
+				},
+			};
+			receipts.set(cancelId, receipt);
+			try {
+				this.session.sessionManager.appendCustomEntry(EXACT_TURN_CANCEL_CUSTOM_TYPE, structuredClone(receipt));
+				this.session.sessionManager.flushPendingEntries();
+			} catch { receipt.persistencePending = true; }
+			return structuredClone(receipt);
+		}
+		const matches = this.activeTurn?.turnId === turnId && this.activeTurn.clientMessageId === clientMessageId;
+		receipt.state = matches ? "accepted" : "rejected";
+		receipt.receiptId = `pi-exact-cancel:${randomUUID()}`;
+		receipts.set(cancelId, receipt);
+		const persist = () => {
+			try {
+				this.session.sessionManager.appendCustomEntry(EXACT_TURN_CANCEL_CUSTOM_TYPE, structuredClone(receipt));
+				this.session.sessionManager.flushPendingEntries();
+				delete receipt.persistencePending;
+			} catch {
+				// An admitted cancellation remains admitted when projection storage
+				// fails. The exact in-memory receipt remains queryable without replay.
+				receipt.persistencePending = true;
+			}
+		};
+		if (!matches) {
+			receipt.reason = "requested_turn_is_not_active";
+			persist();
+			return structuredClone(receipt);
+		}
+		// No await separates identity comparison from signalling Pi's native
+		// abort controls. A reused Session can never be cancelled by this request.
+		receipt.phase = "requested";
+		const cancellation = this.abortWithTurnId(turnId);
+		persist();
+		void cancellation.then((runtimeReceipt) => {
+			receipt.phase = "settled";
+			receipt.runtimeReceipt = runtimeReceipt;
+			persist();
+		}, (error: unknown) => {
+			receipt.phase = "failed";
+			receipt.reason = error instanceof Error ? error.message : String(error);
+			persist();
+		});
+		return structuredClone(receipt);
 	}
 
 	abortRoom(lineage: RoomCancelParams): Promise<PiSessionAbortReceipt> {
@@ -2398,6 +2659,16 @@ export class PiProductSession implements PooledSession {
 		}
 		this.session.setThinkingLevel(level);
 		return { level: this.session.thinkingLevel, supported };
+	}
+
+	setCodemodeMode(mode: "on" | "only" | "off"): Record<string, unknown> {
+		if (!this.session.isIdle || this.activeTurn || this.pluginReloadInFlight) {
+			throw new RuntimeProtocolError("SESSION_BUSY", "Session must be idle before changing codemode");
+		}
+		const tools = this.session.getActiveToolNames().filter(name => name !== "codemode");
+		this.codemodeState.mode = mode;
+		this.session.setActiveToolsByName(mode === "off" ? tools : [...tools, "codemode"]);
+		return { codemodeMode: this.codemodeMode };
 	}
 
 	private async performPluginReload(): Promise<void> {

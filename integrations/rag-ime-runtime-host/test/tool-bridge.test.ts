@@ -903,6 +903,88 @@ describe("BackendToolRegistry", () => {
 });
 
 describe("product gateway request bounds", () => {
+	it.each([
+		{ timeoutMs: 110_000, deadline: 140_000 },
+		{ timeoutMs: undefined, deadline: 90_000 },
+		{ timeoutMs: 0, deadline: 90_000 },
+		{ timeoutMs: -10, deadline: 31_000 },
+		{ timeoutMs: 600_000, deadline: 150_000 },
+	])("waits for browser.run's bounded owner deadline ($timeoutMs), then aborts", async ({ timeoutMs, deadline }) => {
+		vi.useFakeTimers();
+		const fetchMock = vi.fn((_url: string | URL | Request, init?: RequestInit) =>
+			new Promise<Response>((_resolve, reject) => {
+				const signal = init?.signal;
+				if (signal?.aborted) reject(signal.reason);
+				else signal?.addEventListener("abort", () => reject(signal.reason), { once: true });
+			}),
+		);
+		vi.stubGlobal("fetch", fetchMock);
+		try {
+			const definition = createBackendToolDefinition({
+				sessionId: "session-browser-run", registry: new BackendToolRegistry(),
+				gatewayUrl: "http://127.0.0.1:8768/api/agent/tool/execute",
+			}, tool({ name: "browser" }));
+			const outcome = definition.execute("call-browser-run", { op: "run", script: "owned script", timeoutMs } as never,
+				undefined, undefined, {} as never).then(() => null, error => error);
+			await vi.advanceTimersByTimeAsync(30_001);
+			expect(fetchMock.mock.calls[0]?.[1]?.signal?.aborted).toBe(false);
+			const request = JSON.parse(String(fetchMock.mock.calls[0]?.[1]?.body));
+			expect(request.args).toEqual({ op: "run", script: "owned script", ...(timeoutMs === undefined ? {} : { timeoutMs }) });
+			await vi.advanceTimersByTimeAsync(deadline - 30_002);
+			expect(fetchMock.mock.calls[0]?.[1]?.signal?.aborted).toBe(false);
+			await vi.advanceTimersByTimeAsync(1);
+			expect(await outcome).toBeInstanceOf(Error);
+			expect((await outcome).message).toBe(`Tool gateway request timed out after ${deadline}ms`);
+		} finally {
+			vi.useRealTimers(); vi.unstubAllGlobals();
+		}
+	});
+
+	it.each([
+		{ op: "run", timeoutMs: 120_000, gatewayTimeoutMs: 10, deadline: 10 },
+		{ op: "navigate", timeoutMs: 120_000, gatewayTimeoutMs: undefined, deadline: 30_000 },
+		{ op: "trace", timeoutMs: 120_000, gatewayTimeoutMs: undefined, deadline: 30_000 },
+	])("preserves explicit and non-run deadlines ($op/$gatewayTimeoutMs)", async ({ op, timeoutMs, gatewayTimeoutMs, deadline }) => {
+		vi.useFakeTimers();
+		const fetchMock = vi.fn((_url: string | URL | Request, init?: RequestInit) =>
+			new Promise<Response>((_resolve, reject) => init?.signal?.addEventListener("abort", () => reject(init.signal?.reason), { once: true })),
+		);
+		vi.stubGlobal("fetch", fetchMock);
+		try {
+			const definition = createBackendToolDefinition({
+				sessionId: "session-browser-bound", registry: new BackendToolRegistry(), gatewayTimeoutMs,
+				gatewayUrl: "http://127.0.0.1:8768/api/agent/tool/execute",
+			}, tool({ name: "browser" }));
+			const outcome = definition.execute("call-browser-bound", { op, timeoutMs } as never,
+				undefined, undefined, {} as never).then(() => null, error => error);
+			await vi.advanceTimersByTimeAsync(deadline);
+			expect((await outcome).message).toBe(`Tool gateway request timed out after ${deadline}ms`);
+		} finally {
+			vi.useRealTimers(); vi.unstubAllGlobals();
+		}
+	});
+
+	it("propagates caller cancellation while waiting for a long browser script", async () => {
+		const caller = new AbortController();
+		const fetchMock = vi.fn((_url: string | URL | Request, init?: RequestInit) =>
+			new Promise<Response>((_resolve, reject) => init?.signal?.addEventListener("abort", () => reject(init.signal?.reason), { once: true })),
+		);
+		vi.stubGlobal("fetch", fetchMock);
+		try {
+			const definition = createBackendToolDefinition({
+				sessionId: "session-browser-cancel", registry: new BackendToolRegistry(),
+				gatewayUrl: "http://127.0.0.1:8768/api/agent/tool/execute",
+			}, tool({ name: "browser" }));
+			const pending = definition.execute("call-browser-cancel", { op: "run", timeoutMs: 110_000 } as never,
+				caller.signal, undefined, {} as never);
+			await Promise.resolve();
+			caller.abort(new Error("caller stopped this turn"));
+			await expect(pending).rejects.toThrow("caller stopped this turn");
+		} finally {
+			vi.unstubAllGlobals();
+		}
+	});
+
 	it("applies a host timeout even when the caller omits an AbortSignal", async () => {
 		const fetchMock = vi.fn((_url: string | URL | Request, init?: RequestInit) =>
 			new Promise<Response>((_resolve, reject) => {
@@ -975,5 +1057,51 @@ describe("product gateway request bounds", () => {
 			vi.useRealTimers();
 			vi.unstubAllGlobals();
 		}
+	});
+});
+
+describe("managed tool failure projection", () => {
+	it("projects a failed owned approval receipt without mistaking business flags for failure", async () => {
+		const registry = new BackendToolRegistry();
+		registry.sync([tool({ name: "workspace_shell" })]);
+		let resultHook: ((event: any) => any) | undefined;
+		const extension = createBackendToolExtension({ sessionId: "session-test", registry });
+		extension.factory({ registerTool: vi.fn(), on: (name: string, handler: any) => {
+			if (name === "tool_result") resultHook = handler;
+		} } as any);
+		const receipt = { schemaVersion: "rag-ime.workspace-command-receipt.v1", toolId: "workspace_shell",
+			exitCode: 1, mutationApplied: false, timedOut: false, output: "real command failure" };
+		const approval = { schemaVersion: "rag-ime.agent-approval.v1", toolId: "workspace_shell", state: "failed", receipt };
+		const details = { toolName: "workspace_shell", approvalRequired: false, approval, receipt };
+		const event = { toolName: "bash", isError: false, details, content: [{ type: "text", text: "real command failure\n[exit code: 1]" }] };
+		expect(await resultHook!(event)).toEqual({ isError: true });
+		expect(event.details).toBe(details);
+		expect(event.content[0].text).toBe("real command failure\n[exit code: 1]");
+		expect(await resultHook!({ ...event, details: { ...details, approval: { ...approval, state: "applied" }, receipt: { ...receipt, exitCode: 0 } } })).toBeUndefined();
+		expect(await resultHook!({ ...event, details: { ...details, approval: { ...approval, toolId: "other_tool" } } })).toBeUndefined();
+		expect(await resultHook!({ ...event, details: { toolName: "workspace_shell", result: { state: "failed", mutationApplied: false } } })).toBeUndefined();
+	});
+
+	it("keeps a failed Browser receipt while marking the native Pi result as an error", async () => {
+		const registry = new BackendToolRegistry();
+		registry.sync([tool({ name: "browser" })]);
+		let resultHook: ((event: any) => any) | undefined;
+		const extension = createBackendToolExtension({ sessionId: "session-test", registry });
+		extension.factory({ registerTool: vi.fn(), on: (name: string, handler: any) => {
+			if (name === "tool_result") resultHook = handler;
+		} } as any);
+		const receipt = { toolName: "browser", schemaVersion: "rag-ime.browser-control.v1", ok: false,
+			status: "failed", commandId: "bcmd_failed", failureReason: "direct_browser_error" };
+		const event = { toolName: "browser", isError: false, details: receipt,
+			content: [{ type: "text", text: JSON.stringify(receipt) }] };
+		expect(resultHook).toBeTypeOf("function");
+		expect(await resultHook!(event)).toEqual({ isError: true });
+		expect(event.details).toBe(receipt);
+		expect(event.content[0].text).toBe(JSON.stringify(receipt));
+		// Reading a failed business result is a successful tool operation.
+		expect(await resultHook!({ ...event, details: { toolName: "browser", ok: true, result: { status: "failed" } } })).toBeUndefined();
+		// Ambient tools and transport exceptions retain Pi's own authority.
+		expect(await resultHook!({ ...event, details: { toolName: "external", ok: false } })).toBeUndefined();
+		expect(await resultHook!({ ...event, details: undefined, isError: true })).toBeUndefined();
 	});
 });

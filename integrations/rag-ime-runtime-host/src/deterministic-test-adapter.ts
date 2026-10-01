@@ -435,6 +435,13 @@ export async function createDeterministicTestModelRuntime(): Promise<ModelRuntim
 	});
 	if (scenario === LIGHT_ROOM_SCENARIO) {
 		faux.setResponses(Array.from({ length: 32 }, () => lightRoomCanaryResponse));
+	} else if (scenario === "codemode") {
+		faux.setResponses([
+			fauxAssistantMessage(fauxToolCall("codemode", {
+				code: "const r = await Promise.all([tools.product_probe({value:2}), tools.product_probe({value:3})]); text(r.map(x=>JSON.parse(x).value).reduce((a,b)=>a+b,0));",
+			}, { id: "packaged-ptc" }), { stopReason: "toolUse" }),
+			fauxAssistantMessage("PAW-PTC-CANARY-COMPLETE"),
+		]);
 	} else if (scenario === AGENT_SESSION_SCENARIO) {
 		faux.setResponses(Array.from({ length: 96 }, () => agentSessionCanaryResponse));
 	} else if (scenario === NO_PROGRESS_SCENARIO) {

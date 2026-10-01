@@ -394,8 +394,10 @@ describe("typed Session cancellation", () => {
 			pendingDecisions,
 			abortGeneration: 0,
 			roomContinuationIds: new Set(["continuation-1"]),
+			providerContextJournal: { clearTurnContext: vi.fn() },
 			session: {
 				sessionId: "pi-session",
+				sessionManager: { appendCustomEntry: vi.fn(), flushPendingEntries: vi.fn() },
 				isStreaming: false,
 				isRetrying: false,
 				isCompacting: false,

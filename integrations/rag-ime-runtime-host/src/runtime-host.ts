@@ -53,6 +53,9 @@ export const RUNTIME_PRIMITIVE_CAPABILITIES = Object.freeze({
 	sessionSettlementGet: true,
 	sessionContinuationQueue: true,
 	sessionCancelOperationRegistry: true,
+	sessionExactTurnCancel: true,
+	sessionRetiredTurnRecovery: true,
+	sessionInterruptedTurnRecovery: true,
 	sessionCancelOperations: Object.freeze({
 		provider: true,
 		tool: true,
@@ -794,6 +797,10 @@ export class RagImeRuntimeHost {
 				const provider = optionalString(params, "provider", 80);
 				const modelId = optionalString(params, "modelId", 200);
 				const thinking = optionalString(params, "thinkingLevel", 20);
+				const codemodeMode = optionalString(params, "codemodeMode", 20) ?? "on";
+				if (!["on", "only", "off"].includes(codemodeMode)) {
+					throw new RuntimeProtocolError("INVALID_PARAMS", `Unsupported codemodeMode: ${codemodeMode}`);
+				}
 				if (thinking && !THINKING_LEVELS.has(thinking as ModelThinkingLevel)) {
 					throw new RuntimeProtocolError("INVALID_PARAMS", `Unsupported thinkingLevel: ${thinking}`);
 				}
@@ -822,6 +829,7 @@ export class RagImeRuntimeHost {
 						provider,
 						modelId,
 						thinkingLevel: thinking as ModelThinkingLevel | undefined,
+						codemodeMode: codemodeMode as "on" | "only" | "off",
 						toolManifest: params.toolManifest ?? [],
 						roomCapability: optionalRoomCapability(params),
 						toolGatewayUrl: this.options.toolGatewayUrl,
@@ -908,6 +916,7 @@ export class RagImeRuntimeHost {
 							provider: profile.provider,
 							modelId: profile.modelId,
 							thinkingLevel: profile.thinkingLevel,
+							codemodeMode: profile.codemodeMode,
 							toolManifest: profile.toolManifest,
 							roomCapability: profile.roomCapability,
 							toolGatewayUrl: this.options.toolGatewayUrl,
@@ -965,6 +974,16 @@ export class RagImeRuntimeHost {
 					images: Array.isArray(params.images) ? (params.images as never) : undefined,
 				});
 			case "session.abort":
+				if (params.expectedTurnId !== undefined || params.cancelId !== undefined || params.lookupOnly !== undefined || params.recoverRetiredOnly !== undefined || params.recoverInterruptedOnly !== undefined) {
+					return this.session(params).abortExact({
+						turnId: requiredString(params, "expectedTurnId", 240),
+						clientMessageId: requiredString(params, "clientMessageId", 128),
+						cancelId: requiredString(params, "cancelId", 240),
+						lookupOnly: optionalBoolean(params, "lookupOnly"),
+						recoverRetiredOnly: optionalBoolean(params, "recoverRetiredOnly"),
+						recoverInterruptedOnly: optionalBoolean(params, "recoverInterruptedOnly"),
+					});
+				}
 				return this.session(params).abort();
 			case "session.compact":
 				return this.session(params).compact(optionalString(params, "instructions", 4000));
@@ -974,6 +993,13 @@ export class RagImeRuntimeHost {
 					requiredString(params, "modelId", 200),
 					optionalMaxTokens(params),
 				);
+			case "session.codemode.set": {
+				const mode = requiredString(params, "mode", 20);
+				if (mode !== "on" && mode !== "only" && mode !== "off") {
+					throw new RuntimeProtocolError("INVALID_PARAMS", `Unsupported codemode mode: ${mode}`);
+				}
+				return this.session(params).setCodemodeMode(mode);
+			}
 			case "session.thinking.set": {
 				const level = requiredString(params, "level", 20);
 				if (!THINKING_LEVELS.has(level as ModelThinkingLevel)) {

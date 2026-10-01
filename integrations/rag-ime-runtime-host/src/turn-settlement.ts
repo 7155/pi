@@ -2,9 +2,9 @@ import { RuntimeProtocolError } from "./protocol.ts";
 
 /**
  * Product compatibility receipt emitted after Pi's native `agent_settled`
- * event. Pi 0.84 owns the run lifecycle and intentionally exposes only a
- * terminal event; the Runtime Host derives this bounded receipt for PAW's
- * durable turn fence without extending Pi core.
+ * event, or by explicit recovery of an exact retired binding whose Runtime
+ * resources are already drained. The Runtime Host derives this bounded
+ * receipt for PAW's durable turn fence without extending Pi core.
  */
 export interface AgentSettledReceiptV2 {
 	schemaVersion: "pi.agent-settled.v2";
