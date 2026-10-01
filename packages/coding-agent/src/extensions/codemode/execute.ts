@@ -237,32 +237,41 @@ export async function executeCodemode(
 	const callable = ctx ? getCodemodeCallableTools(ctx.tools) : [];
 	// ALL_TOOLS entries carry the declaration.
 	const samples = new Map(callable.map((tool) => [tool.name, renderToolSample(toCodemodeDeclaration(tool))]));
+	const pendingToolCalls = new Set<Promise<unknown>>();
 	const sandboxTools: CodemodeTool[] = callable.map((tool) => ({
 		name: tool.name,
 		description: samples.get(tool.name),
-		execute: async (args, { signal: callSignal }) => {
-			const record: CodemodeNestedCall = {
-				id: `${toolCallId}/?`,
-				name: tool.name,
-				args: previewArgs(args),
-				status: "running",
-			};
-			calls.push(record);
-			publish();
-			const callStartedAt = performance.now();
-			// Only tools from ctx.tools are callable, so ctx is set here.
-			if (!ctx) throw new Error("Tool calls need a session");
-			const outcome = await ctx.executeTool(tool.name, args, { signal: callSignal });
-			record.id = outcome.toolCall.id;
-			record.durationMs = performance.now() - callStartedAt;
-			if (outcome.isError) {
-				record.status = callSignal.aborted ? "cancelled" : "error";
-				record.error = truncateText(textOf(outcome.result) || `Tool "${tool.name}" failed`, ERROR_PREVIEW_CHARS);
-			} else {
-				record.status = "ok";
-			}
-			publish();
-			return toScriptValue(tool, outcome);
+		execute: (args, { signal: callSignal }) => {
+			const promise = (async () => {
+				const record: CodemodeNestedCall = {
+					id: `${toolCallId}/?`,
+					name: tool.name,
+					args: previewArgs(args),
+					status: "running",
+				};
+				calls.push(record);
+				publish();
+				const callStartedAt = performance.now();
+				// Only tools from ctx.tools are callable, so ctx is set here.
+				if (!ctx) throw new Error("Tool calls need a session");
+				const outcome = await ctx.executeTool(tool.name, args, { signal: callSignal });
+				record.id = outcome.toolCall.id;
+				record.durationMs = performance.now() - callStartedAt;
+				if (outcome.isError) {
+					record.status = callSignal.aborted ? "cancelled" : "error";
+					record.error = truncateText(textOf(outcome.result) || `Tool "${tool.name}" failed`, ERROR_PREVIEW_CHARS);
+				} else {
+					record.status = "ok";
+				}
+				publish();
+				return toScriptValue(tool, outcome);
+			})();
+			pendingToolCalls.add(promise);
+			void promise.then(
+				() => pendingToolCalls.delete(promise),
+				() => pendingToolCalls.delete(promise),
+			);
+			return promise;
 		},
 	}));
 
@@ -286,6 +295,8 @@ export async function executeCodemode(
 		result = await sandbox.execute(code, { signal, store });
 	} finally {
 		await sandbox.close();
+		// The worker can stop before native tool cancellation drains. Final details need real child IDs.
+		while (pendingToolCalls.size > 0) await Promise.allSettled([...pendingToolCalls]);
 	}
 	// Calls still marked running were cut off by the script ending, a timeout, or an abort.
 	for (const call of calls) {

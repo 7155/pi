@@ -112,6 +112,9 @@ describe("managed native codemode", () => {
 			const result = restored.find(message => message.role === "toolResult" && message.toolCallId === "ptc-parent");
             expect(result).toMatchObject({ role: "toolResult", toolName: "codemode", isError: scenario.failed,
                 nestedCalls: { complete: true, calls: scenario.values.map((value, index) => ({id: `ptc-parent/${index+1}`,name:"product_probe",arguments:{value},status:scenario.failed ? "error" : "ok"})) } });
+            if ("cancel" in scenario) expect(result).toMatchObject({ details: { calls: [
+                { id: "ptc-parent/1", name: "product_probe", status: "cancelled" },
+            ] } });
             if (result?.role === "toolResult") {
                 const output = result.content.filter(block => block.type === "text").map(block=>block.text).join("\n");
                 expect(output).not.toContain("must not run");
