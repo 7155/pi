@@ -1550,6 +1550,7 @@ export class PiProductSession implements PooledSession {
 		return {
 			schemaVersion: "rag-ime.pi-session-control-state.v1",
 			sessionId: this.externalSessionId,
+			codemodeMode: this.codemodeMode,
 			isIdle: this.session.isIdle,
 			isCompacting: this.session.isCompacting,
 			activeTurn: this.activeTurn,

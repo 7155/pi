@@ -552,6 +552,7 @@ export class RagImeRuntimeHost {
 						conversationRewrite: true,
 						activeTurnMessaging: true,
 						statelessCompletion: true,
+						codemode: { available: true, modes: ["on", "only", "off"], defaultMode: "on" },
 						transientContext: true,
 						runtimePrimitives: RUNTIME_PRIMITIVE_CAPABILITIES,
 					},
