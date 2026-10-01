@@ -346,6 +346,7 @@ describe("PiProductSession catalog updates", () => {
 
 		try {
 			expect(productSession.listCommands()).toEqual([
+				expect.objectContaining({ name: "mcp", source: "extension" }),
 				expect.objectContaining({ name: "init", source: "prompt" }),
 				expect.objectContaining({ name: "skill:rag-ime-product-skill" }),
 			]);
@@ -367,6 +368,7 @@ describe("PiProductSession catalog updates", () => {
 		});
 		try {
 			expect(piSession.listCommands().map((command) => command.name)).toEqual([
+				"mcp",
 				"init",
 				"skill:rag-ime-product-skill",
 				"skill:pi-user-skill",
@@ -383,6 +385,7 @@ describe("PiProductSession catalog updates", () => {
 		});
 		try {
 			expect(codexSession.listCommands().map((command) => command.name)).toEqual([
+				"mcp",
 				"init",
 				"skill:rag-ime-product-skill",
 				"skill:codex-user-skill",
@@ -676,7 +679,8 @@ describe("PiProductSession catalog updates", () => {
 						name: "memory.query",
 						active: false,
 						disclosed: false,
-						routable: true,
+						// Pi direct tools are callable only after disclosure/tool_load.
+						routable: false,
 						catalogOnly: false,
 					}),
 					expect.objectContaining({

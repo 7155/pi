@@ -67,6 +67,10 @@ import { type McpMenu, type McpUi, showMcpManager } from "./ui.ts";
 export type { McpTransportFactory } from "./runtime.ts";
 
 export interface McpExtensionOptions {
+	/** Read-only state projection for SDK surfaces. Never contains transports or credentials. */
+	onStatusChange?: (status: McpStatusSnapshot) => void;
+	/** SDK policy can disable codemode activation without changing MCP configuration. */
+	codemodeActivationAllowed?: () => boolean;
 	/** Defaults to reading `mcp.json` from the agent directory and the trusted project. */
 	loadConfig?: (ctx: ExtensionContext) => LoadedMcpConfig;
 	/** Defaults to stdio and streamable HTTP transports built from the server config. */
@@ -85,6 +89,23 @@ export interface McpExtensionOptions {
 	 * waited for when a script or search needs them. Default: 10000.
 	 */
 	startupWaitMs?: number;
+}
+
+export interface McpStatusSnapshot {
+	active: boolean;
+	configErrorCount: number;
+	servers: Array<{
+		name: string;
+		namespace: string;
+		scope: string;
+		enabled: boolean;
+		exposure: McpExposure;
+		state: "starting" | "disabled" | "connecting" | "connected" | "disconnected" | "needs-auth" | "failed" | "closed";
+		toolCount: number;
+		tools: Array<{ name: string; exposure: McpExposure }>;
+		resourceCount: number;
+		resourceTemplateCount: number;
+	}>;
 }
 
 const DEFAULT_STARTUP_WAIT_MS = 10_000;
@@ -297,6 +318,25 @@ export function createMcpExtension(options: McpExtensionOptions = {}): Extension
 
 		const listeners = new Set<() => void>();
 		const emitChange = () => {
+			options.onStatusChange?.({
+				active: sessionActive,
+				configErrorCount: configErrors.length,
+				servers: servers.map(({ entry, connection }) => ({
+					name: entry.name,
+					namespace: mcpNamespace(entry.name),
+					scope: entry.scope ?? "config",
+					enabled: entry.config.enabled !== false,
+					exposure: exposureOf(entry),
+					state: entry.config.enabled === false ? "disabled" : (connection?.state ?? "starting"),
+					toolCount: connection?.state === "connected" ? connection.tools.length : 0,
+					tools: [...(serverTools.get(entry.name) ?? [])].map((name) => ({
+						name,
+						exposure: getMcpToolExposure(entry.config, toolOwners.get(name)?.split("\0")[1] ?? name),
+					})),
+					resourceCount: connection?.state === "connected" ? connection.resources.length : 0,
+					resourceTemplateCount: connection?.state === "connected" ? connection.resourceTemplates.length : 0,
+				})),
+			});
 			for (const listener of listeners) listener();
 		};
 		const subscribe = (listener: () => void) => {
@@ -460,7 +500,13 @@ export function createMcpExtension(options: McpExtensionOptions = {}): Extension
 			const hasToolSearch = tools.some(isToolSearchTool);
 			const active = pi.getActiveTools();
 			const activate: string[] = [];
-			if (needsCodemode && hasCodemode && autoEnableCodemode && !active.includes(CODEMODE_TOOL_NAME)) {
+			if (
+				needsCodemode &&
+				hasCodemode &&
+				autoEnableCodemode &&
+				options.codemodeActivationAllowed?.() !== false &&
+				!active.includes(CODEMODE_TOOL_NAME)
+			) {
 				activate.push(CODEMODE_TOOL_NAME);
 			}
 			if (needsToolSearch && hasToolSearch && !active.includes(TOOL_SEARCH_TOOL_NAME)) {

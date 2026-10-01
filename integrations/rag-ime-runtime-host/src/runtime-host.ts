@@ -1147,7 +1147,7 @@ export class RagImeRuntimeHost {
 				);
 			}
 			case "tools.list":
-				return { tools: this.session(params).listTools() };
+				return { tools: this.session(params).listTools(), nativeCapabilities: this.session(params).nativeCapabilities() };
 			case "tools.sync":
 				return { tools: await this.session(params).syncTools(params.tools) };
 			case "plugins.catalog": {

@@ -9,10 +9,13 @@ import {
 	type CreateAgentSessionOptions,
 	createAgentSession,
 	createCodemodeExtension,
+	createMcpExtension,
 	DefaultResourceLoader,
 	type ExtensionUIContext,
 	type ExtensionUIDialogOptions,
 	type ModelRuntime,
+	type McpStatusSnapshot,
+	loadMcpConfig,
 	type PromptOptions,
 	SessionManager,
 	SettingsManager,
@@ -516,6 +519,7 @@ export class PiProductSession implements PooledSession {
 	readonly piSkillsEnabled: boolean;
 	readonly codexSkillsEnabled: boolean;
 	private readonly codemodeState: { mode: "on" | "only" | "off" };
+	private readonly mcpState: { snapshot?: McpStatusSnapshot };
 	get codemodeMode(): "on" | "only" | "off" { return this.codemodeState.mode; }
 	private roomCapability?: Record<string, unknown>;
 	private readonly session: AgentSession;
@@ -582,9 +586,11 @@ export class PiProductSession implements PooledSession {
 		backendBridge: BackendToolBridgeOptions,
 		roomSkillLoad: RoomSkillLoadReceipt | undefined,
 		codemodeState: { mode: "on" | "only" | "off" },
+		mcpState: { snapshot?: McpStatusSnapshot },
 	) {
 		this.externalSessionId = options.externalSessionId;
 		this.codemodeState = codemodeState;
+		this.mcpState = mcpState;
 		this.cwd = options.cwd;
 		this.noContextFiles = options.noContextFiles ?? false;
 		this.piSkillsEnabled = options.piSkillsEnabled ?? false;
@@ -695,6 +701,7 @@ export class PiProductSession implements PooledSession {
 		const roomBound = options.roomCapability !== undefined;
 		const codemodeMode = options.codemodeMode ?? "on";
 		const codemodeState = { mode: codemodeMode };
+		const mcpState: { snapshot?: McpStatusSnapshot } = {};
 		const registry = new BackendToolRegistry();
 		if (options.toolManifest !== undefined) registry.sync(options.toolManifest);
 		const sessionManager =
@@ -813,7 +820,8 @@ export class PiProductSession implements PooledSession {
 				// extensions from enabled Pi Packages. Ambient ~/.pi and project
 				// extensions remain outside this Session unless installed as a Package.
 				extensions: base.extensions.filter(
-					(extension) => extension.sourceInfo.scope === "temporary" || extension.sourceInfo.origin === "package",
+					(extension) => extension.sourceInfo.scope === "temporary" || extension.sourceInfo.origin === "package"
+						|| extension.path === "builtin:mcp",
 				),
 			}),
 			skillsOverride: (base) =>
@@ -835,6 +843,17 @@ export class PiProductSession implements PooledSession {
 				),
 			extensionFactories: [
 				{
+					name: "mcp", builtin: true, replaceable: true,
+					factory: createMcpExtension({
+						codemodeActivationAllowed: () => codemodeState.mode !== "off",
+						loadConfig: (ctx) => {
+							const config = loadMcpConfig({ agentDir: options.agentDir, cwd: ctx.cwd, projectTrusted: ctx.isProjectTrusted() });
+							return codemodeState.mode === "off" ? { ...config, autoEnableCodemode: false } : config;
+						},
+						onStatusChange: (snapshot) => { mcpState.snapshot = snapshot; },
+					}),
+				},
+				{
 					name: "builtin:codemode",
 					builtin: true,
 					factory: createCodemodeExtension({ get mode() { return codemodeState.mode === "only" ? "only" : "on"; }, models: false }),
@@ -851,6 +870,7 @@ export class PiProductSession implements PooledSession {
 						]),
 				createDiscoveryToolsExtension({
 					getResourceLoader,
+					nativeMcpSearch: true,
 					registry,
 					gateway: backendBridge,
 					focusToolNames: toolPromptFocus,
@@ -1003,6 +1023,7 @@ export class PiProductSession implements PooledSession {
 			backendBridge,
 			roomSkillLoad,
 			codemodeState,
+			mcpState,
 		);
 		productSession.sessionContext = options.sessionContext?.trim() ?? "";
 		productSession.roomContext = options.roomContext?.trim() ?? "";
@@ -1729,16 +1750,19 @@ export class PiProductSession implements PooledSession {
 
 	listTools(): Array<Record<string, unknown>> {
 		const active = new Set(this.session.getActiveToolNames());
+		const callable = new Set(this.session.getCallableToolNames());
 		const backend = new Map(this.toolRegistry.list().map((tool) => [tool.name, tool]));
 		const registered = this.session.getAllTools().map((tool) => ({
 			name: tool.name,
 			description: tool.description,
 			parameters: tool.parameters,
 			promptGuidelines: tool.promptGuidelines,
+			exposure: tool.exposure,
+			...(tool.namespace ? { namespace: { name: tool.namespace.name } } : {}),
 			sourceInfo: tool.sourceInfo,
 			active: active.has(tool.name),
 			disclosed: active.has(tool.name),
-			routable: true,
+			routable: callable.has(tool.name),
 			catalogOnly: false,
 			profile: backend.get(tool.name)?.profile,
 			risk: backend.get(tool.name)?.risk,
@@ -1757,6 +1781,21 @@ export class PiProductSession implements PooledSession {
 				risk: tool.risk,
 			}));
 		return [...registered, ...catalogOnly].sort((left, right) => left.name.localeCompare(right.name));
+	}
+
+	nativeCapabilities(): Record<string, unknown> {
+		const snapshot = this.mcpState.snapshot;
+		const mcpExposures = new Map(snapshot?.servers.flatMap((server) => server.tools.map((tool) => [tool.name, tool.exposure] as const)) ?? []);
+		return {
+			schemaVersion: "rag-ime.pi-native-capabilities.v1",
+			codemodeMode: this.codemodeMode,
+			mcp: snapshot?.active ? { available: true, ...structuredClone(snapshot) } : { available: false, servers: [] },
+			tools: this.listTools().filter((tool) => mcpExposures.has(String(tool.name))).map((tool) => ({
+				name: tool.name, description: tool.description, parameters: tool.parameters,
+				namespace: tool.namespace, exposure: mcpExposures.get(String(tool.name)), nativeToolExposure: tool.exposure,
+				active: tool.active, routable: tool.routable,
+			})),
+		};
 	}
 
 	listCommands(): Array<Record<string, unknown>> {

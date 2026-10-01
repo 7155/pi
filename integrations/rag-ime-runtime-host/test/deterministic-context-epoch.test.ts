@@ -29,8 +29,10 @@ function roomToolResult(toolCallId: string, result: Record<string, unknown>): Co
 function lightRoomContext(results: Context["messages"] = [], includeTool = true): Context {
 	return {
 		systemPrompt: "LIGHT-ROOM-CANARY",
-		messages: [{ role: "user", content: "Run LIGHT-ROOM-CANARY.", timestamp: 1 }, ...results] as Context["messages"],
-		tools: includeTool ? [tool("room_partner")] : [],
+		messages: [
+			{ role: "system", content: "", toolsAdded: includeTool ? [tool("room_partner")] : [], timestamp: 0 },
+			{ role: "user", content: "Run LIGHT-ROOM-CANARY.", timestamp: 1 }, ...results,
+		] as Context["messages"],
 	};
 }
 
@@ -38,13 +40,13 @@ function agentContext(tools: string[], history = "", systemPrompt = ""): Context
 	return {
 		systemPrompt,
 		messages: [
+			{ role: "system", content: "", toolsAdded: tools.map(tool), timestamp: 0 },
 			{
 				role: "user",
 				content: `AGENT-SESSION-RESILIENCE ${history}`,
 				timestamp: 1,
 			},
 		] as Context["messages"],
-		tools: tools.map(tool),
 	};
 }
 
@@ -52,6 +54,7 @@ function agentReceiptContext(tools: string[], receipt: Record<string, unknown>, 
 	return {
 		systemPrompt,
 		messages: [
+			{ role: "system", content: "", toolsAdded: tools.map(tool), timestamp: 0 },
 			{
 				role: "user",
 				content: "AGENT-SESSION-RESILIENCE",
@@ -67,7 +70,6 @@ function agentReceiptContext(tools: string[], receipt: Record<string, unknown>, 
 				timestamp: 2,
 			},
 		] as Context["messages"],
-		tools: tools.map(tool),
 	};
 }
 

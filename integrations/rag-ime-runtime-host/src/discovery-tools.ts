@@ -1,6 +1,7 @@
 import { createHash } from "node:crypto";
 import { readFile } from "node:fs/promises";
 import {
+	createToolSearchToolDefinition,
 	type InlineExtension,
 	type ResourceLoader,
 	type Skill,
@@ -114,6 +115,8 @@ export interface DiscoveryToolsOptions {
 	getResourceLoader(): ResourceLoader;
 	registry: BackendToolRegistry;
 	includeToolSearch?: boolean;
+	/** Compose native MCP search with the existing governed product catalog search. */
+	nativeMcpSearch?: boolean;
 	gateway?: BackendToolBridgeOptions;
 	focusToolNames?: readonly string[];
 	getLoadedSkillNames?: () => readonly string[];
@@ -699,14 +702,24 @@ export function createDiscoveryToolsExtension(options: DiscoveryToolsOptions): I
 				},
 			});
 			if (options.includeToolSearch !== false) {
+				const nativeSearch = options.nativeMcpSearch ? createToolSearchToolDefinition({ tools: {
+					getAllTools: () => pi.getAllTools().filter((tool) => tool.namespace?.name.startsWith("mcp__")),
+					getActiveTools: () => pi.getActiveTools(),
+					setActiveTools: (names) => pi.setActiveTools(names),
+				} }) : undefined;
 				pi.registerTool({
 					name: TOOL_SEARCH_TOOL_NAME,
 					label: "Search tools",
 					description:
-						"Search the product tool catalog by its six compact routing fields without loading schemas.",
-					promptSnippet: "Search the product tool catalog, then use tool_load before calling a result",
-					parameters: TOOL_SEARCH_PARAMETERS,
-					execute: async (toolCallId, args, signal) => {
+						nativeSearch ? "Search native MCP tools and load their matches for direct calling; also search the governed product catalog without loading its schemas. Product results still require tool_load."
+							: "Search the product tool catalog by its six compact routing fields without loading schemas.",
+					promptSnippet: nativeSearch ? "Discover MCP tools natively; product catalog results require tool_load" : "Search the product tool catalog, then use tool_load before calling a result",
+					parameters: nativeSearch?.parameters ?? TOOL_SEARCH_PARAMETERS,
+					execute: async (toolCallId, args, signal, onUpdate, ctx) => {
+						const nativeArgs = args as { query?: string; limit?: number };
+						const nativeResult = nativeSearch && nativeArgs.query?.trim()
+							? await nativeSearch.execute(toolCallId, { query: nativeArgs.query, limit: nativeArgs.limit }, signal, onUpdate, ctx)
+							: undefined;
 						let result = searchBackendTools(
 							options.registry.catalog(),
 							args as { query?: unknown; limit?: unknown },
@@ -747,8 +760,8 @@ export function createDiscoveryToolsExtension(options: DiscoveryToolsOptions): I
 							}
 						}
 						return {
-							content: [{ type: "text", text: JSON.stringify(result) }],
-							details: result,
+							content: [...(nativeResult?.content ?? []), { type: "text", text: JSON.stringify(result) }],
+							details: nativeResult ? { ...result, nativeLoaded: nativeResult.details.loaded } : result,
 						};
 					},
 				});

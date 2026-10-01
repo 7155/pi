@@ -4,6 +4,7 @@ import {
 	createFauxCore,
 	fauxAssistantMessage,
 	fauxToolCall,
+	getCurrentTools,
 } from "@earendil-works/pi-ai";
 import { ModelRuntime } from "@earendil-works/pi-coding-agent";
 
@@ -40,7 +41,7 @@ function contextText(context: Context): string {
 }
 
 function activeToolNames(context: Context): Set<string> {
-	return new Set((context.tools ?? []).map((tool) => tool.name));
+	return new Set(getCurrentTools(context.messages).map((tool) => tool.name));
 }
 
 function stringsIn(value: unknown): string[] {
