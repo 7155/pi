@@ -350,6 +350,20 @@ export interface ActiveTurn {
 	clientMessageId?: string;
 }
 
+export interface PiPromptReceipt extends ActiveTurn {
+	disposition: "started" | "queued" | "handled";
+	settlement?: PiTurnSettlementReceipt;
+}
+
+interface PromptPreflight {
+	turn: ActiveTurn;
+	operation: PiAgentAbortOperation;
+	cancelled: boolean;
+	nativeRun: boolean;
+	done: Promise<void>;
+	finish(): void;
+}
+
 const TURN_BINDING_CUSTOM_TYPE = "rag-ime.pi-turn-binding";
 const PACKAGE_COMMAND_RESULT_CUSTOM_TYPE = "paw-pi-package-command-result";
 const EXACT_TURN_CANCEL_CUSTOM_TYPE = "rag-ime.pi-exact-turn-cancel";
@@ -554,6 +568,7 @@ export class PiProductSession implements PooledSession {
 	private settlementGeneration = 0;
 	private abortGeneration = 0;
 	private abortingTurnIds?: Set<string>;
+	private promptPreflight?: PromptPreflight;
 	private activeSourceLoopId = "";
 	private sourceLoopOrdinal = 0;
 	private readonly roomContinuationIds = new Set<string>();
@@ -1299,7 +1314,7 @@ export class PiProductSession implements PooledSession {
 	}
 
 	get isIdle(): boolean {
-		return this.session.isIdle;
+		return this.session.isIdle && !this.promptPreflight;
 	}
 
 	private createSettlementReceipt(turn: ActiveTurn): AgentSettledReceiptV2 {
@@ -1374,6 +1389,12 @@ export class PiProductSession implements PooledSession {
 	private onSessionEvent(event: AgentSessionEvent): void {
 		if (event.type === "agent_start") this.recoveredTurnBindingId = undefined;
 		const turn = this.activeTurn;
+		const preflight = this.promptPreflight;
+		if (event.type === "agent_start" && preflight && preflight.turn.turnId === turn?.turnId) preflight.nativeRun = true;
+		// A command's nested run may end while its outer handler or another
+		// command-owned admission is still pending. Publish its terminal once
+		// startTurnPrompt observes the command and native lifecycle both drained.
+		if (event.type === "agent_settled" && preflight) return;
 		if (event.type === "message_start" && event.message.role === "assistant") {
 			const timestamp = Number((event.message as unknown as Record<string, unknown>).timestamp);
 			this.sourceLoopOrdinal += 1;
@@ -1382,7 +1403,7 @@ export class PiProductSession implements PooledSession {
 				: `pi:loop:${this.externalSessionId}:${this.sourceLoopOrdinal}`;
 		}
 		let settlementReceipt: AgentSettledReceiptV2 | undefined;
-		if (event.type === "agent_settled" && turn?.turnId) {
+		if (event.type === "agent_settled" && turn?.turnId && !preflight) {
 			settlementReceipt = this.createSettlementReceipt(turn);
 			this.abortingTurnIds?.delete(turn.turnId);
 			const previous = this.turnSettlements.get(turn.turnId, turn.clientMessageId);
@@ -1441,7 +1462,7 @@ export class PiProductSession implements PooledSession {
 				),
 			},
 		});
-		if (event.type === "agent_settled") {
+		if (event.type === "agent_settled" && !preflight) {
 			// Keep the terminal no-progress receipt available in the idle
 			// snapshot. A new prompt/Dispatch clears it before the next run.
 			this.progressGuard().reset({ preserveStopReceipt: true });
@@ -1581,7 +1602,7 @@ export class PiProductSession implements PooledSession {
 			schemaVersion: "rag-ime.pi-session-control-state.v1",
 			sessionId: this.externalSessionId,
 			codemodeMode: this.codemodeMode,
-			isIdle: this.session.isIdle,
+			isIdle: this.isIdle,
 			isCompacting: this.session.isCompacting,
 			activeTurn: this.activeTurn,
 			roomCapability: this.roomCapability ? structuredClone(this.roomCapability) : undefined,
@@ -1604,7 +1625,7 @@ export class PiProductSession implements PooledSession {
 			model: this.session.model ? publicSessionModel(this.session.model) : undefined,
 			thinkingLevel: this.session.thinkingLevel,
 			codemodeMode: this.codemodeMode,
-			isIdle: this.session.isIdle,
+			isIdle: this.isIdle,
 			isCompacting: this.session.isCompacting,
 			telemetry: this.telemetry(),
 			activeTurn: this.activeTurn,
@@ -2004,8 +2025,8 @@ export class PiProductSession implements PooledSession {
 		images?: PromptOptions["images"];
 		sessionContext?: string;
 		transientContext?: string;
-	}): Promise<ActiveTurn> {
-		if (!this.session.isIdle || this.activeTurn) {
+	}): Promise<PiPromptReceipt> {
+		if (!this.isIdle || this.activeTurn || this.disposePromise) {
 			throw new RuntimeProtocolError("SESSION_BUSY", "Session already has an active turn");
 		}
 		this.progressGuard().reset();
@@ -2040,48 +2061,86 @@ export class PiProductSession implements PooledSession {
 			this.sessionContext = nextSessionContext;
 		}
 		this.transientContext = nextTransientContext;
-		let preflightSettled = false;
-		let preflightFallback: ReturnType<typeof setTimeout> | undefined;
-		return new Promise<ActiveTurn>((accept, reject) => {
-			void this.session
-				.prompt(options.message, {
-					images: options.images,
-					source: "rpc",
-					preflightResult: (success) => {
-						if (preflightSettled) return;
-						if (success) {
-							this.session.sessionManager.appendCustomEntry(TURN_BINDING_CUSTOM_TYPE, {
-								schemaVersion: "rag-ime.pi-turn-binding.v1",
-								...turn,
-							});
-							preflightSettled = true;
-							accept(turn);
-							return;
-						}
-						this.activeTurn = undefined;
-						this.transientContext = "";
-						this.providerContextJournal.clearTurnContext();
-						// AgentSession reports preflight=false immediately before
-						// rethrowing the concrete failure. Let the Promise rejection
-						// preserve that diagnostic instead of replacing it with a
-						// generic error; retain a fallback for non-conforming hosts.
-						preflightFallback = setTimeout(() => {
-							if (preflightSettled) return;
-							preflightSettled = true;
-							reject(new RuntimeProtocolError("PROMPT_REJECTED", "Prompt preflight was rejected"));
-						}, 0);
-					},
-				})
-				.catch((error) => {
-					if (!preflightSettled) {
-						if (preflightFallback !== undefined) clearTimeout(preflightFallback);
-						preflightSettled = true;
-						this.activeTurn = undefined;
-						this.transientContext = "";
-						this.providerContextJournal.clearTurnContext();
-						reject(error);
-					}
-				});
+		return this.startTurnPrompt(turn, options.message, { images: options.images, source: "rpc" });
+	}
+
+	private clearTurn(turn: ActiveTurn): void {
+		if (this.activeTurn?.turnId !== turn.turnId) return;
+		this.activeTurn = undefined;
+		if (this.activeRoom?.runtimeTurnId === turn.turnId) this.activeRoom = undefined;
+		this.transientContext = "";
+		this.providerContextJournal.clearTurnContext();
+	}
+
+	private settlePromptPreflight(preflight: PromptPreflight): PiTurnSettlementReceipt | undefined {
+		const { turn } = preflight;
+		if (this.activeTurn?.turnId !== turn.turnId) return this.turnSettlements.get(turn.turnId, turn.clientMessageId);
+		const previous = this.turnSettlements.get(turn.turnId, turn.clientMessageId);
+		if (previous) return previous;
+		const receipt: AgentSettledReceiptV2 & { origin: "prompt_preflight" } = {
+			...this.createSettlementReceipt(turn), origin: "prompt_preflight",
+		};
+		if (!preflight.nativeRun) {
+			receipt.disposition = preflight.cancelled ? "aborted" : "completed";
+			receipt.aborted = preflight.cancelled;
+			receipt.stopReason = preflight.cancelled ? "prompt_preflight_cancelled" : "prompt_handled";
+			delete receipt.finalMessage;
+		}
+		const settlement: PiTurnSettlementReceipt = {
+			schemaVersion: "rag-ime.pi-turn-settlement.v1", sessionId: this.externalSessionId,
+			runtimeSessionId: this.session.sessionId, ...turn, receipt,
+		};
+		this.session.sessionManager.appendCustomEntry(TURN_SETTLEMENT_CUSTOM_TYPE, settlement);
+		this.session.sessionManager.flushPendingEntries();
+		this.turnSettlements.restore(settlement);
+		this.emitEvent({ protocolVersion: PROTOCOL_VERSION, event: "agent.event", sessionId: this.externalSessionId,
+			...turn, sequence: ++this.sequence, payload: { type: "agent_settled", origin: "prompt_preflight", receipt } });
+		this.abortingTurnIds?.delete(turn.turnId);
+		this.clearTurn(turn);
+		return settlement;
+	}
+
+	private startTurnPrompt(turn: ActiveTurn, message: string, options: PromptOptions): Promise<PiPromptReceipt> {
+		if (this.promptPreflight) throw new RuntimeProtocolError("SESSION_BUSY", "Prompt preflight is still pending");
+		let finish!: () => void;
+		const preflight: PromptPreflight = { turn, cancelled: false, nativeRun: false,
+			operation: { operationId: `prompt-preflight:${turn.turnId}:${randomUUID()}`, kind: "prompt_preflight", registeredAt: Date.now() },
+			done: new Promise<void>(resolveDone => { finish = resolveDone; }), finish: () => finish() };
+		this.promptPreflight = preflight;
+		let accepted = false;
+		let disposition: PiPromptReceipt["disposition"] | undefined;
+		return new Promise<PiPromptReceipt>((accept, reject) => {
+			void this.session.prompt(message, { ...options, preflightResult: result => {
+				disposition = result;
+				if (result === "handled") return; // Commands may already have performed an effect.
+				if (preflight.cancelled || this.disposePromise || this.activeTurn?.turnId !== turn.turnId) {
+					throw new RuntimeProtocolError("PROMPT_ADMISSION_CANCELLED", "Prompt admission was cancelled before the Agent run");
+				}
+				if (options.expandPromptTemplates !== false) {
+					this.session.sessionManager.appendCustomEntry(TURN_BINDING_CUSTOM_TYPE, { schemaVersion: "rag-ime.pi-turn-binding.v1", ...turn });
+				}
+				if (this.promptPreflight === preflight) this.promptPreflight = undefined;
+				preflight.finish();
+				accepted = true;
+				accept({ ...turn, disposition: result });
+			} }).then(async () => {
+				if (!accepted) {
+					await this.session.waitForIdle();
+					if (this.promptPreflight === preflight) this.promptPreflight = undefined;
+					if (disposition !== "handled") throw new RuntimeProtocolError("PROMPT_REJECTED", "Prompt ended without an admission disposition");
+					const settlement = this.settlePromptPreflight(preflight);
+					accept({ ...turn, disposition, settlement });
+				}
+			}, async error => {
+				if (accepted) return;
+				// A failing outer admission may have started extension-owned work.
+				// Its error does not prove that a nested preflight or run has drained.
+				await this.session.waitForIdle();
+				if (this.promptPreflight === preflight) this.promptPreflight = undefined;
+				if ((preflight.cancelled || preflight.nativeRun) && !this.disposePromise) this.settlePromptPreflight(preflight);
+				else this.clearTurn(turn);
+				reject(preflight.cancelled ? new RuntimeProtocolError("PROMPT_ADMISSION_CANCELLED", "Prompt admission was cancelled before the Agent run") : error);
+			}).catch(reject).finally(() => preflight.finish());
 		});
 	}
 
@@ -2127,6 +2186,7 @@ export class PiProductSession implements PooledSession {
 		roomResourceLimits?: RoomResourceLimits;
 	}): Promise<Record<string, unknown>> {
 		this.assertRoomDispatchResources();
+		if (this.promptPreflight) throw new RuntimeProtocolError("SESSION_BUSY", "Prompt preflight is still pending");
 		if (this.activeRoom && this.activeRoom.dispatchId !== options.dispatchId) {
 			throw new RuntimeProtocolError("ROOM_SESSION_BUSY", "Room Session already owns another active Dispatch");
 		}
@@ -2194,8 +2254,10 @@ export class PiProductSession implements PooledSession {
 					this.activeRoom.runtimeTurnId = turn.turnId;
 				}
 				return {
-					delivery: "prompt",
+					delivery: turn.disposition === "handled" ? "handled" : "prompt",
 					turnId: turn.turnId,
+					disposition: turn.disposition,
+					...(turn.settlement ? { settlement: turn.settlement } : {}),
 					roomSkillLoad: this.roomSkillLoadReceipt(),
 					providerContextReceipt: this.roomProviderContext
 						? {
@@ -2230,25 +2292,10 @@ export class PiProductSession implements PooledSession {
 			// An idle repair starts a native Pi prompt so before_agent_start can
 			// assemble the latest governed context. Resolve after preflight rather
 			// than waiting for the entire Provider run.
-			await new Promise<void>((resolvePrompt, rejectPrompt) => {
-				let preflightSettled = false;
-				void this.session
-					.prompt(options.message, {
-						source: "rpc",
-						expandPromptTemplates: false,
-						preflightResult: (success) => {
-							if (preflightSettled) return;
-							preflightSettled = true;
-							if (success) resolvePrompt();
-							else rejectPrompt(new RuntimeProtocolError("PROMPT_REJECTED", "Room continuation was rejected"));
-						},
-					})
-					.catch((error) => {
-						if (preflightSettled) return;
-						preflightSettled = true;
-						rejectPrompt(error);
-					});
-			});
+			const turn = this.activeTurn;
+			if (!turn) throw new RuntimeProtocolError("SESSION_IDLE", "Room continuation requires its original turn");
+			const admission = await this.startTurnPrompt(turn, options.message, { source: "rpc", expandPromptTemplates: false });
+			if (admission.disposition === "handled") return { delivery: "handled", ...admission };
 		} else {
 			await this.session.followUp(options.message);
 		}
@@ -2353,6 +2400,7 @@ export class PiProductSession implements PooledSession {
 	finishRoomCancel(rootId: string, generation: number, cancelId?: string): void {
 		if (cancelId) this.appliedRoomCancels.delete(cancelId);
 		if (this.activeRoom?.rootId !== rootId || this.activeRoom.generation > generation) return;
+		if (!this.isIdle) return;
 		this.activeTurn = undefined;
 		this.activeRoom = undefined;
 		this.roomContinuationIds.clear();
@@ -2371,7 +2419,7 @@ export class PiProductSession implements PooledSession {
 
 	private recoveryResourcesDrained(): boolean {
 		return !this.activeRoom && !this.disposePromise && !this.pluginReloadInFlight &&
-			this.session.isIdle === true && this.session.isStreaming === false &&
+			this.isIdle === true && this.session.isStreaming === false &&
 			this.session.isRetrying === false && this.session.isCompacting === false && this.session.isBashRunning === false &&
 			this.session.pendingMessageCount === 0 && this.session.agent.state.isStreaming === false &&
 			this.session.agent.state.pendingToolCalls.size === 0 && !this.session.agent.hasQueuedMessages() &&
@@ -2399,7 +2447,12 @@ export class PiProductSession implements PooledSession {
 
 	private async abortWithTurnId(turnId: string): Promise<PiSessionAbortReceipt> {
 		const activeTurn = this.activeTurn;
-		if (activeTurn?.turnId === turnId && !this.session.isIdle) {
+		if (activeTurn && activeTurn.turnId !== turnId) {
+			throw new RuntimeProtocolError("TURN_BINDING_MISMATCH", "Cancellation no longer matches the active turn");
+		}
+		const preflight = this.promptPreflight?.turn.turnId === turnId ? this.promptPreflight : undefined;
+		if (preflight) preflight.cancelled = true;
+		if (activeTurn?.turnId === turnId && (!this.session.isIdle || preflight)) {
 			(this.abortingTurnIds ??= new Set()).add(turnId);
 		}
 		const cancelledUIRequestIds = [...this.pendingUIRequests.keys()];
@@ -2410,6 +2463,7 @@ export class PiProductSession implements PooledSession {
 
 		const registeredAt = Date.now();
 		const operations: PiAgentAbortOperation[] = [];
+		if (preflight) operations.push(preflight.operation);
 		const register = (kind: string) => {
 			operations.push({
 				operationId: `abort:${kind}:${turnId || this.externalSessionId}:${randomUUID()}`,
@@ -2429,9 +2483,14 @@ export class PiProductSession implements PooledSession {
 		this.session.abortCompaction();
 		this.session.abortBranchSummary();
 		this.session.abortRetry();
-		await this.session.abort();
-		await this.session.waitForIdle();
+		const nativeAbort = this.session.abort();
+		if (preflight) void nativeAbort.catch(() => undefined);
+		else {
+			await nativeAbort;
+			await this.session.waitForIdle();
+		}
 		const stillPending = new Set<string>();
+		if (this.promptPreflight === preflight && preflight) stillPending.add("prompt_preflight");
 		if (this.session.isStreaming) stillPending.add("provider");
 		if (this.session.isRetrying) stillPending.add("retry_sleep");
 		if (this.session.isCompacting) stillPending.add("compaction_or_branch_summary");
@@ -2441,7 +2500,7 @@ export class PiProductSession implements PooledSession {
 		const cancelledOperationIds = operations
 			.filter((operation) => !stillPending.has(operation.kind))
 			.map((operation) => operation.operationId);
-		const idle = this.session.isIdle;
+		const idle = this.isIdle;
 		const lifecycle: PiAgentAbortReceipt = {
 			schemaVersion: "pi.agent-abort-receipt.v1",
 			scopeId: `${this.session.sessionId}:${turnId || "idle"}`,
@@ -2645,11 +2704,26 @@ export class PiProductSession implements PooledSession {
 		// No await separates identity comparison from signalling Pi's native
 		// abort controls. A reused Session can never be cancelled by this request.
 		receipt.phase = "requested";
+		const preflight = this.promptPreflight?.turn.turnId === turnId ? this.promptPreflight : undefined;
 		const cancellation = this.abortWithTurnId(turnId);
 		persist();
-		void cancellation.then((runtimeReceipt) => {
-			receipt.phase = "settled";
+		void cancellation.then(async (runtimeReceipt) => {
 			receipt.runtimeReceipt = runtimeReceipt;
+			// Native abort completion retains its existing phase contract; a
+			// preflight is additional work that native abort did not wait for.
+			receipt.phase = preflight && !runtimeReceipt.lifecycle.drained ? "requested" : "settled";
+			persist();
+			if (!runtimeReceipt.lifecycle.drained && preflight) {
+				await preflight.done;
+				const settlement = this.turnSettlements.get(turnId, clientMessageId);
+				if (!settlement || settlement.receipt.pendingOperations !== 0) return;
+				const lifecycle = runtimeReceipt.lifecycle;
+				const pendingOperations = lifecycle.pendingOperations.filter(operation => operation.operationId !== preflight.operation.operationId);
+				receipt.runtimeReceipt = { ...runtimeReceipt, lifecycle: { ...lifecycle, pendingOperations,
+					cancelledOperationIds: lifecycle.operations.filter(operation => !pendingOperations.includes(operation)).map(operation => operation.operationId),
+					drained: pendingOperations.length === 0, idle: pendingOperations.length === 0 } };
+				receipt.phase = pendingOperations.length === 0 ? "settled" : "requested";
+			}
 			persist();
 		}, (error: unknown) => {
 			receipt.phase = "failed";
@@ -2671,7 +2745,7 @@ export class PiProductSession implements PooledSession {
 	}
 
 	async compact(customInstructions?: string): Promise<unknown> {
-		if (!this.session.isIdle) {
+		if (!this.isIdle) {
 			throw new RuntimeProtocolError("SESSION_BUSY", "Session must be idle before compaction");
 		}
 		const refreshRevisionBefore = this.sessionContextRefreshRevision;
@@ -2699,7 +2773,7 @@ export class PiProductSession implements PooledSession {
 	}
 
 	async setModel(provider: string, modelId: string, maxTokens?: number): Promise<Record<string, unknown>> {
-		if (!this.session.isIdle) {
+		if (!this.isIdle) {
 			throw new RuntimeProtocolError("SESSION_BUSY", "Session must be idle before changing models");
 		}
 		const model = this.session.modelRuntime.getModel(provider, modelId);
@@ -2716,7 +2790,7 @@ export class PiProductSession implements PooledSession {
 	}
 
 	setThinkingLevel(level: NonNullable<CreateAgentSessionOptions["thinkingLevel"]>): Record<string, unknown> {
-		if (!this.session.isIdle) {
+		if (!this.isIdle) {
 			throw new RuntimeProtocolError("SESSION_BUSY", "Session must be idle before changing thinking level");
 		}
 		const supported = this.session.model ? getSupportedThinkingLevels(this.session.model) : ["off"];
@@ -2757,10 +2831,10 @@ export class PiProductSession implements PooledSession {
 	}
 
 	private async drainPluginReload(): Promise<void> {
-		if (!this.pluginReloadPending || !this.session.isIdle || this.disposePromise) return;
+		if (!this.pluginReloadPending || !this.isIdle || this.disposePromise) return;
 		if (this.pluginReloadInFlight) return await this.pluginReloadInFlight;
 		const operation = (async () => {
-			while (this.pluginReloadPending && this.session.isIdle && !this.disposePromise) {
+			while (this.pluginReloadPending && this.isIdle && !this.disposePromise) {
 				this.pluginReloadPending = false;
 				try {
 					await this.performPluginReload();
@@ -2789,6 +2863,8 @@ export class PiProductSession implements PooledSession {
 	}
 
 	private async disposeInternal(): Promise<void> {
+		const preflight = this.promptPreflight;
+		if (preflight) preflight.cancelled = true;
 		this.progressGuard().reset();
 		this.turnSettlements.dispose();
 		for (const pending of this.pendingUIRequests.values()) pending.cancel();
@@ -2802,6 +2878,7 @@ export class PiProductSession implements PooledSession {
 		this.providerContextJournal.clearTurnContext();
 		try {
 			await this.session.abort();
+			await preflight?.done;
 		} catch {
 			// Continue shutdown even if the active Provider or Tool ignored abort.
 		}

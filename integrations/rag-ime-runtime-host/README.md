@@ -36,6 +36,30 @@ separate. Paired PAW requires this capability rather than silently sending an
 unbound Stop to an older Host; an unidentifiable pending turn waits for its
 original identity instead of treating empty fields as a wildcard.
 
+### Prompt admission and settlement
+
+`session.prompt` returns the original turn/client identity and a typed
+`disposition`: `started`, `queued`, or `handled`. A handled input or extension
+command has already been processed and must not be replayed as a rejected
+prompt. Its ACK includes the persisted exact `rag-ime.pi-turn-settlement.v1`
+`settlement`, also available through the settlement APIs and public terminal
+event. Consumers use that receipt's disposition to determine the outcome.
+
+Pure handled completion uses `origin: prompt_preflight`,
+`stopReason: prompt_handled`, and `disposition: completed`, with no
+`finalMessage`. A command that starts a native Agent run retains its real
+assistant result. If Stop cancels the command's nested admission, the handled
+ACK can instead carry an aborted settlement with
+`stopReason: prompt_preflight_cancelled`.
+
+Preflight and command-owned nested prompts keep the original turn bound until
+they exit. Stop signals their cancellation scopes and returns
+`prompt_preflight` in `pendingOperations`, with `idle: false` and
+`drained: false`, while work is still pending. Exact cancellation remains
+`requested` until that work drains. A cancelled direct admission rejects
+`PROMPT_ADMISSION_CANCELLED`; it cannot enter the Provider later. A nested
+run's terminal event is deferred until its owning command handler also exits.
+
 The CLI uses strict byte-oriented JSONL framing:
 
 - only LF (`0x0A`) terminates a record;

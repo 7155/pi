@@ -453,8 +453,8 @@ describe("prompt preflight diagnostics", () => {
 			providerContextJournal: new ProviderContextJournal(),
 			session: {
 				isIdle: true,
-				prompt: vi.fn(async (_message, options) => {
-					options.preflightResult(false);
+				waitForIdle: vi.fn(async () => undefined),
+				prompt: vi.fn(async () => {
 					throw new Error("Room recovery receipt revision does not match");
 				}),
 			},
@@ -541,8 +541,8 @@ describe("per-turn Provider context lifecycle", () => {
 	it("starts an idle Room repair through native prompt preflight", async () => {
 		const productSession = Object.create(PiProductSession.prototype) as PiProductSession;
 		const providerContextJournal = new ProviderContextJournal();
-		const prompt = vi.fn(async (_message: string, options: { preflightResult(success: boolean): void }) => {
-			options.preflightResult(true);
+		const prompt = vi.fn(async (_message: string, options: { preflightResult(disposition: "started"): void }) => {
+			options.preflightResult("started");
 		});
 		const mutable = productSession as unknown as Record<string, any>;
 		Object.assign(mutable, {
@@ -603,7 +603,7 @@ describe("ordinary Session memory context epochs", () => {
 		const productSession = Object.create(PiProductSession.prototype) as PiProductSession;
 		const providerContextJournal = new ProviderContextJournal();
 		const prompt = vi.fn(async (_message, options) => {
-			options.preflightResult(true);
+			options.preflightResult("started");
 		});
 		const mutable = productSession as unknown as Record<string, any>;
 		Object.assign(mutable, {
@@ -690,7 +690,7 @@ describe("ordinary Session memory context epochs", () => {
 				systemPrompt: "stable system prompt",
 				sessionManager: { appendCustomEntry: vi.fn() },
 				prompt: vi.fn(async (_message, options) => {
-					options.preflightResult(true);
+					options.preflightResult("started");
 				}),
 			},
 		});
@@ -867,7 +867,7 @@ describe("managed Room runtime turn identity", () => {
 		const mutable = productSession as unknown as Record<string, any>;
 		const providerContextJournal = new ProviderContextJournal();
 		const prompt = vi.fn(async (_message, options) => {
-			options.preflightResult(true);
+			options.preflightResult("started");
 		});
 		Object.assign(mutable, {
 			externalSessionId: "agent:runtime",
@@ -940,7 +940,7 @@ describe("managed Room runtime turn identity", () => {
 		const prompt = vi.fn(async (_message, options) => {
 			turnIdObservedByPrompt = String(mutable.activeRoom?.runtimeTurnId ?? "");
 			expect(turnIdObservedByPrompt).toBe(String(mutable.activeTurn?.turnId ?? ""));
-			options.preflightResult(true);
+			options.preflightResult("started");
 		});
 		Object.assign(mutable, {
 			activeRoom: undefined,

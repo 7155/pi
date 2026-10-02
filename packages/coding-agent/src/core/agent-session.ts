@@ -13,6 +13,7 @@
  * Modes use this class and add their own I/O layer on top.
  */
 
+import { AsyncLocalStorage } from "node:async_hooks";
 import { readFileSync } from "node:fs";
 import { basename, dirname } from "node:path";
 import {
@@ -371,6 +372,9 @@ export class AgentSession {
 	private _eventListeners: AgentSessionEventListener[] = [];
 	private _isAgentRunActive = false;
 	private _agentRunAbortRequested = false;
+	private readonly _promptAbortContext = new AsyncLocalStorage<AbortSignal>();
+	private readonly _promptAbortControllers = new Set<AbortController>();
+	private readonly _promptPreflights = new Set<AbortController>();
 	private _idleWaitPromise: Promise<void> | undefined;
 	private _resolveIdleWait: (() => void) | undefined;
 
@@ -1363,6 +1367,7 @@ export class AgentSession {
 	 */
 	dispose(): void {
 		try {
+			for (const controller of this._promptAbortControllers) controller.abort();
 			this.abortRetry();
 			this.abortCompaction();
 			this.abortBranchSummary();
@@ -1432,9 +1437,9 @@ export class AgentSession {
 		return this._isAgentRunActive;
 	}
 
-	/** Whether the session has no active agent run, compaction, branch summary, retry, or queued continuation. */
+	/** Whether model admission, the agent run, and compaction have drained. */
 	get isIdle(): boolean {
-		return !this._isAgentRunActive && !this.isCompacting;
+		return !this._isAgentRunActive && !this.isCompacting && this._promptPreflights.size === 0;
 	}
 
 	/** Current effective system prompt, including changes not yet sent to the model. */
@@ -1969,144 +1974,173 @@ export class AgentSession {
 			this._deferredSettledActions.push(async () => await this.prompt(text, options));
 			return;
 		}
-		const expandPromptTemplates = options?.expandPromptTemplates ?? true;
-		const preflightResult = options?.preflightResult;
-		// Handle extension commands first (execute immediately, even during streaming)
-		// Extension commands manage their own LLM interaction via pi.sendMessage()
-		if (expandPromptTemplates && text.startsWith("/")) {
-			const handled = await this._tryExecuteExtensionCommand(text);
-			if (handled) {
-				// Extension command executed, no prompt to send
-				preflightResult?.("handled");
-				return;
-			}
-		}
+		const controller = new AbortController();
+		const parentSignal = this._promptAbortContext.getStore();
+		const onParentAbort = () => controller.abort(parentSignal?.reason);
+		if (parentSignal?.aborted) onParentAbort();
+		else parentSignal?.addEventListener("abort", onParentAbort, { once: true });
+		this._promptAbortControllers.add(controller);
+		try {
+			await this._promptAbortContext.run(controller.signal, async () => {
+				const { signal } = controller;
+				signal.throwIfAborted();
+				const expandPromptTemplates = options?.expandPromptTemplates ?? true;
+				const preflightResult = options?.preflightResult;
+				// Handle extension commands first (execute immediately, even during streaming)
+				// Extension commands manage their own LLM interaction via pi.sendMessage()
+				if (expandPromptTemplates && text.startsWith("/")) {
+					const handled = await this._tryExecuteExtensionCommand(text);
+					if (handled) {
+						// Extension command executed, no prompt to send
+						preflightResult?.("handled");
+						return;
+					}
+				}
+				// Commands can await the run they initiate. Count model admission, not
+				// the caller's command handler, in the native idle wait to avoid self-wait.
+				this._promptPreflights.add(controller);
+				signal.throwIfAborted();
 
-		if (this._compactionAbortController !== undefined) {
-			throw new Error(
-				"Cannot submit a prompt while compaction is in progress. Wait for compaction to finish and retry.",
-			);
-		}
+				if (this._compactionAbortController !== undefined) {
+					throw new Error(
+						"Cannot submit a prompt while compaction is in progress. Wait for compaction to finish and retry.",
+					);
+				}
 
-		// Emit input event for extension interception (before skill/template expansion)
-		const processedInput = await this._runInputHandlers(
-			text,
-			options?.images,
-			options?.source ?? "interactive",
-			this.isStreaming ? options?.streamingBehavior : undefined,
-		);
-		if (!processedInput) {
-			preflightResult?.("handled");
-			return;
-		}
-		const { text: currentText, images: currentImages } = processedInput;
-
-		// Expand skill commands (/skill:name args) and prompt templates (/template args)
-		let expandedText = currentText;
-		if (expandPromptTemplates) {
-			expandedText = this._expandSkillCommand(expandedText);
-			expandedText = expandPromptTemplate(expandedText, [...this.promptTemplates]);
-		}
-
-		// If streaming, queue via steer() or followUp() based on option
-		if (this.isStreaming) {
-			if (!options?.streamingBehavior) {
-				throw new Error(
-					"Agent is already processing. Specify streamingBehavior ('steer' or 'followUp') to queue the message.",
+				// Emit input event for extension interception (before skill/template expansion)
+				const processedInput = await this._runInputHandlers(
+					text,
+					options?.images,
+					options?.source ?? "interactive",
+					this.isStreaming ? options?.streamingBehavior : undefined,
 				);
-			}
-			if (options.streamingBehavior === "followUp") {
-				await this._queueFollowUp(expandedText, currentImages);
-			} else {
-				await this._queueSteer(expandedText, currentImages);
-			}
-			preflightResult?.("queued");
-			return;
-		}
+				if (!processedInput) {
+					preflightResult?.("handled");
+					return;
+				}
+				signal.throwIfAborted();
+				const { text: currentText, images: currentImages } = processedInput;
 
-		// Flush any pending bash and custom messages before the new prompt
-		this._flushPendingBashMessages();
-		this._flushPendingCustomMessages();
+				// Expand skill commands (/skill:name args) and prompt templates (/template args)
+				let expandedText = currentText;
+				if (expandPromptTemplates) {
+					expandedText = this._expandSkillCommand(expandedText);
+					expandedText = expandPromptTemplate(expandedText, [...this.promptTemplates]);
+				}
 
-		// Validate model
-		if (!this.model) {
-			throw new Error(formatNoModelSelectedMessage());
-		}
+				// If streaming, queue via steer() or followUp() based on option
+				if (this.isStreaming) {
+					if (!options?.streamingBehavior) {
+						throw new Error(
+							"Agent is already processing. Specify streamingBehavior ('steer' or 'followUp') to queue the message.",
+						);
+					}
+					if (options.streamingBehavior === "followUp") {
+						await this._queueFollowUp(expandedText, currentImages);
+					} else {
+						await this._queueSteer(expandedText, currentImages);
+					}
+					preflightResult?.("queued");
+					return;
+				}
 
-		const hasConfiguredAuth =
-			this._modelRuntime.hasConfiguredAuth(this.model.provider) ||
-			(await this._modelRuntime.checkAuth(this.model.provider)) !== undefined;
-		if (!hasConfiguredAuth) {
-			const isOAuth = this._modelRuntime.isUsingOAuth(this.model.provider);
-			if (isOAuth) {
-				throw new Error(
-					`Authentication failed for "${this.model.provider}". ` +
-						`Credentials may have expired or network is unavailable. ` +
-						`Run '/login ${this.model.provider}' to re-authenticate.`,
+				// Flush any pending bash and custom messages before the new prompt
+				this._flushPendingBashMessages();
+				this._flushPendingCustomMessages();
+
+				// Validate model
+				if (!this.model) {
+					throw new Error(formatNoModelSelectedMessage());
+				}
+
+				const hasConfiguredAuth =
+					this._modelRuntime.hasConfiguredAuth(this.model.provider) ||
+					(await this._modelRuntime.checkAuth(this.model.provider)) !== undefined;
+				signal.throwIfAborted();
+				if (!hasConfiguredAuth) {
+					const isOAuth = this._modelRuntime.isUsingOAuth(this.model.provider);
+					if (isOAuth) {
+						throw new Error(
+							`Authentication failed for "${this.model.provider}". ` +
+								`Credentials may have expired or network is unavailable. ` +
+								`Run '/login ${this.model.provider}' to re-authenticate.`,
+						);
+					}
+					throw new Error(formatNoApiKeyFoundMessage(this.model.provider));
+				}
+
+				// Check if we need to compact before sending (catches aborted responses).
+				// The user's new prompt is sent below, so do not call agent.continue() here.
+				const lastAssistant = this._findLastAssistantMessage();
+				if (lastAssistant) {
+					await this._checkCompaction(lastAssistant, false);
+				}
+				signal.throwIfAborted();
+
+				// Emit before_agent_start before normalizing images so extension-driven model
+				// selection determines the resize profile used for the request and history.
+				const selectedToolsBefore = this._baseSystemPromptOptions.selectedTools;
+				const result = await this._extensionRunner.emitBeforeAgentStart(
+					expandedText,
+					currentImages,
+					this._baseSystemPromptOptions,
 				);
-			}
-			throw new Error(formatNoApiKeyFoundMessage(this.model.provider));
-		}
+				signal.throwIfAborted();
+				// Handlers may edit event.systemPromptOptions.selectedTools or call setActiveTools(),
+				// which updates the live loadout instead. An explicit edit wins; otherwise the live
+				// loadout is authoritative, so a setActiveTools() call is not undone here.
+				const handlerEditedTools =
+					result.systemPromptOptions.selectedTools.length !== selectedToolsBefore.length ||
+					result.systemPromptOptions.selectedTools.some((name, index) => name !== selectedToolsBefore[index]);
+				if (!handlerEditedTools) result.systemPromptOptions.selectedTools = this.getActiveToolNames();
 
-		// Check if we need to compact before sending (catches aborted responses).
-		// The user's new prompt is sent below, so do not call agent.continue() here.
-		const lastAssistant = this._findLastAssistantMessage();
-		if (lastAssistant) {
-			await this._checkCompaction(lastAssistant, false);
-		}
+				const normalized = await this._normalizePromptImages(currentImages);
+				signal.throwIfAborted();
+				const userText =
+					normalized.hints.length > 0 ? `${expandedText}\n\n${normalized.hints.join("\n")}` : expandedText;
 
-		// Emit before_agent_start before normalizing images so extension-driven model
-		// selection determines the resize profile used for the request and history.
-		const selectedToolsBefore = this._baseSystemPromptOptions.selectedTools;
-		const result = await this._extensionRunner.emitBeforeAgentStart(
-			expandedText,
-			currentImages,
-			this._baseSystemPromptOptions,
-		);
-		// Handlers may edit event.systemPromptOptions.selectedTools or call setActiveTools(),
-		// which updates the live loadout instead. An explicit edit wins; otherwise the live
-		// loadout is authoritative, so a setActiveTools() call is not undone here.
-		const handlerEditedTools =
-			result.systemPromptOptions.selectedTools.length !== selectedToolsBefore.length ||
-			result.systemPromptOptions.selectedTools.some((name, index) => name !== selectedToolsBefore[index]);
-		if (!handlerEditedTools) result.systemPromptOptions.selectedTools = this.getActiveToolNames();
+				// Build messages only after hooks and image normalization have completed.
+				const messages: AgentMessage[] = [];
+				const userContent: (TextContent | ImageContent)[] = [{ type: "text", text: userText }];
+				userContent.push(...normalized.images);
+				messages.push({
+					role: "user",
+					content: userContent,
+					timestamp: Date.now(),
+				});
 
-		const normalized = await this._normalizePromptImages(currentImages);
-		const userText = normalized.hints.length > 0 ? `${expandedText}\n\n${normalized.hints.join("\n")}` : expandedText;
+				// Inject any pending "nextTurn" messages as context alongside the user message
+				for (const msg of this._pendingNextTurnMessages) {
+					messages.push(msg);
+				}
+				this._pendingNextTurnMessages = [];
 
-		// Build messages only after hooks and image normalization have completed.
-		const messages: AgentMessage[] = [];
-		const userContent: (TextContent | ImageContent)[] = [{ type: "text", text: userText }];
-		userContent.push(...normalized.images);
-		messages.push({
-			role: "user",
-			content: userContent,
-			timestamp: Date.now(),
-		});
+				for (const msg of result.messages) {
+					messages.push({
+						role: "custom",
+						customType: msg.customType,
+						// Untyped extensions can pass null/missing content; normalize at ingestion.
+						content: msg.content ?? [],
+						display: msg.display,
+						details: msg.details,
+						timestamp: Date.now(),
+					});
+				}
+				const updateMessage = this._preparePromptAndToolLoadout(result.systemPromptOptions);
+				this._runSystemPromptOptions = result.systemPromptOptions;
+				if (updateMessage) messages.unshift(updateMessage);
 
-		// Inject any pending "nextTurn" messages as context alongside the user message
-		for (const msg of this._pendingNextTurnMessages) {
-			messages.push(msg);
-		}
-		this._pendingNextTurnMessages = [];
-
-		for (const msg of result.messages) {
-			messages.push({
-				role: "custom",
-				customType: msg.customType,
-				// Untyped extensions can pass null/missing content; normalize at ingestion.
-				content: msg.content ?? [],
-				display: msg.display,
-				details: msg.details,
-				timestamp: Date.now(),
+				preflightResult?.("started");
+				signal.throwIfAborted();
+				this._promptPreflights.delete(controller);
+				await this._runAgentPrompt(messages);
 			});
+		} finally {
+			parentSignal?.removeEventListener("abort", onParentAbort);
+			this._promptAbortControllers.delete(controller);
+			this._promptPreflights.delete(controller);
+			this._resolveIdleWaitIfIdle();
 		}
-		const updateMessage = this._preparePromptAndToolLoadout(result.systemPromptOptions);
-		this._runSystemPromptOptions = result.systemPromptOptions;
-		if (updateMessage) messages.unshift(updateMessage);
-
-		preflightResult?.("started");
-		await this._runAgentPrompt(messages);
 	}
 
 	/**
@@ -2437,6 +2471,7 @@ export class AgentSession {
 	 * Abort current operation and wait for agent to become idle.
 	 */
 	async abort(): Promise<void> {
+		for (const controller of this._promptAbortControllers) controller.abort();
 		if (this._isAgentRunActive) {
 			this._agentRunAbortRequested = true;
 		}
@@ -3430,7 +3465,8 @@ export class AgentSession {
 				getScopedModels: () => this._scopedModels,
 				isIdle: () => this.isIdle,
 				isProjectTrusted: () => this.settingsManager.isProjectTrusted(),
-				getSignal: () => this.agent.signal,
+				getSignal: () =>
+					this.isStreaming ? this.agent.signal : (this._promptAbortContext.getStore() ?? this.agent.signal),
 				abort: () => {
 					if (this._extensionAbortHandler) {
 						this._extensionAbortHandler();
