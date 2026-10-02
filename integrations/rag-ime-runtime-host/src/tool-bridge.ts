@@ -604,6 +604,7 @@ export interface BackendToolBridgeOptions {
 	gatewayTimeoutMs?: number;
 	roomCapability?: Record<string, unknown>;
 	sourceLoopId?(): string;
+	executionBinding?(): { turnId: string; clientMessageId: string } | undefined;
 	resultStore?: ToolResultStore;
 	waitForDecision?(
 		kind: "approval" | "review",
@@ -874,6 +875,10 @@ async function executeGatewayTool(
 	const prepared = artifacts.prepare(tool.name, args);
 	const gatewayOptions = gatewayOptionsForToolExecution(options, tool.name, prepared.arguments);
 	const sourceLoopId = gatewayOptions.sourceLoopId?.().trim() ?? "";
+	// Freeze ownership before HTTP capacity waiting. Later turns cannot rebind
+	// an already queued native, deferred, or codemode tool call.
+	const executionBinding = gatewayOptions.executionBinding?.();
+	const roomCapability = options.roomCapability ? structuredClone(options.roomCapability) : undefined;
 	const payload = await requestProductGateway(
 		gatewayOptions,
 		"execute",
@@ -884,7 +889,8 @@ async function executeGatewayTool(
 			tool: tool.name,
 			args: prepared.arguments,
 			...(sourceLoopId ? { sourceLoopId } : {}),
-			...(options.roomCapability ? { roomCapability: options.roomCapability } : {}),
+			...(executionBinding ? { executionBinding: { ...executionBinding } } : {}),
+			...(roomCapability ? { roomCapability } : {}),
 			...(options.registry.loadReceipt(tool.name) ? { loadReceiptId: options.registry.loadReceipt(tool.name) } : {}),
 		},
 		signal,

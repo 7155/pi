@@ -744,6 +744,10 @@ export class PiProductSession implements PooledSession {
 			gatewayToken: options.toolGatewayToken,
 			roomCapability: options.roomCapability,
 			sourceLoopId: () => productSession?.activeSourceLoopId ?? "",
+			executionBinding: () => productSession?.activeTurn ? {
+				turnId: productSession.activeTurn.turnId,
+				clientMessageId: productSession.activeTurn.clientMessageId ?? "",
+			} : undefined,
 			resultStore: new ToolResultStore(
 				resolve(
 					options.sessionDir,

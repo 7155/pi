@@ -5,8 +5,10 @@ Weasel product. It is deliberately kept outside upstream Pi's `packages/*`
 workspace so product policy and protocol code do not alter upstream package or
 lockfile ownership.
 
-The integration targets Pi `0.99.2` and exposes a versioned JSONL protocol over
-stdin/stdout. Callers must not parse or edit Pi session files directly.
+This source targets Pi `1.0.0` and exposes protocol 2 over versioned JSONL on
+stdin/stdout. The previously reviewed product baseline was `0.99.2`; building
+this Host does not activate it in an installed PAW. The Host owns transcript
+writes and recovery; product-side history readers are read-only projections.
 
 ## Ownership boundary
 
@@ -35,6 +37,15 @@ The CLI uses strict byte-oriented JSONL framing:
 The host maintains a bounded LRU session pool. Eviction closes a Pi SDK session
 without deleting its persisted transcript, allowing later recovery through the
 normal session manager.
+
+Gateway requests capture the active `turnId`, exact `clientMessageId` (including
+the empty value used by Room turns), and Room capability before waiting for HTTP
+capacity. A later turn cannot adopt a queued request. PAW persists admission by
+Session and tool-call ID: a completed repeat returns its original receipt;
+conflicting or uncertain outcomes require reconciliation instead of executing
+again. Older clients without this additive binding retain receipt deduplication,
+but do not acquire exact-turn cancellation protection. Rebuild the paired Host
+payload to enable that protection.
 
 ## Native programmatic tool calling
 
@@ -102,7 +113,7 @@ context.
 Tool disclosure follows the same three levels without mutating the stable
 prefix: the initial route catalog has no parameters, `tool_search` returns the
 full description/profile/risk, and `tool_load` discloses one parameter schema.
-`tool_load` emits upstream Pi's `addedToolNames`, allowing Pi 0.84 deferred tools
+`tool_load` emits upstream Pi's `addedToolNames`, allowing native deferred tools
 to anchor the new schema at the tool-result point instead of rebuilding the
 cached prefix.
 
@@ -138,7 +149,7 @@ injected through `before_agent_start` and are not stored as fake user messages.
 After compaction, the integration refreshes the product Session context but does
 not mutate Pi's authoritative `session_compact` settlement. The refreshed
 context is composed during the next normal provider start. Compaction failures
-and aborts are reported through Pi 0.84's `session_compact_failed` lifecycle
+and aborts are reported through Pi's `session_compact_failed` lifecycle
 event and enter the same durable product outbox.
 
 Conversation branches use `session.fork.candidates` and `session.fork`. The
