@@ -2469,7 +2469,14 @@ export class PiProductSession implements PooledSession {
 		};
 	}
 
-	abort(): Promise<PiSessionAbortReceipt> {
+	abort(expected?: { turnId?: string; clientMessageId: string }): Promise<PiSessionAbortReceipt> {
+		// Comparison and native signalling share one synchronous call; no await
+		// lets a replacement turn acquire a Stop intended for an earlier run.
+		if (expected && (!this.activeTurn ||
+			(expected.turnId !== undefined && this.activeTurn.turnId !== expected.turnId) ||
+			(this.activeTurn.clientMessageId ?? "") !== expected.clientMessageId)) {
+			throw new RuntimeProtocolError("ABORT_TARGET_MISMATCH", "Requested Stop target is no longer active");
+		}
 		return this.abortWithTurnId(this.activeTurn?.turnId ?? "");
 	}
 

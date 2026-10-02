@@ -124,4 +124,47 @@ describe("exact turn cancellation", () => {
 		expect(result).toMatchObject({ state: "accepted", cancelId: "cancel", clientMessageId: "dispatch" });
 		expect(f.abort).toHaveBeenCalledTimes(1);
 	});
+
+	it.each(["dispatch", ""])("bound ordinary Stop preserves a replacement turn (%s)", async (clientMessageId) => {
+		const f = fixture();
+		Object.assign(f.session, { activeTurn: { turnId: "new-turn", clientMessageId: "new-message" } });
+		const host = Object.create(RagImeRuntimeHost.prototype) as RagImeRuntimeHost;
+		Object.assign(host, { sessions: { get: () => f.session } });
+		await expect(host.handle({ protocolVersion: "2", id: "late-stop", method: "session.abort",
+			params: { sessionId: "session", expectedTurnId: "turn", clientMessageId } }))
+			.rejects.toMatchObject({ code: "ABORT_TARGET_MISMATCH" });
+		expect(f.abort).not.toHaveBeenCalled();
+		expect(f.state.session.clearQueue).not.toHaveBeenCalled();
+		expect(Reflect.get(f.session, "activeTurn")).toEqual({ turnId: "new-turn", clientMessageId: "new-message" });
+	});
+
+	it("pending admission Stop matches its original non-empty client identity", async () => {
+		const f = fixture();
+		const host = Object.create(RagImeRuntimeHost.prototype) as RagImeRuntimeHost;
+		Object.assign(host, { sessions: { get: () => f.session } });
+		await expect(host.handle({ protocolVersion: "2", id: "old-admission", method: "session.abort",
+			params: { sessionId: "session", expectedClientMessageId: "previous-message" } }))
+			.rejects.toMatchObject({ code: "ABORT_TARGET_MISMATCH" });
+		await expect(host.handle({ protocolVersion: "2", id: "empty-admission", method: "session.abort",
+			params: { sessionId: "session", expectedClientMessageId: "" } }))
+			.rejects.toMatchObject({ code: "INVALID_PARAMS" });
+		expect(f.abort).not.toHaveBeenCalled();
+		const pending = host.handle({ protocolVersion: "2", id: "original-admission", method: "session.abort",
+			params: { sessionId: "session", expectedClientMessageId: "dispatch" } });
+		expect(f.abort).toHaveBeenCalledTimes(1);
+		f.finish();
+		expect(await pending).toMatchObject({ turnId: "turn" });
+	});
+
+	it("bound ordinary Stop accepts exact empty Room client identity with a turn", async () => {
+		const f = fixture();
+		Object.assign(f.session, { activeTurn: { turnId: "turn", clientMessageId: "" } });
+		const host = Object.create(RagImeRuntimeHost.prototype) as RagImeRuntimeHost;
+		Object.assign(host, { sessions: { get: () => f.session } });
+		const pending = host.handle({ protocolVersion: "2", id: "room-stop", method: "session.abort",
+			params: { sessionId: "session", expectedTurnId: "turn", clientMessageId: "" } });
+		expect(f.abort).toHaveBeenCalledTimes(1);
+		f.finish();
+		expect(await pending).toMatchObject({ turnId: "turn" });
+	});
 });

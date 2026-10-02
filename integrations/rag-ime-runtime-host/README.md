@@ -26,6 +26,16 @@ and turn operations carry stable `sessionId`, `turnId`, and `clientMessageId`
 correlation fields. Run `hello` first to negotiate protocol version 2 and
 capabilities.
 
+`sessionBoundAbort` advertises target-bound ordinary Stop. A caller supplies an
+exact turn and client identity, or the non-empty client identity of a pending
+admission. Comparison and native cancellation signalling happen synchronously;
+a replacement turn returns `ABORT_TARGET_MISMATCH` without being stopped.
+An empty client identity is valid only with an exact turn (native Room turns).
+The existing `cancelId`-based exact cancellation and recovery contract remains
+separate. Paired PAW requires this capability rather than silently sending an
+unbound Stop to an older Host; an unidentifiable pending turn waits for its
+original identity instead of treating empty fields as a wildcard.
+
 The CLI uses strict byte-oriented JSONL framing:
 
 - only LF (`0x0A`) terminates a record;

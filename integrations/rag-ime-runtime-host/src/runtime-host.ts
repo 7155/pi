@@ -540,6 +540,7 @@ export class RagImeRuntimeHost {
 						settledEvents: true,
 						dynamicTools: true,
 						sessionControlState: true,
+						sessionBoundAbort: true,
 						sessionSnapshot: true,
 						conversationFork: true,
 							managedPlugins: true,
@@ -978,7 +979,7 @@ export class RagImeRuntimeHost {
 					images: Array.isArray(params.images) ? (params.images as never) : undefined,
 				});
 			case "session.abort":
-				if (params.expectedTurnId !== undefined || params.cancelId !== undefined || params.lookupOnly !== undefined || params.recoverRetiredOnly !== undefined || params.recoverInterruptedOnly !== undefined) {
+				if (params.cancelId !== undefined || params.lookupOnly !== undefined || params.recoverRetiredOnly !== undefined || params.recoverInterruptedOnly !== undefined) {
 					return this.session(params).abortExact({
 						turnId: requiredString(params, "expectedTurnId", 240),
 						clientMessageId: requiredString(params, "clientMessageId", 128),
@@ -987,6 +988,14 @@ export class RagImeRuntimeHost {
 						recoverRetiredOnly: optionalBoolean(params, "recoverRetiredOnly"),
 						recoverInterruptedOnly: optionalBoolean(params, "recoverInterruptedOnly"),
 					});
+				}
+				if (params.expectedTurnId !== undefined || params.expectedClientMessageId !== undefined) {
+					const turnId = params.expectedTurnId === undefined ? undefined : requiredString(params, "expectedTurnId", 240);
+					const clientMessageId = params.expectedClientMessageId ?? params.clientMessageId;
+					if (typeof clientMessageId !== "string" || clientMessageId.length > 128 || (!turnId && !clientMessageId)) {
+						throw new RuntimeProtocolError("INVALID_PARAMS", "Bound Stop needs an exact turn or non-empty client identity");
+					}
+					return this.session(params).abort({ turnId, clientMessageId });
 				}
 				return this.session(params).abort();
 			case "session.compact":
