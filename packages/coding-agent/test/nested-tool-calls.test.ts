@@ -21,6 +21,27 @@ function usage(input: number, cost: number): Usage {
 	};
 }
 
+function gate() {
+	let release!: () => void;
+	const promise = new Promise<void>((resolve) => {
+		release = resolve;
+	});
+	return { promise, release };
+}
+
+const nextTurn = () => new Promise<void>((resolve) => setImmediate(resolve));
+
+function tool(name: string, execute: AgentTool["execute"], sequential = false): AgentTool {
+	return {
+		name,
+		label: name,
+		description: name,
+		parameters: Type.Object({}),
+		executionMode: sequential ? "sequential" : undefined,
+		execute,
+	};
+}
+
 function createRunner(tools: AgentTool[], options: { sequential?: boolean } = {}) {
 	const events: NestedToolExecutionEvent[] = [];
 	const host: NestedToolCallHost = {
@@ -80,7 +101,15 @@ describe("NestedToolCallRunner", () => {
 		]);
 		expect(runner.takeRecord("call")?.calls).toEqual({
 			calls: [
-				{ id: "call/1", name: "echo", arguments: { a: 1 }, status: "ok", durationMs: expect.any(Number) },
+				{
+					id: "call/1",
+					name: "echo",
+					arguments: { a: 1 },
+					status: "ok",
+					durationMs: expect.any(Number),
+					result: { content: [{ type: "text", text: "ok" }], details: {} },
+					resultBytes: expect.any(Number),
+				},
 				{
 					id: "call/2",
 					name: "missing",
@@ -88,6 +117,8 @@ describe("NestedToolCallRunner", () => {
 					status: "error",
 					durationMs: expect.any(Number),
 					error: "Tool missing not found",
+					result: { content: [{ type: "text", text: "Tool missing not found" }], details: {} },
+					resultBytes: expect.any(Number),
 				},
 			],
 			complete: true,
@@ -185,6 +216,327 @@ describe("NestedToolCallRunner", () => {
 
 		expect(maxActive).toEqual({ sequential: 1, parallel: 3 });
 	});
+
+	it("drains parallel calls before a sequential call and blocks later parallel calls", async () => {
+		const before = gate();
+		const exclusive = gate();
+		const trace: string[] = [];
+		const { runner } = createRunner([
+			tool("before", async () => {
+				trace.push("before:start");
+				await before.promise;
+				trace.push("before:end");
+				return { content: [], details: {} };
+			}),
+			tool(
+				"exclusive",
+				async () => {
+					trace.push("exclusive:start");
+					await exclusive.promise;
+					trace.push("exclusive:end");
+					return { content: [], details: {} };
+				},
+				true,
+			),
+			tool("after", async () => {
+				trace.push("after");
+				return { content: [], details: {} };
+			}),
+		]);
+		const first = runner.execute("one", "before", {});
+		await nextTurn();
+		const second = runner.execute("two", "exclusive", {});
+		const third = runner.execute("three", "after", {});
+		try {
+			await nextTurn();
+			expect(trace).toEqual(["before:start"]);
+			before.release();
+			await first;
+			await nextTurn();
+			expect(trace).toEqual(["before:start", "before:end", "exclusive:start"]);
+			exclusive.release();
+			await Promise.all([second, third]);
+			expect(trace).toEqual(["before:start", "before:end", "exclusive:start", "exclusive:end", "after"]);
+		} finally {
+			before.release();
+			exclusive.release();
+			await Promise.allSettled([first, second, third]);
+		}
+	});
+
+	it.each([false, true])(
+		"keeps recursive sibling barriers without waiting on the parent (sequential=%s)",
+		async (sequential) => {
+			const exclusive = gate();
+			const trace: string[] = [];
+			const tools = [
+				tool(
+					"exclusive",
+					async () => {
+						trace.push("exclusive:start");
+						await exclusive.promise;
+						trace.push("exclusive:end");
+						return { content: [], details: {} };
+					},
+					true,
+				),
+				tool("after", async () => {
+					trace.push("after");
+					return { content: [], details: {} };
+				}),
+			];
+			const { runner } = createRunner(tools, { sequential });
+			tools.push(
+				tool(
+					"parent",
+					async (id) => {
+						await Promise.all([runner.execute(id, "exclusive", {}), runner.execute(id, "after", {})]);
+						return { content: [], details: {} };
+					},
+					true,
+				),
+			);
+			const call = runner.execute("root", "parent", {});
+			try {
+				await nextTurn();
+				expect(trace).toEqual(["exclusive:start"]);
+			} finally {
+				exclusive.release();
+			}
+			await call;
+			expect(trace).toEqual(["exclusive:start", "exclusive:end", "after"]);
+		},
+	);
+
+	it("allows parallel descendants of an exclusive parent to run concurrently", async () => {
+		const finish = gate();
+		let active = 0;
+		const tools = [
+			tool("leaf", async () => {
+				active++;
+				await finish.promise;
+				return { content: [], details: {} };
+			}),
+		];
+		const { runner } = createRunner(tools);
+		tools.push(
+			tool(
+				"parent",
+				async (id) => {
+					await Promise.all([runner.execute(id, "leaf", {}), runner.execute(id, "leaf", {})]);
+					return { content: [], details: {} };
+				},
+				true,
+			),
+		);
+		const call = runner.execute("root", "parent", {});
+		try {
+			await nextTurn();
+			expect(active).toBe(2);
+		} finally {
+			finish.release();
+		}
+		await call;
+	});
+
+	it("lets a running parent finish nested work ahead of a queued outer barrier", async () => {
+		const spawn = gate();
+		const trace: string[] = [];
+		const tools = [
+			tool(
+				"leaf",
+				async () => {
+					trace.push("leaf");
+					return { content: [], details: {} };
+				},
+				true,
+			),
+		];
+		const { runner } = createRunner(tools);
+		tools.push(
+			tool("parent", async (id) => {
+				await spawn.promise;
+				await runner.execute(id, "leaf", {});
+				trace.push("parent:end");
+				return { content: [], details: {} };
+			}),
+		);
+		const parent = runner.execute("root", "parent", {});
+		await nextTurn();
+		const outer = runner.execute("root", "leaf", {});
+		spawn.release();
+		await Promise.all([parent, outer]);
+		expect(trace).toEqual(["leaf", "parent:end", "leaf"]);
+	}, 1000);
+
+	it("does not deadlock when parallel parents both await exclusive descendants", async () => {
+		const spawn = gate();
+		const trace: string[] = [];
+		const tools = [
+			tool(
+				"leaf",
+				async (id) => {
+					trace.push(id);
+					await nextTurn();
+					return { content: [], details: {} };
+				},
+				true,
+			),
+		];
+		const { runner } = createRunner(tools);
+		tools.push(
+			tool("parent", async (id) => {
+				await spawn.promise;
+				await runner.execute(id, "leaf", {});
+				trace.push(`${id}:end`);
+				return { content: [], details: {} };
+			}),
+		);
+		const calls = [runner.execute("root", "parent", {}), runner.execute("root", "parent", {})];
+		await nextTurn();
+		spawn.release();
+		await Promise.all(calls);
+		expect(trace).toEqual(["root/1/1", "root/1:end", "root/2/1", "root/2:end"]);
+	}, 1000);
+
+	it.each([false, true])(
+		"keeps an unawaited child inside its ancestor's barrier (exclusive parent=%s)",
+		async (exclusiveParent) => {
+			const finish = gate();
+			const trace: string[] = [];
+			const tools = [
+				tool("child", async () => {
+					trace.push("child:start");
+					await finish.promise;
+					trace.push("child:end");
+					return { content: [], details: {} };
+				}),
+				tool(
+					"later",
+					async () => {
+						trace.push("later");
+						return { content: [], details: {} };
+					},
+					!exclusiveParent,
+				),
+			];
+			const { runner } = createRunner(tools);
+			tools.push(
+				tool(
+					"parent",
+					async (id) => {
+						void runner.execute(id, "child", {});
+						return { content: [], details: {} };
+					},
+					exclusiveParent,
+				),
+			);
+			await runner.execute("root", "parent", {});
+			const later = runner.execute("another-root", "later", {});
+			try {
+				await nextTurn();
+				expect(trace).toEqual(["child:start"]);
+			} finally {
+				finish.release();
+			}
+			await Promise.all([later, runner.drain("root")]);
+			expect(trace).toEqual(["child:start", "child:end", "later"]);
+			expect(runner.takeRecord("root")?.calls?.complete).toBe(true);
+		},
+	);
+
+	it("keeps an aborted running tool's barrier until its physical work finishes", async () => {
+		const finish = gate();
+		const controller = new AbortController();
+		let laterRan = false;
+		const { runner } = createRunner([
+			tool(
+				"exclusive",
+				async () => {
+					await finish.promise;
+					return { content: [], details: {} };
+				},
+				true,
+			),
+			tool("later", async () => {
+				laterRan = true;
+				return { content: [], details: {} };
+			}),
+		]);
+		const running = runner.execute("root", "exclusive", {}, { signal: controller.signal });
+		await nextTurn();
+		controller.abort();
+		const later = runner.execute("root", "later", {});
+		try {
+			await nextTurn();
+			expect(laterRan).toBe(false);
+		} finally {
+			finish.release();
+		}
+		await Promise.all([running, later]);
+		expect(laterRan).toBe(true);
+	});
+
+	it("cancels queued calls without entering the tool and still drains physical active work", async () => {
+		const finish = gate();
+		const controller = new AbortController();
+		const trace: string[] = [];
+		const { runner } = createRunner([
+			tool(
+				"exclusive",
+				async () => {
+					await finish.promise;
+					return { content: [], details: {} };
+				},
+				true,
+			),
+			tool("queued", async () => {
+				trace.push("executed");
+				return { content: [], details: {} };
+			}),
+		]);
+		const running = runner.execute("root", "exclusive", {});
+		const queued = runner.execute("root", "queued", {}, { signal: controller.signal });
+		let drained = false;
+		try {
+			await nextTurn();
+			controller.abort();
+			const drain = runner.drain("root").then(() => {
+				drained = true;
+			});
+			await nextTurn();
+			expect(await queued).toMatchObject({ isError: true });
+			expect(trace).toEqual([]);
+			expect(drained).toBe(false);
+			finish.release();
+			await Promise.all([running, drain]);
+			expect(runner.takeRecord("root")?.calls?.calls.map((call) => call.status)).toEqual(["ok", "error"]);
+		} finally {
+			finish.release();
+		}
+	});
+
+	it("releases the barrier without swallowing an unexpected pipeline rejection", async () => {
+		const error = new Error("pipeline rejected");
+		let called = false;
+		const { runner } = createRunner([
+			tool(
+				"reject",
+				async () => {
+					throw error;
+				},
+				true,
+			),
+			tool("after", async () => {
+				called = true;
+				return { content: [], details: {} };
+			}),
+		]);
+		const rejection = expect(runner.execute("root", "reject", {})).rejects.toBe(error);
+		await Promise.all([rejection, runner.execute("root", "after", {})]);
+		expect(called).toBe(true);
+		await runner.drain("root");
+	});
 });
 
 describe("NestedCallRecorder", () => {
@@ -193,6 +545,88 @@ describe("NestedCallRecorder", () => {
 		id,
 		name: "t",
 		arguments: args,
+	});
+
+	it("snapshots actual success and failure receipts independently of later mutation", () => {
+		const recorder = new NestedCallRecorder();
+		const result = { content: [{ type: "text" as const, text: "15" }], details: { receipt: { exitCode: 0 } } };
+		recorder.finish(recorder.start(call("outer/1", {})), false, "", result);
+		result.details.receipt.exitCode = 9;
+		recorder.finish(recorder.start(call("outer/2", {})), true, "failed", result);
+		const snapshot = recorder.snapshot();
+		expect(snapshot?.calls[0].result).toEqual({
+			content: [{ type: "text", text: "15" }],
+			details: { receipt: { exitCode: 0 } },
+		});
+		expect(snapshot?.calls[1]).toMatchObject({ status: "error", result: { details: { receipt: { exitCode: 9 } } } });
+		if (snapshot?.calls[0].result) snapshot.calls[0].result.details = {};
+		expect(recorder.snapshot()?.calls[0].result?.details).toEqual({ receipt: { exitCode: 0 } });
+		expect(JSON.parse(JSON.stringify(recorder.snapshot()))).toEqual(recorder.snapshot());
+	});
+
+	it.each([false, true])(
+		"retains the structured result consumed by codemode within the same byte budget (isError=%s)",
+		(isError) => {
+			const recorder = new NestedCallRecorder();
+			const result = {
+				content: [{ type: "text" as const, text: "summary" }],
+				details: { server: "fixture", tool: "inspect" },
+				structuredContent: {
+					content: [{ type: "text", text: "full result" }],
+					structuredContent: { receiptId: "receipt:child", verified: true },
+					isError,
+				},
+			};
+			const expected = structuredClone(result);
+			recorder.finish(recorder.start(call("outer/1", {})), isError, "", result);
+			result.structuredContent.structuredContent.verified = false;
+			const snapshot = recorder.snapshot();
+			expect(snapshot?.complete).toBe(true);
+			expect(snapshot?.calls[0].status).toBe(isError ? "error" : "ok");
+			expect(snapshot?.calls[0].result).toEqual(expected);
+			expect(snapshot?.calls[0].resultBytes).toBe(new TextEncoder().encode(JSON.stringify(expected)).length);
+
+			recorder.finish(recorder.start(call("outer/2", {})), false, "", {
+				content: [],
+				details: {},
+				structuredContent: "证".repeat(NESTED_CALL_LIMITS.maxResultBytesPerCall),
+			});
+			expect(recorder.snapshot()?.calls[1]).toMatchObject({ status: "ok", resultUnavailable: "size_limit" });
+			expect(recorder.snapshot()?.calls[1].result).toBeUndefined();
+			expect(recorder.snapshot()?.complete).toBe(false);
+		},
+	);
+
+	it("bounds result bytes and retains the latest completed receipts", () => {
+		const recorder = new NestedCallRecorder();
+		const oversized = {
+			content: [{ type: "text" as const, text: "证".repeat(NESTED_CALL_LIMITS.maxResultBytesPerCall) }],
+			details: {},
+		};
+		recorder.finish(recorder.start(call("outer/1", {})), false, "", oversized);
+		expect(recorder.snapshot()?.calls[0]).toMatchObject({ status: "ok", resultUnavailable: "size_limit" });
+		expect(recorder.snapshot()?.calls[0].result).toBeUndefined();
+		const result = { content: [], details: {}, structuredContent: "x".repeat(200_000) };
+		for (let i = 2; i <= 15; i++) recorder.finish(recorder.start(call(`outer/${i}`, {})), false, "", result);
+		const snapshot = recorder.snapshot();
+		const retained = snapshot?.calls.filter((entry) => entry.result !== undefined) ?? [];
+		expect(retained.length).toBeLessThan(14);
+		expect(retained.reduce((total, entry) => total + (entry.resultBytes ?? 0), 0)).toBeLessThanOrEqual(
+			NESTED_CALL_LIMITS.maxResultBytesTotal,
+		);
+		expect(retained.at(-1)?.id).toBe("outer/15");
+		expect(snapshot?.complete).toBe(false);
+	});
+
+	it("keeps completed status when a receipt is not serializable", () => {
+		const recorder = new NestedCallRecorder();
+		const circular: Record<string, unknown> = {};
+		circular.self = circular;
+		expect(() =>
+			recorder.finish(recorder.start(call("outer/1", {})), false, "", { content: [], details: circular }),
+		).not.toThrow();
+		expect(recorder.snapshot()?.calls[0]).toMatchObject({ status: "ok", resultUnavailable: "not_serializable" });
+		expect(recorder.snapshot()?.complete).toBe(false);
 	});
 
 	it("omits oversized arguments and drops calls beyond the limit", () => {

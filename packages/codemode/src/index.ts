@@ -4,12 +4,14 @@ export {
 	mcpStructuredContentSchema,
 	type RenderDeclarationsOptions,
 	renderDeclarations,
+	renderToolOutputType,
 	renderToolSample,
 	renderToolSignature,
 	schemaToType,
 } from "./declarations.ts";
 export { toCodemodeIdentifier } from "./identifier.ts";
 export { CodemodeSandbox } from "./runtime/host.ts";
+export { DEFAULT_MAX_OUTPUT_BYTES, DEFAULT_MAX_OUTPUT_ITEMS } from "./runtime/limits.ts";
 export { MAX_STORE_TOTAL_CHARS, MAX_STORE_VALUE_CHARS } from "./runtime/prelude-source.ts";
 export {
 	CODEMODE_OPTIONS_PREFIX,

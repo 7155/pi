@@ -56,7 +56,7 @@ describe("runtime host metadata and workspace boundaries", () => {
 			});
 			await expect(
 				host.handle({ protocolVersion: "2", id: "hello", method: "hello", params: {} }),
-			).resolves.toMatchObject({ piVersion: "0.99.2" });
+			).resolves.toMatchObject({ piVersion: "1.0.0" });
 		} finally {
 			await host?.dispose();
 			await rm(root, { recursive: true, force: true });

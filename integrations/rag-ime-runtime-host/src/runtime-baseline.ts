@@ -1,7 +1,7 @@
 import { PROTOCOL_NAME } from "./protocol.ts";
 
 /** Upstream Pi baseline used to build and validate this product adapter. */
-export const PI_RUNTIME_BASELINE = "0.99.2" as const;
+export const PI_RUNTIME_BASELINE = "1.0.0" as const;
 
 /**
  * Keep externally visible Runtime metadata authoritative while the legacy host

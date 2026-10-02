@@ -12,6 +12,7 @@ import type {
 	CodemodeTool,
 } from "../types.ts";
 import { type CodemodeWasmModule, loadQuickJSWasm } from "../wasm.ts";
+import { DEFAULT_MAX_OUTPUT_BYTES, DEFAULT_MAX_OUTPUT_ITEMS, MessageBudget, type OutputLimits } from "./limits.ts";
 import {
 	type HostToWorkerMessage,
 	isWorkerToHostMessage,
@@ -73,6 +74,7 @@ interface ExecutionOptions {
 	timeoutMs: number;
 	signal: AbortSignal | undefined;
 	memoryLimitBytes: number | undefined;
+	outputLimits: OutputLimits;
 	store: Record<string, string>;
 	wasm: Promise<CodemodeWasmModule>;
 	workerUrl: string | URL;
@@ -93,6 +95,7 @@ class Execution {
 	private readonly signal: AbortSignal | undefined;
 	private readonly timer: NodeJS.Timeout | undefined;
 	private readonly output: CodemodeOutputItem[] = [];
+	private readonly budget: MessageBudget;
 	private readonly calls: CodemodeCall[] = [];
 	private readonly pending = new Map<number, PendingCall>();
 	private finished = false;
@@ -104,6 +107,7 @@ class Execution {
 		this.tools = options.tools;
 		this.globals = options.globals;
 		this.signal = options.signal;
+		this.budget = new MessageBudget(options.outputLimits);
 
 		if (Number.isFinite(options.timeoutMs)) {
 			this.timer = setTimeout(() => {
@@ -147,6 +151,7 @@ class Execution {
 			})),
 			wasm,
 			memoryLimitBytes: options.memoryLimitBytes,
+			outputLimits: options.outputLimits,
 			store: options.store,
 			interrupt: this.interrupt,
 		};
@@ -182,6 +187,15 @@ class Execution {
 
 	private handleMessage(message: unknown): void {
 		if (this.finished || !isWorkerToHostMessage(message)) return;
+		if (message.type === "limit") {
+			this.finish({ kind: "limit", message: message.message.slice(0, 512) });
+			return;
+		}
+		const limit = this.budget.accept(message);
+		if (limit) {
+			this.finish({ kind: "limit", message: limit });
+			return;
+		}
 		switch (message.type) {
 			case "output":
 				this.output.push(message.item);
@@ -222,6 +236,9 @@ class Execution {
 			if (!tool) throw new Error(`Unknown ${isTool ? "tool" : "global"} "${name}"`);
 			const args: unknown = message.args === undefined ? undefined : JSON.parse(message.args);
 			const value = await tool.execute(args, { signal: pending.controller.signal });
+			// Cancellation may have drained a real tool after the worker was stopped. Do not
+			// serialize or post its possibly large result to a worker that no longer needs it.
+			if (!this.pending.has(id)) return;
 			reply = { type: "result", id, ok: true, payload: value === undefined ? undefined : JSON.stringify(value) };
 			status = "ok";
 		} catch (error) {
@@ -287,6 +304,7 @@ export class CodemodeSandbox {
 	private readonly globalsByName = new Map<string, CodemodeTool>();
 	private readonly timeoutMs: number;
 	private readonly memoryLimitBytes: number | undefined;
+	private readonly outputLimits: OutputLimits;
 	private readonly wasm: CodemodeWasmModule | Promise<CodemodeWasmModule> | undefined;
 	private readonly workerUrl: string | URL;
 	private readonly running = new Set<Execution>();
@@ -295,6 +313,14 @@ export class CodemodeSandbox {
 	constructor(options: CodemodeSandboxOptions = {}) {
 		this.timeoutMs = options.timeoutMs ?? DEFAULT_TIMEOUT_MS;
 		this.memoryLimitBytes = options.memoryLimitBytes;
+		this.outputLimits = {
+			maxOutputBytes: options.maxOutputBytes ?? DEFAULT_MAX_OUTPUT_BYTES,
+			maxOutputItems: options.maxOutputItems ?? DEFAULT_MAX_OUTPUT_ITEMS,
+		};
+		for (const [name, value] of Object.entries(this.outputLimits)) {
+			if (!Number.isSafeInteger(value) || value < 0)
+				throw new RangeError(`${name} must be a non-negative safe integer`);
+		}
 		this.wasm = options.wasm;
 		this.workerUrl = options.workerUrl ?? defaultWorkerUrl();
 		for (const tool of options.tools ?? []) this.registerTool(tool);
@@ -345,6 +371,7 @@ export class CodemodeSandbox {
 			timeoutMs: options.timeoutMs ?? this.timeoutMs,
 			signal: options.signal,
 			memoryLimitBytes: this.memoryLimitBytes,
+			outputLimits: this.outputLimits,
 			store: serializeStore(options.store),
 			wasm: this.wasm === undefined ? loadQuickJSWasm() : Promise.resolve(this.wasm),
 			workerUrl: this.workerUrl,

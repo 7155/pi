@@ -61,6 +61,8 @@ export type CodemodeErrorKind =
 	| "timeout"
 	/** The caller's signal fired or the sandbox was closed. The worker was terminated. */
 	| "aborted"
+	/** Output or bridge traffic exceeded a resource limit. Previously accepted output is kept. */
+	| "limit"
 	/** The worker or VM failed outside the script's control (for example a wasm trap or a missing worker file). */
 	| "sandbox";
 
@@ -109,6 +111,17 @@ export interface CodemodeSandboxOptions {
 	 * `InternalError: out of memory`. Default: no limit beyond wasm32's 4 GiB address space.
 	 */
 	memoryLimitBytes?: number;
+	/**
+	 * Cumulative UTF-8 bytes of text, image base64/MIME, and serialized return/error values.
+	 * Exceeding the budget terminates execution with `kind: "limit"`, keeping earlier output.
+	 * A non-negative safe integer; default: 16777216 (16 MiB). Independent of the VM heap limit.
+	 */
+	maxOutputBytes?: number;
+	/**
+	 * Maximum text/image items, plus a non-undefined return value, per execution. Empty items count.
+	 * A non-negative safe integer; default: 1024. Exceeding it terminates with `kind: "limit"`.
+	 */
+	maxOutputItems?: number;
 	/**
 	 * Compiled `quickjs-wasi/quickjs.wasm`, usually from {@link loadQuickJSWasm}. Default:
 	 * `loadQuickJSWasm()`, the file in the installed `quickjs-wasi` package. Pass it when that file

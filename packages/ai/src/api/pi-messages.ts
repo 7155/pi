@@ -374,7 +374,17 @@ export const stream: StreamFunction<"pi-messages", PiMessagesOptions> = (
 
 			let payload: unknown = {
 				model: model.id,
-				context,
+				context: {
+					...context,
+					messages: context.messages.map((message) => {
+						if (message.role !== "toolResult") return message;
+						// Nested receipts belong to the local Session record, not the
+						// model protocol. This transport otherwise serializes messages
+						// directly instead of selecting content like other providers.
+						const { nestedCalls: _nestedCalls, ...modelMessage } = message;
+						return modelMessage;
+					}),
+				},
 				options: {
 					temperature: options?.temperature,
 					maxTokens: options?.maxTokens,

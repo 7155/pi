@@ -10,8 +10,10 @@
  * `@earendil-works/pi-codemode/worker` as a separate entrypoint and pass its URL
  * or embedded-module string specifier as `workerUrl`.
  */
+import { Buffer } from "node:buffer";
 import { parentPort, workerData } from "node:worker_threads";
 import { JSException, type JSValueHandle, MAX_STACK_SIZE, QuickJS } from "quickjs-wasi";
+import { MessageBudget } from "./limits.ts";
 import { PRELUDE_SOURCE } from "./prelude-source.ts";
 import { isHostToWorkerMessage, type WorkerData, type WorkerToHostMessage } from "./protocol.ts";
 
@@ -20,7 +22,11 @@ function post(message: WorkerToHostMessage): void {
 }
 
 function crash(error: unknown): void {
-	post({ type: "crash", message: error instanceof Error ? `${error.name}: ${error.message}` : String(error) });
+	const message =
+		error instanceof Error
+			? `${error.name.slice(0, 128)}: ${error.message.slice(0, 4096)}`
+			: String(error).slice(0, 4096);
+	post({ type: "crash", message });
 }
 
 /**
@@ -51,6 +57,21 @@ function describeException(error: JSException): string {
 
 async function main(data: WorkerData): Promise<void> {
 	const interrupt = new Int32Array(data.interrupt);
+	const budget = new MessageBudget(data.outputLimits);
+	let stopped = false;
+	const stop = (message: string) => {
+		if (stopped) return;
+		stopped = true;
+		// Fail closed even when a script catches exceptions or keeps emitting synchronously.
+		Atomics.store(interrupt, 0, 1);
+		post({ type: "limit", message });
+	};
+	const send = (message: Exclude<WorkerToHostMessage, { type: "limit" }>) => {
+		if (stopped) return;
+		const limit = budget.accept(message);
+		if (limit) stop(limit);
+		else post(message);
+	};
 	const vm = await QuickJS.create({
 		wasm: data.wasm,
 		memoryLimit: data.memoryLimitBytes,
@@ -63,36 +84,69 @@ async function main(data: WorkerData): Promise<void> {
 
 	// Called from the prelude with primitives only.
 	const bridge = vm.newFunction("bridge", (kind, a, b, c) => {
-		switch (kind.toString()) {
+		if (stopped) return vm.undefined;
+		const type = kind.toString();
+		const outputItems = type === "output" || (type === "done" && a.toBoolean() && !b.isUndefined) ? 1 : 0;
+		let messageBytes = 0;
+		let outputBytes = 0;
+		const initialLimit = budget.check(0, 0, outputItems);
+		if (initialLimit) {
+			stop(initialLimit);
+			return vm.undefined;
+		}
+		const read = (value: JSValueHandle, output = false): string => {
+			if (stopped) return "";
+			if (!value.isString) throw new Error("Invalid non-string bridge payload");
+			// A string's UTF-16 length is a lower bound on its UTF-8 byte count. Reject huge
+			// values before toString() copies them into the worker's JS heap. Exact accounting
+			// follows; even a multibyte candidate is bounded to at most 3x the remaining bytes.
+			const lengthLimit = budget.check(
+				messageBytes + value.length,
+				outputBytes + (output ? value.length : 0),
+				outputItems,
+			);
+			if (lengthLimit) {
+				stop(lengthLimit);
+				return "";
+			}
+			const text = value.toString();
+			const bytes = Buffer.byteLength(text);
+			messageBytes += bytes;
+			if (output) outputBytes += bytes;
+			const limit = budget.check(messageBytes, outputBytes, outputItems);
+			if (limit) stop(limit);
+			return text;
+		};
+		switch (type) {
 			case "call":
 			case "global":
-				post({
+				send({
 					type: "call",
 					id: a.toNumber(),
-					target: kind.toString() === "call" ? "tool" : "global",
-					name: b.toString(),
-					args: c === undefined || c.isUndefined ? undefined : c.toString(),
+					target: type === "call" ? "tool" : "global",
+					name: read(b),
+					args: c === undefined || c.isUndefined ? undefined : read(c),
 				});
 				break;
 			case "output":
-				post({
+				send({
 					type: "output",
 					item:
 						a.toString() === "image"
-							? { type: "image", data: b.toString(), mimeType: c.toString() }
-							: { type: "text", text: b.toString() },
+							? { type: "image", data: read(b, true), mimeType: read(c, true) }
+							: { type: "text", text: read(b, true) },
 				});
 				break;
 			case "done":
 				if (a.toBoolean()) {
-					post({
+					send({
 						type: "done",
 						ok: true,
-						value: b === undefined || b.isUndefined ? undefined : b.toString(),
-						writes: c.toString(),
+						value: b === undefined || b.isUndefined ? undefined : read(b, true),
+						writes: read(c),
 					});
 				} else {
-					post({ type: "done", ok: false, error: b.toString() });
+					send({ type: "done", ok: false, error: read(b, true) });
 				}
 				break;
 		}
@@ -117,12 +171,14 @@ async function main(data: WorkerData): Promise<void> {
 	const stalled = api.getProp("stalled");
 	/** Run queued jobs, then fail a script that waits on nothing that can ever resume it. */
 	const drain = () => {
+		if (stopped) return;
 		vm.executePendingJobs();
+		if (stopped) return;
 		vm.callFunction(stalled, api).dispose();
 	};
 
 	parentPort?.on("message", (message: unknown) => {
-		if (!isHostToWorkerMessage(message)) return;
+		if (stopped || !isHostToWorkerMessage(message)) return;
 		try {
 			vm.withScope(() => {
 				vm.callFunction(
@@ -135,7 +191,7 @@ async function main(data: WorkerData): Promise<void> {
 			});
 			drain();
 		} catch (error) {
-			crash(error);
+			if (!stopped) crash(error);
 		}
 	});
 
@@ -146,12 +202,19 @@ async function main(data: WorkerData): Promise<void> {
 		fn = vm.evalCode(`(async (tools, console) => {${data.code}\n})`, "codemode.js");
 	} catch (error) {
 		if (!(error instanceof JSException)) throw error;
-		post({ type: "done", ok: false, error: describeException(error) });
+		send({ type: "done", ok: false, error: describeException(error) });
 		return;
 	}
-	vm.callFunction(run, api, fn).dispose();
-	fn.dispose();
-	drain();
+	try {
+		vm.callFunction(run, api, fn).dispose();
+		drain();
+	} catch (error) {
+		// A limit's interrupt can surface while unwinding the current VM call. Its single
+		// limit message was already posted; do not queue a second crash behind it.
+		if (!stopped) throw error;
+	} finally {
+		fn.dispose();
+	}
 }
 
 if (parentPort) {

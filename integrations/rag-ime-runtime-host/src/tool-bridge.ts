@@ -139,13 +139,15 @@ class GatewayRequestLimiter {
 	}
 }
 
-const gatewayRequestLimiters = new WeakMap<BackendToolBridgeOptions, GatewayRequestLimiter>();
+// Each Session owns one registry. Bridge projections and per-call timeout
+// overrides copy options, but must still share that Session's admission limit.
+const gatewayRequestLimiters = new WeakMap<BackendToolRegistry, GatewayRequestLimiter>();
 
 function gatewayRequestLimiter(options: BackendToolBridgeOptions): GatewayRequestLimiter {
-	let limiter = gatewayRequestLimiters.get(options);
+	let limiter = gatewayRequestLimiters.get(options.registry);
 	if (!limiter) {
 		limiter = new GatewayRequestLimiter(MAX_CONCURRENT_GATEWAY_REQUESTS);
-		gatewayRequestLimiters.set(options, limiter);
+		gatewayRequestLimiters.set(options.registry, limiter);
 	}
 	return limiter;
 }

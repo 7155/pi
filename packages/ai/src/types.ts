@@ -582,12 +582,18 @@ export interface NestedToolCallRecord {
 	durationMs?: number;
 	/** Error text, truncated. */
 	error?: string;
+	/** Actual child pipeline result, retained only within the recorder's byte budget. */
+	result?: JsonObject;
+	/** UTF-8 size of the serialized child result, including when its body was omitted. */
+	resultBytes?: number;
+	/** Why a completed call has no retained result. Never implies execution failure. */
+	resultUnavailable?: "size_limit" | "not_serializable";
 }
 
-/** Bounded record of the nested calls a tool made. Results are not recorded. */
+/** Bounded record of the nested calls a tool made and their actual pipeline results. */
 export interface NestedToolCalls {
 	calls: NestedToolCallRecord[];
-	/** False when calls were dropped, arguments omitted, or calls had not finished. */
+	/** False when calls, arguments or results were omitted, or calls had not finished. */
 	complete: boolean;
 }
 

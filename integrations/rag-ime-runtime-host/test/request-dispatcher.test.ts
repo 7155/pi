@@ -81,7 +81,7 @@ describe("runtime request dispatcher", () => {
 			expect.objectContaining({
 				id: "hello",
 				ok: true,
-				result: expect.objectContaining({ piVersion: "0.99.2" }),
+				result: expect.objectContaining({ piVersion: "1.0.0" }),
 			}),
 		]);
 	});

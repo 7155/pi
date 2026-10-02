@@ -27,7 +27,7 @@
  */
 
 import { join, resolve } from "node:path";
-import type { SelectItem } from "@earendil-works/pi-tui";
+import { hyperlink, type SelectItem } from "@earendil-works/pi-tui";
 import type { TSchema } from "typebox";
 import { getAgentDir } from "../../config.ts";
 import type {
@@ -67,6 +67,8 @@ import { type McpMenu, type McpUi, showMcpManager } from "./ui.ts";
 export type { McpTransportFactory } from "./runtime.ts";
 
 export interface McpExtensionOptions {
+	/** SDK-owned authority, independent of untrusted server annotations. Defaults to allowed. */
+	executionAllowed?: () => boolean;
 	/** Read-only state projection for SDK surfaces. Never contains transports or credentials. */
 	onStatusChange?: (status: McpStatusSnapshot) => void;
 	/** SDK policy can disable codemode activation without changing MCP configuration. */
@@ -176,8 +178,13 @@ const MAX_SERVER_DESCRIPTION_CHARS = 250;
  */
 export const MAX_SERVERS_SECTION_CHARS = 4096;
 
-const SERVERS_SECTION_INTRO =
-	"MCP servers whose tools are not declared to you. Call the tools of `codemode` servers from codemode scripts: find them with `searchTools(query, { namespace })` and read a server's instructions and tool names with `describeNamespace(name)`. Load the tools of `tool_search` servers with `tool_search`.";
+/** The section's first line. It explains only the ways of reaching tools that the listed servers use. */
+function serversSectionIntro(reaches: ReadonlySet<string>): string {
+	let intro = "MCP servers whose tools are not declared to you.";
+	if (reaches.has("codemode")) intro += " Call the tools of `codemode` servers from codemode scripts.";
+	if (reaches.has("tool_search")) intro += " Load the tools of `tool_search` servers with `tool_search`.";
+	return intro;
+}
 
 function truncate(text: string, max: number): string {
 	if (text.length <= max) return text;
@@ -206,16 +213,15 @@ export function renderServersSection(servers: readonly McpServerListing[]): stri
 		.filter((server) => isEnabled(server) && hasIndirectTools(server.entry))
 		.sort((a, b) => a.entry.name.localeCompare(b.entry.name));
 	if (listed.length === 0) return undefined;
-	const heads = listed.map((server) => {
-		const exposures = configuredExposures(server.entry);
-		const reach = exposures.has("codemode") ? "codemode" : "tool_search";
-		return `- ${mcpNamespace(server.entry.name)} (${reach})`;
-	});
+	const reaches = listed.map((server) =>
+		configuredExposures(server.entry).has("codemode") ? "codemode" : "tool_search",
+	);
+	const intro = serversSectionIntro(new Set(reaches));
+	const heads = listed.map((server, index) => `- ${mcpNamespace(server.entry.name)} (${reaches[index]})`);
 	const omitted = (count: number) =>
 		count > 0 ? [`- … ${count} more server${count === 1 ? "" : "s"}; find their tools with searchTools()`] : [];
 	// Characters of the intro, the first `kept` server lines without descriptions, and the omission line.
-	const size = (kept: number) =>
-		[SERVERS_SECTION_INTRO, ...heads.slice(0, kept), ...omitted(listed.length - kept)].join("\n").length;
+	const size = (kept: number) => [intro, ...heads.slice(0, kept), ...omitted(listed.length - kept)].join("\n").length;
 	let kept = listed.length;
 	while (kept > 0 && size(kept) > MAX_SERVERS_SECTION_CHARS) kept--;
 	// Each description also takes a ": " separator.
@@ -227,7 +233,7 @@ export function renderServersSection(servers: readonly McpServerListing[]): stri
 		const summary = perServer > 0 ? truncate(serverSummary(server), perServer) : "";
 		return summary ? `${heads[index]}: ${summary}` : heads[index];
 	});
-	return [SERVERS_SECTION_INTRO, ...lines, ...omitted(listed.length - kept)].join("\n");
+	return [intro, ...lines, ...omitted(listed.length - kept)].join("\n");
 }
 
 /**
@@ -289,6 +295,12 @@ const MCP_USAGE = "Usage: /mcp, /mcp login [server], /mcp logout [server], /mcp 
 
 export function createMcpExtension(options: McpExtensionOptions = {}): ExtensionFactory {
 	return (pi: ExtensionAPI) => {
+		// A denied Session must not launch configured stdio processes, including
+		// servers contributed by other extensions. Reload after policy changes.
+		if (options.executionAllowed?.() === false) return;
+		const requireExecutionAllowed = () => {
+			if (options.executionAllowed?.() === false) throw new Error("MCP execution is denied by the Session policy");
+		};
 		let servers: McpServer[] = [];
 		/** Servers from `mcp.json`, which take precedence over registered servers of the same name. */
 		let configuredEntries: McpServerEntry[] = [];
@@ -426,8 +438,15 @@ export function createMcpExtension(options: McpExtensionOptions = {}): Extension
 					getClient: async () => connection,
 					readableResources: () => resourceServers().includes(connection),
 				});
-				definitions.set(definition.name, definition);
-				pi.registerTool(definition);
+				const guarded: typeof definition = {
+					...definition,
+					execute: (...args) => {
+						requireExecutionAllowed();
+						return definition.execute(...args);
+					},
+				};
+				definitions.set(guarded.name, guarded);
+				pi.registerTool(guarded);
 			}
 			serverTools.set(server, current);
 			// Tools cannot be unregistered, so tools the server dropped are re-registered as hidden. When
@@ -471,7 +490,14 @@ export function createMcpExtension(options: McpExtensionOptions = {}): Extension
 			const wasDirect = resourceToolsExposure === "direct";
 			resourceToolsExposure = next;
 			const resourceDefinitions = createMcpResourceToolDefinitions({ exposure: next, servers: resourceServers });
-			for (const definition of resourceDefinitions) pi.registerTool(definition);
+			for (const definition of resourceDefinitions)
+				pi.registerTool({
+					...definition,
+					execute: (...args) => {
+						requireExecutionAllowed();
+						return definition.execute(...args);
+					},
+				});
 			if (wasDirect) {
 				const names = new Set(resourceDefinitions.map((definition) => definition.name));
 				pi.setActiveTools(pi.getActiveTools().filter((name) => !names.has(name)));
@@ -532,7 +558,7 @@ export function createMcpExtension(options: McpExtensionOptions = {}): Extension
 		const tokensAtSignIn = new Map<McpServerConnection, string>();
 		const storedTokens = (connection: McpServerConnection): string => {
 			const url = connection.oauthUrl;
-			return url && credentials ? JSON.stringify(credentials.tokens(url) ?? null) : "null";
+			return url && credentials ? JSON.stringify(credentials.tokens(connection.name, url) ?? null) : "null";
 		};
 		const onConnectionChange = (connection: McpServerConnection) => {
 			if (connection.state !== "needs-auth") tokensAtSignIn.delete(connection);
@@ -550,11 +576,16 @@ export function createMcpExtension(options: McpExtensionOptions = {}): Extension
 
 		/** Create the server's connection, loading the MCP runtime on first use. */
 		const createConnection = async (server: McpServer): Promise<McpServerConnection> => {
+			requireExecutionAllowed();
 			const runtime = await loadMcpRuntime();
+			requireExecutionAllowed();
 			const connection = new runtime.McpServerConnection({
 				entry: server.entry,
 				cwd: sessionCwd,
-				createTransport: options.createTransport ?? runtime.createDefaultTransport,
+				createTransport: (...args) => {
+					requireExecutionAllowed();
+					return (options.createTransport ?? runtime.createDefaultTransport)(...args);
+				},
 				credentials: getCredentials(runtime),
 				providerToken: async (provider) => modelRegistry?.getApiKeyForProvider(provider),
 				log: getServerLog(runtime),
@@ -579,8 +610,10 @@ export function createMcpExtension(options: McpExtensionOptions = {}): Extension
 			const ready = (async () => {
 				await after;
 				if (!isCurrent()) return;
+				requireExecutionAllowed();
 				const connection = await createConnection(server);
 				if (!isCurrent()) return;
+				requireExecutionAllowed();
 				await connection.getClient().catch(() => undefined);
 			})();
 			server.ready = ready.catch(() => undefined);
@@ -644,7 +677,7 @@ export function createMcpExtension(options: McpExtensionOptions = {}): Extension
 			try {
 				await runtime.signInMcpServer({
 					serverUrl: url,
-					store: getCredentials(runtime).forServer(url),
+					store: getCredentials(runtime).forServer(server.entry.name, url),
 					settings: connection.oauthSettings(),
 					challenge: connection.challenge,
 					prompt,
@@ -667,7 +700,7 @@ export function createMcpExtension(options: McpExtensionOptions = {}): Extension
 			const connection = server.connection;
 			const url = connection?.oauthUrl;
 			if (!connection || !url) return false;
-			const removed = getCredentials(await loadMcpRuntime()).remove(url);
+			const removed = getCredentials(await loadMcpRuntime()).remove(server.entry.name, url);
 			await connection.signOut();
 			return removed;
 		};
@@ -970,7 +1003,12 @@ export function createMcpExtension(options: McpExtensionOptions = {}): Extension
 			}
 			const failure = await signIn(server, {
 				showAuthorizationUrl: (url) => {
-					ctx.ui.notify(`Sign in to MCP server "${name}" in your browser:\n${url.href}`, "info");
+					// Long URLs wrap, which some terminals cannot open; a short link line stays on one line.
+					const lines =
+						ctx.mode === "tui"
+							? `${hyperlink(url.href, url.href)}\n${hyperlink(process.platform === "darwin" ? "Cmd+click to open" : "Ctrl+click to open", url.href)}`
+							: url.href;
+					ctx.ui.notify(`Sign in to MCP server "${name}" in your browser:\n${lines}`, "info");
 					openUrl(url.href);
 				},
 				promptForRedirectUrl: (signal) =>
@@ -1155,7 +1193,9 @@ export function createMcpExtension(options: McpExtensionOptions = {}): Extension
 				return items.length > 0 ? items : null;
 			},
 			handler: async (args, ctx) => {
+				requireExecutionAllowed();
 				await pending;
+				requireExecutionAllowed();
 				const [action, name, ...extra] = args.trim().split(/\s+/).filter(Boolean);
 				if (action === undefined) {
 					if (ctx.mode === "tui") await showMcpManager(ctx, (ui) => manage(ui, ctx));

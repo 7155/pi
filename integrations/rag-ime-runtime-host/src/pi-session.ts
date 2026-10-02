@@ -92,6 +92,7 @@ export interface PiSessionOpenOptions {
 	thinkingLevel?: NonNullable<CreateAgentSessionOptions["thinkingLevel"]>;
 	codemodeMode?: "on" | "only" | "off";
 	toolManifest?: unknown;
+	nativeMcpExecutionAllowed?: boolean;
 	roomCapability?: Record<string, unknown>;
 	toolGatewayUrl?: string;
 	toolGatewayToken?: string;
@@ -129,6 +130,7 @@ export interface PiForkRuntimeProfile {
 	thinkingLevel?: NonNullable<CreateAgentSessionOptions["thinkingLevel"]>;
 	codemodeMode: "on" | "only" | "off";
 	toolManifest: BackendToolManifest[];
+	nativeMcpExecutionAllowed: boolean;
 	roomCapability?: Record<string, unknown>;
 	systemPrompt: string;
 	noContextFiles: boolean;
@@ -519,7 +521,7 @@ export class PiProductSession implements PooledSession {
 	readonly piSkillsEnabled: boolean;
 	readonly codexSkillsEnabled: boolean;
 	private readonly codemodeState: { mode: "on" | "only" | "off" };
-	private readonly mcpState: { snapshot?: McpStatusSnapshot };
+	private readonly mcpState: { allowed: boolean; snapshot?: McpStatusSnapshot };
 	get codemodeMode(): "on" | "only" | "off" { return this.codemodeState.mode; }
 	private roomCapability?: Record<string, unknown>;
 	private readonly session: AgentSession;
@@ -586,7 +588,7 @@ export class PiProductSession implements PooledSession {
 		backendBridge: BackendToolBridgeOptions,
 		roomSkillLoad: RoomSkillLoadReceipt | undefined,
 		codemodeState: { mode: "on" | "only" | "off" },
-		mcpState: { snapshot?: McpStatusSnapshot },
+		mcpState: { allowed: boolean; snapshot?: McpStatusSnapshot },
 	) {
 		this.externalSessionId = options.externalSessionId;
 		this.codemodeState = codemodeState;
@@ -701,7 +703,9 @@ export class PiProductSession implements PooledSession {
 		const roomBound = options.roomCapability !== undefined;
 		const codemodeMode = options.codemodeMode ?? "on";
 		const codemodeState = { mode: codemodeMode };
-		const mcpState: { snapshot?: McpStatusSnapshot } = {};
+		const mcpState: { allowed: boolean; snapshot?: McpStatusSnapshot } = {
+			allowed: options.nativeMcpExecutionAllowed === true,
+		};
 		const registry = new BackendToolRegistry();
 		if (options.toolManifest !== undefined) registry.sync(options.toolManifest);
 		const sessionManager =
@@ -845,6 +849,7 @@ export class PiProductSession implements PooledSession {
 				{
 					name: "mcp", builtin: true, replaceable: true,
 					factory: createMcpExtension({
+						executionAllowed: () => mcpState.allowed,
 						codemodeActivationAllowed: () => codemodeState.mode !== "off",
 						loadConfig: (ctx) => {
 							const config = loadMcpConfig({ agentDir: options.agentDir, cwd: ctx.cwd, projectTrusted: ctx.isProjectTrusted() });
@@ -1784,12 +1789,14 @@ export class PiProductSession implements PooledSession {
 	}
 
 	nativeCapabilities(): Record<string, unknown> {
-		const snapshot = this.mcpState.snapshot;
+		const snapshot = this.mcpState.allowed ? this.mcpState.snapshot : undefined;
 		const mcpExposures = new Map(snapshot?.servers.flatMap((server) => server.tools.map((tool) => [tool.name, tool.exposure] as const)) ?? []);
 		return {
 			schemaVersion: "rag-ime.pi-native-capabilities.v1",
 			codemodeMode: this.codemodeMode,
-			mcp: snapshot?.active ? { available: true, ...structuredClone(snapshot) } : { available: false, servers: [] },
+			mcp: snapshot?.active ? { available: true, ...structuredClone(snapshot) } : {
+				available: false, servers: [], policyAllowed: this.mcpState.allowed,
+			},
 			tools: this.listTools().filter((tool) => mcpExposures.has(String(tool.name))).map((tool) => ({
 				name: tool.name, description: tool.description, parameters: tool.parameters,
 				namespace: tool.namespace, exposure: mcpExposures.get(String(tool.name)), nativeToolExposure: tool.exposure,
@@ -1902,6 +1909,7 @@ export class PiProductSession implements PooledSession {
 			thinkingLevel: this.session.thinkingLevel,
 			codemodeMode: this.codemodeMode,
 			toolManifest: this.toolRegistry.list(),
+			nativeMcpExecutionAllowed: this.mcpState.allowed,
 			roomCapability: this.roomCapability ? structuredClone(this.roomCapability) : undefined,
 			systemPrompt: this.session.systemPrompt,
 			noContextFiles: this.noContextFiles,
@@ -1943,8 +1951,8 @@ export class PiProductSession implements PooledSession {
 		});
 	}
 
-	async syncTools(manifest: unknown): Promise<BackendToolManifest[]> {
-		if (!this.session.isIdle) {
+	async syncTools(manifest: unknown, nativeMcpExecutionAllowed = this.mcpState.allowed): Promise<BackendToolManifest[]> {
+		if (!this.session.isIdle || this.activeTurn || this.pluginReloadInFlight) {
 			throw new RuntimeProtocolError("SESSION_BUSY", "Tools can only be synchronized while the session is idle");
 		}
 		const registrySnapshot = this.toolRegistry.snapshot();
@@ -1952,12 +1960,17 @@ export class PiProductSession implements PooledSession {
 		const disclosedBefore = new Set(this.toolRegistry.disclosed().map((tool) => tool.name));
 		const tools = this.toolRegistry.sync(manifest);
 		const diff = diffBackendToolCatalog(before, tools);
-		if (diff.previousRevision === diff.revision) return tools;
+		const mcpPolicyChanged = this.mcpState.allowed !== nativeMcpExecutionAllowed;
+		// Revoke before awaiting reload, so stale direct/deferred/codemode tool
+		// references cannot execute with the old authority. Never restore an
+		// earlier grant if reload fails.
+		this.mcpState.allowed = nativeMcpExecutionAllowed;
+		if (diff.previousRevision === diff.revision && !mcpPolicyChanged) return tools;
 
 		const providerSchemaChanged =
 			diff.schemaChanged.some((name) => disclosedBefore.has(name)) ||
 			diff.removed.some((name) => disclosedBefore.has(name));
-		const registryReloaded = diff.added.length > 0 || diff.removed.length > 0 || diff.schemaChanged.length > 0;
+		const registryReloaded = mcpPolicyChanged || diff.added.length > 0 || diff.removed.length > 0 || diff.schemaChanged.length > 0;
 		// Catalog shape changes must refresh execution lookup, but the Provider
 		// still sees only the explicitly disclosed subset after the reload.
 		if (registryReloaded) {
@@ -1966,12 +1979,14 @@ export class PiProductSession implements PooledSession {
 				applyBackendToolDisclosure(this.session, this.toolRegistry, this.roomCapability !== undefined);
 			} catch (error) {
 				this.toolRegistry.restore(registrySnapshot);
+				this.mcpState.allowed = false;
 				applyBackendToolDisclosure(this.session, this.toolRegistry, this.roomCapability !== undefined);
 				throw error;
 			}
 		}
 		await this.appendCatalogChange("tool_catalog_changed", {
 			...diff,
+			nativeMcpExecutionAllowed,
 			registryReloaded,
 			providerSchemaChanged,
 			schemaReloaded: providerSchemaChanged,

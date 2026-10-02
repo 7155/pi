@@ -6,6 +6,7 @@ const telemetrySrcIndex = fileURLToPath(new URL("../../packages/telemetry/src/in
 const aiSrcIndex = fileURLToPath(new URL("../../packages/ai/src/index.ts", import.meta.url));
 const aiSrcCompat = fileURLToPath(new URL("../../packages/ai/src/compat.ts", import.meta.url));
 const aiSrcOAuth = fileURLToPath(new URL("../../packages/ai/src/oauth.ts", import.meta.url));
+const aiSrcModelOperations = fileURLToPath(new URL("../../packages/ai/src/utils/model-operations.ts", import.meta.url));
 const aiSrcProviders = fileURLToPath(new URL("../../packages/ai/src/providers", import.meta.url));
 const agentSrcIndex = fileURLToPath(new URL("../../packages/agent/src/index.ts", import.meta.url));
 const codingAgentSrcIndex = fileURLToPath(new URL("../../packages/coding-agent/src/index.ts", import.meta.url));
@@ -35,6 +36,7 @@ export default defineConfig({
 			{ find: /^@earendil-works\/pi-ai$/, replacement: aiSrcIndex },
 			{ find: /^@earendil-works\/pi-ai\/compat$/, replacement: aiSrcCompat },
 			{ find: /^@earendil-works\/pi-ai\/oauth$/, replacement: aiSrcOAuth },
+			{ find: /^@earendil-works\/pi-ai\/utils\/model-operations$/, replacement: aiSrcModelOperations },
 			{ find: /^@earendil-works\/pi-ai\/providers\/(.+)$/, replacement: `${aiSrcProviders}/$1.ts` },
 			{ find: /^@earendil-works\/pi-agent-core$/, replacement: agentSrcIndex },
 			{ find: /^@earendil-works\/pi-coding-agent$/, replacement: codingAgentSrcIndex },

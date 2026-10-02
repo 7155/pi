@@ -330,6 +330,7 @@ describe("PiProductSession catalog updates", () => {
 		});
 		const sessionOptions = {
 			externalSessionId: "product-skill-test",
+			nativeMcpExecutionAllowed: true,
 			cwd: root,
 			sessionDir,
 			agentDir,

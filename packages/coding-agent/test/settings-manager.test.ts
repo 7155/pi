@@ -478,33 +478,33 @@ describe("SettingsManager", () => {
 	});
 
 	describe("TUI mode", () => {
-		it("defaults to regular and persists fullscreen mode", async () => {
+		it("defaults to fullscreen and persists regular mode", async () => {
 			const manager = SettingsManager.create(projectDir, agentDir);
 
-			expect(manager.getTuiMode()).toBe("regular");
+			expect(manager.getTuiMode()).toBe("fullscreen");
 
-			manager.setTuiMode("fullscreen");
+			manager.setTuiMode("regular");
 			await manager.flush();
 
-			expect(manager.getTuiMode()).toBe("fullscreen");
+			expect(manager.getTuiMode()).toBe("regular");
 			const savedSettings = JSON.parse(readFileSync(join(agentDir, "settings.json"), "utf-8"));
-			expect(savedSettings.tuiMode).toBe("fullscreen");
+			expect(savedSettings.tuiMode).toBe("regular");
 		});
 
-		it("falls back to regular for unsupported values", () => {
+		it("falls back to fullscreen for unsupported values", () => {
 			writeFileSync(join(agentDir, "settings.json"), JSON.stringify({ tuiMode: "other" }));
 
 			const manager = SettingsManager.create(projectDir, agentDir);
 
-			expect(manager.getTuiMode()).toBe("regular");
+			expect(manager.getTuiMode()).toBe("fullscreen");
 		});
 
 		it("does not recognize the old uiMode setting", () => {
-			writeFileSync(join(agentDir, "settings.json"), JSON.stringify({ uiMode: "fullscreen" }));
+			writeFileSync(join(agentDir, "settings.json"), JSON.stringify({ uiMode: "regular" }));
 
 			const manager = SettingsManager.create(projectDir, agentDir);
 
-			expect(manager.getTuiMode()).toBe("regular");
+			expect(manager.getTuiMode()).toBe("fullscreen");
 		});
 	});
 
@@ -645,6 +645,66 @@ describe("SettingsManager", () => {
 		it("preserves an empty tool list", () => {
 			expect(SettingsManager.inMemory({ defaultTools: [] }).getDefaultTools()).toEqual([]);
 			expect(SettingsManager.inMemory().getDefaultTools()).toBeUndefined();
+		});
+
+		it.each([{ globalTools: ["read", "bash"] }, { globalTools: ["+codemode"] }, { globalTools: [] }])(
+			"lets an empty project list replace global tools $globalTools, including after reload",
+			async ({ globalTools }) => {
+				writeFileSync(join(agentDir, "settings.json"), JSON.stringify({ defaultTools: globalTools }));
+				writeFileSync(join(projectDir, ".pi", "settings.json"), JSON.stringify({ defaultTools: [] }));
+				const manager = SettingsManager.create(projectDir, agentDir);
+				expect(manager.getDefaultTools()).toEqual([]);
+				manager.applyOverrides({ defaultTools: ["+codemode"] });
+				expect(manager.getDefaultTools()).toEqual(["codemode"]);
+				await manager.reload();
+				expect(manager.getDefaultTools()).toEqual([]);
+			},
+		);
+
+		it("applies ordered project and runtime modifiers to an explicitly empty global selection", async () => {
+			writeFileSync(join(agentDir, "settings.json"), JSON.stringify({ defaultTools: [] }));
+			writeFileSync(
+				join(projectDir, ".pi", "settings.json"),
+				JSON.stringify({ defaultTools: ["+codemode", "+grep", "-codemode", "+codemode"] }),
+			);
+			const manager = SettingsManager.create(projectDir, agentDir);
+			expect(manager.getDefaultTools()).toEqual(["grep", "codemode"]);
+			manager.applyOverrides({ defaultTools: ["-grep", "-codemode"] });
+			expect(manager.getDefaultTools()).toEqual([]);
+			manager.applyOverrides({ defaultTools: ["+tool_search"] });
+			expect(manager.getDefaultTools()).toEqual(["tool_search"]);
+			await manager.reload();
+			expect(manager.getDefaultTools()).toEqual(["grep", "codemode"]);
+			expect(manager.getGlobalSettings().defaultTools).toEqual([]);
+		});
+
+		it("clears inherited tools with a runtime override and keeps subsequent modifiers empty-based", async () => {
+			writeFileSync(join(agentDir, "settings.json"), JSON.stringify({ defaultTools: ["read", "bash"] }));
+			writeFileSync(join(projectDir, ".pi", "settings.json"), JSON.stringify({ defaultTools: ["+grep"] }));
+			const manager = SettingsManager.create(projectDir, agentDir);
+			manager.applyOverrides({ defaultTools: [] });
+			expect(manager.getDefaultTools()).toEqual([]);
+			manager.applyOverrides({ defaultTools: ["-write"] });
+			expect(manager.getDefaultTools()).toEqual([]);
+			manager.applyOverrides({ defaultTools: ["+codemode", "+codemode"] });
+			expect(manager.getDefaultTools()).toEqual(["codemode"]);
+			manager.applyOverrides({ defaultTools: undefined });
+			expect(manager.getDefaultTools()).toEqual(["codemode"]);
+			await manager.reload();
+			expect(manager.getDefaultTools()).toEqual(["read", "bash", "grep"]);
+		});
+
+		it.each([
+			{ value: null, expected: [] },
+			{ value: "read", expected: [] },
+			{ value: [false, 1, null], expected: [] },
+			{ value: ["grep", null, "+codemode"], expected: ["grep", "codemode"] },
+			{ value: [null, "+codemode"], expected: ["read", "bash", "edit", "write", "codemode"] },
+		])("preserves malformed settings handling for $value", ({ value, expected }) => {
+			writeFileSync(join(agentDir, "settings.json"), JSON.stringify({ defaultTools: ["read"] }));
+			writeFileSync(join(projectDir, ".pi", "settings.json"), JSON.stringify({ defaultTools: value }));
+			const manager = SettingsManager.create(projectDir, agentDir);
+			expect(manager.getDefaultTools()).toEqual(expected);
 		});
 
 		it("applies +name and -name to the default selection", () => {

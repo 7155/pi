@@ -50,6 +50,23 @@ await sandbox.close();
 
 `memoryLimitBytes` caps the VM's heap. Allocations beyond it fail inside the script as `InternalError: out of memory`.
 
+## Output and bridge limits
+
+The VM heap limit does not bound host output: repeatedly emitting the same string can grow the worker's message queue and the host's output array without growing the VM. Independent per-execution budgets prevent that:
+
+- `maxOutputBytes` defaults to `DEFAULT_MAX_OUTPUT_BYTES` (16 MiB). It counts UTF-8 bytes across text, image base64 data and MIME types, and serialized return/error values. A return value is measured as JSON, including its quotes and escapes. Store writes and tool arguments instead count toward bridge payload limits.
+- `maxOutputItems` defaults to `DEFAULT_MAX_OUTPUT_ITEMS` (1024). Each text/image item, including empty text, counts once. A non-undefined return value also counts once.
+- Both options accept non-negative safe integers. Zero permits executions without output; attempting an output beyond either budget fails instead of silently discarding it.
+- Worker-to-host traffic also has fixed safety limits: 16 MiB of UTF-8 payload per message, 64 MiB cumulatively, and 4096 messages, including output, tool/global calls and completion. These limits remain in force if the output options are raised. Message counts bound object/envelope overhead independently of payload bytes.
+
+The worker checks string lengths before copying values out of QuickJS, checks exact UTF-8 budgets before posting, and stops producing messages at the first overrun. The host independently checks the same limits before accepting output, parsing values, or starting another tool. This is fail-fast backpressure: the queue can contain only the accepted, bounded prefix plus one small limit notification; output helpers remain synchronous.
+
+An overrun terminates execution with `ok: false` and `error.kind: "limit"`. Earlier complete output items and call records remain available; the offending item is not partially emitted, store writes are discarded, and already running tools receive cancellation. The script cannot catch this limit and resume emitting output. The coding-agent integration waits for its started native tools to drain before returning their final IDs and receipts.
+
+These are payload budgets, not exact process-heap measurements. VM allocations, string conversion, structured cloning and JSON parsing use additional bounded memory. `memoryLimitBytes` still controls the VM heap, and `timeoutMs` still independently controls elapsed time.
+
+The coding agent uses these defaults even with no timeout. Its `max_output_tokens` option only controls display truncation and spill files for accepted output; it does not increase execution budgets. Limit errors remain visible with a zero-token display budget, and a spill file after a limit failure contains only the accepted partial text.
+
 ## Store
 
 `store`/`load` let scripts keep values across executions. The sandbox does not persist anything itself: pass the current values as `options.store`, and a successful result reports what the script changed as `result.storeWrites` (`{ set, delete }`). Failed executions report no writes.
@@ -169,6 +186,7 @@ const codemodeTool: AgentTool = {
 | `script`  | the script threw or failed to parse; `stack` points at `codemode.js:<line>` |
 | `timeout` | the deadline expired; the worker was terminated                             |
 | `aborted` | `options.signal` fired or `close()` was called; the worker was terminated   |
+| `limit`   | output or worker-to-host bridge traffic exceeded a resource budget          |
 | `sandbox` | the worker or VM failed, for example a wasm trap or a missing worker file   |
 
 `result.output` holds the text and image items in the order the script produced them, also for failed executions. `result.calls` lists every tool call with `status: "ok" | "error" | "cancelled"`. A call that is still running when the script returns (not awaited) is aborted through the tool's `signal` and reported as `cancelled`.

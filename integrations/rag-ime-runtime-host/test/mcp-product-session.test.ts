@@ -30,7 +30,7 @@ describe("managed native MCP inspection", () => {
 					reasoning: model.reasoning, input: model.input, cost: model.cost, contextWindow: model.contextWindow, maxTokens: model.maxTokens }] });
 			session = await PiProductSession.create({ externalSessionId: "mcp-call", cwd: root, agentDir,
 				sessionDir: join(root, "sessions"), activePluginDir: join(root, "plugins"), skillPaths: [], piSkillPaths: [], codexSkillPaths: [],
-				modelRuntime, provider: "paw-mcp-test", modelId: "test", toolManifest: [], noContextFiles: true, emitEvent: () => undefined });
+				modelRuntime, provider: "paw-mcp-test", modelId: "test", toolManifest: [], nativeMcpExecutionAllowed: true, noContextFiles: true, emitEvent: () => undefined });
 			await expect.poll(() => session?.nativeCapabilities().mcp, { timeout: 5_000 }).toMatchObject({
 				servers: [{ name: "fixture", state: "connected", toolCount: 1 }],
 			});
@@ -50,6 +50,14 @@ describe("managed native MCP inspection", () => {
 			expect(results).toHaveLength(exposure === "deferred" ? 2 : 1);
 			expect(results.every(result => result.isError === false)).toBe(true);
 			expect(JSON.stringify(results.at(-1)?.content)).toContain("mcp-value");
+			if (exposure === "codemode") {
+				expect(results.at(-1)).toMatchObject({ nestedCalls: {
+					complete: true,
+					calls: [{ name: "mcp__fixture__echo", status: "ok", result: {
+						structuredContent: { content: [{ type: "text", text: "mcp-value" }] },
+					} }],
+				} });
+			}
 			expect(session.resourceDiagnostics().extensions).toMatchObject({ errors: [] });
 		} finally { await session?.dispose(); await rm(root, { recursive: true, force: true }); }
 	});
@@ -67,7 +75,7 @@ describe("managed native MCP inspection", () => {
 			session = await PiProductSession.create({ externalSessionId: "mcp-inspect", cwd: root, agentDir,
 				sessionDir: join(root, "sessions"), activePluginDir: join(root, "plugins"),
 				skillPaths: [], piSkillPaths: [], codexSkillPaths: [], modelRuntime, codemodeMode: "off",
-				toolManifest: [], noContextFiles: true, emitEvent: () => undefined });
+				toolManifest: [], nativeMcpExecutionAllowed: true, noContextFiles: true, emitEvent: () => undefined });
 			expect(session.listCommands().some(command => command.name === "mcp")).toBe(true);
 			await expect.poll(() => session?.nativeCapabilities().mcp, { timeout: 5_000 }).toMatchObject({
 				available: true, servers: [

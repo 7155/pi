@@ -553,6 +553,7 @@ export class RagImeRuntimeHost {
 						activeTurnMessaging: true,
 						statelessCompletion: true,
 						codemode: { available: true, modes: ["on", "only", "off"], defaultMode: "on" },
+						nativeMcpExecutionPolicy: true,
 						transientContext: true,
 						runtimePrimitives: RUNTIME_PRIMITIVE_CAPABILITIES,
 					},
@@ -832,6 +833,7 @@ export class RagImeRuntimeHost {
 						thinkingLevel: thinking as ModelThinkingLevel | undefined,
 						codemodeMode: codemodeMode as "on" | "only" | "off",
 						toolManifest: params.toolManifest ?? [],
+						nativeMcpExecutionAllowed: optionalBoolean(params, "nativeMcpExecutionAllowed"),
 						roomCapability: optionalRoomCapability(params),
 						toolGatewayUrl: this.options.toolGatewayUrl,
 						toolGatewayToken: this.options.toolGatewayToken,
@@ -919,6 +921,7 @@ export class RagImeRuntimeHost {
 							thinkingLevel: profile.thinkingLevel,
 							codemodeMode: profile.codemodeMode,
 							toolManifest: profile.toolManifest,
+							nativeMcpExecutionAllowed: optionalBoolean(params, "nativeMcpExecutionAllowed"),
 							roomCapability: profile.roomCapability,
 							toolGatewayUrl: this.options.toolGatewayUrl,
 							toolGatewayToken: this.options.toolGatewayToken,
@@ -1149,7 +1152,7 @@ export class RagImeRuntimeHost {
 			case "tools.list":
 				return { tools: this.session(params).listTools(), nativeCapabilities: this.session(params).nativeCapabilities() };
 			case "tools.sync":
-				return { tools: await this.session(params).syncTools(params.tools) };
+				return { tools: await this.session(params).syncTools(params.tools, optionalBoolean(params, "nativeMcpExecutionAllowed")) };
 			case "plugins.catalog": {
 				const installed = await this.nativePackages.list();
 				return { packages: await listBundledPiPackages(installed) };

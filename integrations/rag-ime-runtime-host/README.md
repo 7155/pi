@@ -54,6 +54,24 @@ assets through normal Session RPC; it is not a live model or Room acceptance.
 
 ## Stable prompt prefix and discovery
 
+### Native MCP execution policy
+
+Managed clients send `nativeMcpExecutionAllowed` on `session.open`, `tools.sync`,
+and `session.fork` (the target Session's current policy). Missing values deny.
+The host advertises `nativeMcpExecutionPolicy`; PAW requires that capability for
+restricted Sessions rather than letting older hosts ignore their policy.
+
+PAW grants native MCP only to its existing explicit unrestricted profiles.
+Read-only, scoped, and memory-curation profiles retain governed Gateway tools
+but cannot launch native MCP servers or call their tools/resources. Server
+annotations such as `readOnlyHint` are advisory, not authorization. This is a
+coarse native-MCP boundary until per-tool effects can use the product Gateway.
+
+Policy refresh occurs between turns through `tools.sync`. A changed policy
+reloads native registrations; execution and transport creation recheck the
+current policy, so stale direct, deferred, and codemode references cannot
+restore a revoked grant. Plugin reloads preserve the effective policy.
+
 Each Session starts with one deterministic model-facing prefix:
 
 - the product Persona/System Prompt;

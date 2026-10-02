@@ -19,14 +19,16 @@ import type { JsonObject, NestedToolCallRecord, NestedToolCalls, TextContent, Us
 import { combineUsage } from "./usage-totals.ts";
 
 /**
- * Limits of the nested-call record on a tool result: arguments
- * over the per-call or total size are omitted, calls beyond the count are dropped, and the record
- * is marked incomplete when any of that happens.
+ * Limits of the nested-call record on a tool result: oversized arguments and results
+ * are omitted, calls beyond the count are dropped, and the record is marked incomplete.
+ * Result eviction keeps the latest completions, including final validation receipts.
  */
 export const NESTED_CALL_LIMITS = {
 	maxCalls: 256,
 	maxArgumentBytesPerCall: 8 * 1024,
 	maxArgumentBytesTotal: 32 * 1024,
+	maxResultBytesPerCall: 256 * 1024,
+	maxResultBytesTotal: 2 * 1024 * 1024,
 	maxErrorChars: 500,
 } as const;
 
@@ -49,6 +51,9 @@ export class NestedCallRecorder {
 	private readonly startedAt = new Map<NestedToolCallRecord, number>();
 	private complete = true;
 	private argumentBytes = 0;
+	private resultBytes = 0;
+	/** Completion order, so later validation receipts survive a large earlier result set. */
+	private readonly retainedResults: NestedToolCallRecord[] = [];
 	/** Summed usage of every nested result, including calls dropped from the record. */
 	private usage: Usage | undefined;
 
@@ -76,12 +81,50 @@ export class NestedCallRecorder {
 		return record;
 	}
 
-	finish(record: NestedToolCallRecord | undefined, isError: boolean, errorText: string): void {
+	finish(
+		record: NestedToolCallRecord | undefined,
+		isError: boolean,
+		errorText: string,
+		result?: AgentToolResult<unknown>,
+	): void {
 		if (!record) return;
 		record.status = isError ? "error" : "ok";
 		record.durationMs = Math.round(performance.now() - (this.startedAt.get(record) ?? performance.now()));
 		this.startedAt.delete(record);
 		if (isError && errorText) record.error = errorText.slice(0, NESTED_CALL_LIMITS.maxErrorChars);
+		if (!result) return;
+		try {
+			// Capture only the actual child pipeline return. Outer script output and
+			// tool-authored call summaries are never used to reconstruct this receipt.
+			const json = JSON.stringify({
+				content: result.content,
+				details: result.details,
+				structuredContent: result.structuredContent,
+			});
+			const bytes = encoder.encode(json).length;
+			record.resultBytes = bytes;
+			if (bytes > NESTED_CALL_LIMITS.maxResultBytesPerCall) {
+				record.resultUnavailable = "size_limit";
+				this.complete = false;
+				return;
+			}
+			while (this.resultBytes + bytes > NESTED_CALL_LIMITS.maxResultBytesTotal) {
+				const previous = this.retainedResults.shift();
+				if (!previous) break;
+				this.resultBytes -= previous.resultBytes ?? 0;
+				delete previous.result;
+				previous.resultUnavailable = "size_limit";
+				this.complete = false;
+			}
+			record.result = JSON.parse(json) as JsonObject;
+			this.resultBytes += bytes;
+			this.retainedResults.push(record);
+		} catch {
+			// Receipt storage must not turn an already completed side effect into a
+			// retryable tool failure when a third-party result is not JSON-shaped.
+			record.resultUnavailable = "not_serializable";
+			this.complete = false;
+		}
 	}
 
 	addUsage(usage: Usage): void {
@@ -95,7 +138,7 @@ export class NestedCallRecorder {
 	/** Copy of the record so far, or undefined when no nested call was made. */
 	snapshot(): NestedToolCalls | undefined {
 		if (this.calls.length === 0 && this.complete) return undefined;
-		const calls = this.calls.map((call) => ({ ...call }));
+		const calls = this.calls.map((call) => structuredClone(call));
 		return { calls, complete: this.complete && calls.every((call) => call.status !== "unfinished") };
 	}
 }
@@ -148,8 +191,26 @@ interface CallScope {
 	/** Physical child calls, shared by all descendants of a model-issued call. */
 	pending: Set<Promise<AgentToolCallOutcome>>;
 	nextId: number;
-	/** Set inside a call that holds the exclusive queue, so its own nested calls do not wait on it. */
-	holdsQueue: boolean;
+	/** The running caller lends its scheduling slot to its children until they finish. */
+	owner?: ScheduledCall;
+}
+
+interface ScheduledCall {
+	/** Root first; common ancestors are reentrant, not competing calls. */
+	path: ScheduledCall[];
+	order: number;
+	exclusive: boolean;
+	children: number;
+	running: boolean;
+	admit: (run: boolean) => void;
+}
+
+function competingCalls(a: ScheduledCall, b: ScheduledCall): boolean {
+	let common = 0;
+	while (common < Math.min(a.path.length, b.path.length) && a.path[common] === b.path[common]) common++;
+	// A call cannot wait for its own ancestor to finish.
+	if (common === a.path.length || common === b.path.length) return false;
+	return a.path.slice(common).some((call) => call.exclusive) || b.path.slice(common).some((call) => call.exclusive);
 }
 
 function textOf(result: AgentToolResult<unknown>): string {
@@ -163,8 +224,8 @@ export class NestedToolCallRunner {
 	private readonly host: NestedToolCallHost;
 	/** Scopes by the id of the calling tool call. */
 	private readonly scopes = new Map<string, CallScope>();
-	/** Serializes nested calls that must not run concurrently. */
-	private queueTail: Promise<void> = Promise.resolve();
+	private readonly scheduled = new Set<ScheduledCall>();
+	private nextOrder = 0;
 
 	constructor(host: NestedToolCallHost) {
 		this.host = host;
@@ -182,7 +243,7 @@ export class NestedToolCallRunner {
 	): Promise<AgentToolCallOutcome> {
 		let scope = this.scopes.get(callerId);
 		if (!scope) {
-			scope = { recorder: new NestedCallRecorder(), pending: new Set(), nextId: 1, holdsQueue: false };
+			scope = { recorder: new NestedCallRecorder(), pending: new Set(), nextId: 1 };
 			this.scopes.set(callerId, scope);
 		}
 		const promise = this.executeCall(callerId, name, args, options, scope);
@@ -192,6 +253,39 @@ export class NestedToolCallRunner {
 			() => scope.pending.delete(promise),
 		);
 		return promise;
+	}
+
+	private dispatch(): void {
+		const active = [...this.scheduled].filter((call) => call.running && call.children === 0);
+		const waiting = [...this.scheduled].filter((call) => !call.running);
+		// Finish an earlier caller's descendants before a later outer barrier. Otherwise the
+		// barrier would wait for the caller while its children wait behind the barrier.
+		waiting.sort((a, b) => {
+			for (let i = 0; i < Math.min(a.path.length, b.path.length); i++) {
+				if (a.path[i] !== b.path[i]) return a.path[i].order - b.path[i].order;
+			}
+			return a.path.length - b.path.length;
+		});
+		const blocked: ScheduledCall[] = [];
+		for (const call of waiting) {
+			if (
+				active.some((other) => competingCalls(call, other)) ||
+				blocked.some((other) => competingCalls(call, other))
+			) {
+				blocked.push(call);
+				continue;
+			}
+			call.running = true;
+			active.push(call);
+			call.admit(true);
+		}
+	}
+
+	private release(call: ScheduledCall): void {
+		if (!this.scheduled.delete(call)) return;
+		const parent = call.path.at(-2);
+		if (parent) parent.children--;
+		this.dispatch();
 	}
 
 	private async executeCall(
@@ -208,52 +302,73 @@ export class NestedToolCallRunner {
 			arguments: (args ?? {}) as AgentToolCall["arguments"],
 		};
 		const record = scope.recorder.start(toolCall);
-		await this.host.emit({
-			type: "tool_execution_start",
-			toolCallId: toolCall.id,
-			toolName: name,
-			args: toolCall.arguments,
-			parentToolCallId: callerId,
+		let admit!: ScheduledCall["admit"];
+		const admitted = new Promise<boolean>((resolve) => {
+			admit = resolve;
 		});
-
-		const exclusive =
-			!scope.holdsQueue &&
-			(this.host.isSequential() ||
-				this.host.getTools().find((tool) => tool.name === name)?.executionMode === "sequential");
-		let release: (() => void) | undefined;
-		if (exclusive) {
-			const previous = this.queueTail;
-			this.queueTail = new Promise((resolve) => {
-				release = resolve;
-			});
-			await previous;
-		}
-		this.scopes.set(toolCall.id, {
-			recorder: scope.recorder,
-			pending: scope.pending,
-			nextId: 1,
-			holdsQueue: scope.holdsQueue || exclusive,
-		});
+		const scheduled: ScheduledCall = {
+			path: [...(scope.owner?.path ?? [])],
+			order: this.nextOrder++,
+			exclusive:
+				this.host.isSequential() ||
+				this.host.getTools().find((tool) => tool.name === name)?.executionMode === "sequential",
+			children: 0,
+			running: false,
+			admit,
+		};
+		scheduled.path.push(scheduled);
+		if (scope.owner) scope.owner.children++;
+		this.scheduled.add(scheduled);
+		const cancelWaiting = () => {
+			if (scheduled.running) return;
+			scheduled.admit(false);
+			this.release(scheduled);
+		};
+		options.signal?.addEventListener("abort", cancelWaiting, { once: true });
+		if (options.signal?.aborted) cancelWaiting();
+		else this.dispatch();
 		let outcome: AgentToolCallOutcome;
 		try {
-			outcome = await this.host.runToolCall(toolCall, callerId, options.signal, async (partialResult) => {
-				options.onUpdate?.(partialResult);
-				await this.host.emit({
-					type: "tool_execution_update",
-					toolCallId: toolCall.id,
-					toolName: name,
-					args: toolCall.arguments,
-					partialResult,
-					parentToolCallId: callerId,
-				});
+			await this.host.emit({
+				type: "tool_execution_start",
+				toolCallId: toolCall.id,
+				toolName: name,
+				args: toolCall.arguments,
+				parentToolCallId: callerId,
 			});
+			if (!(await admitted) || options.signal?.aborted) {
+				outcome = {
+					toolCall,
+					result: { content: [{ type: "text", text: "Operation aborted" }], details: {} },
+					isError: true,
+				};
+			} else {
+				this.scopes.set(toolCall.id, {
+					recorder: scope.recorder,
+					pending: scope.pending,
+					nextId: 1,
+					owner: scheduled,
+				});
+				outcome = await this.host.runToolCall(toolCall, callerId, options.signal, async (partialResult) => {
+					options.onUpdate?.(partialResult);
+					await this.host.emit({
+						type: "tool_execution_update",
+						toolCallId: toolCall.id,
+						toolName: name,
+						args: toolCall.arguments,
+						partialResult,
+						parentToolCallId: callerId,
+					});
+				});
+			}
 		} finally {
+			options.signal?.removeEventListener("abort", cancelWaiting);
 			this.scopes.delete(toolCall.id);
-			release?.();
+			this.release(scheduled);
 		}
 
-		scope.recorder.finish(record, outcome.isError, textOf(outcome.result));
-		// Nested results are not persisted, so their usage is only counted through the recorder.
+		scope.recorder.finish(record, outcome.isError, textOf(outcome.result), outcome.result);
+		// Usage is counted through the recorder, not again from the retained result body.
 		if (outcome.result.usage) scope.recorder.addUsage(outcome.result.usage);
 		await this.host.emit({
 			type: "tool_execution_end",
