@@ -75,6 +75,7 @@ describe("AgentSession concurrent prompt guard", () => {
 		delete (globalThis as typeof globalThis & { testExtensionApi?: unknown }).testExtensionApi;
 		delete (globalThis as typeof globalThis & { testCommandRuns?: unknown }).testCommandRuns;
 		if (session) {
+			await session.abort();
 			session.dispose();
 		}
 		if (tempDir && existsSync(tempDir)) {
@@ -82,7 +83,7 @@ describe("AgentSession concurrent prompt guard", () => {
 		}
 	});
 
-	async function createSession() {
+	async function createSession(beforeAgentStartDelayMs = 0) {
 		const model = getModel("anthropic", "claude-sonnet-4-5")!;
 		let abortSignal: AbortSignal | undefined;
 
@@ -118,6 +119,16 @@ describe("AgentSession concurrent prompt guard", () => {
 		const modelRegistry = await createModelRegistry(authStorage, tempDir);
 		// Set a runtime API key so validation passes
 		await authStorage.modify("anthropic", async () => ({ type: "api_key", key: "test-key" }));
+		const extensionsResult =
+			beforeAgentStartDelayMs > 0
+				? await createTestExtensionsResult([
+						(pi) => {
+							pi.on("before_agent_start", async () => {
+								await new Promise((resolve) => setTimeout(resolve, beforeAgentStartDelayMs));
+							});
+						},
+					])
+				: undefined;
 
 		session = new AgentSession({
 			agent,
@@ -125,64 +136,74 @@ describe("AgentSession concurrent prompt guard", () => {
 			settingsManager,
 			cwd: tempDir,
 			modelRuntime: getModelRuntime(modelRegistry),
-			resourceLoader: createTestResourceLoader(),
+			resourceLoader: createTestResourceLoader({ extensionsResult }),
 		});
 
 		return session;
 	}
 
+	async function startStreamingPrompt() {
+		let unsubscribe = () => {};
+		const streamingStarted = new Promise<void>((resolve) => {
+			unsubscribe = session.subscribe((event) => {
+				if (event.type === "message_start" && event.message.role === "assistant") resolve();
+			});
+		});
+		const firstPrompt = session.prompt("First message");
+		try {
+			await Promise.race([
+				streamingStarted,
+				firstPrompt.then(() => {
+					throw new Error("Prompt completed before streaming started");
+				}),
+			]);
+			return { firstPrompt };
+		} finally {
+			unsubscribe();
+		}
+	}
+
 	it("should throw when prompt() called while streaming", async () => {
 		await createSession();
 
-		// Start first prompt (don't await, it will block until abort)
-		const firstPrompt = session.prompt("First message");
-
-		// Wait a tick for isStreaming to be set
-		await new Promise((resolve) => setTimeout(resolve, 10));
-
-		// Verify we're streaming
-		expect(session.isStreaming).toBe(true);
-
-		// Second prompt should reject
-		await expect(session.prompt("Second message")).rejects.toThrow(
-			"Agent is already processing. Specify streamingBehavior ('steer' or 'followUp') to queue the message.",
-		);
-
-		// Cleanup
-		await session.abort();
-		await firstPrompt.catch(() => {}); // Ignore abort error
+		const { firstPrompt } = await startStreamingPrompt();
+		try {
+			expect(session.isStreaming).toBe(true);
+			await expect(session.prompt("Second message")).rejects.toThrow(
+				"Agent is already processing. Specify streamingBehavior ('steer' or 'followUp') to queue the message.",
+			);
+		} finally {
+			await session.abort();
+			await firstPrompt.catch(() => {});
+		}
 	});
 
 	it("should allow steer() while streaming", async () => {
 		await createSession();
 
-		// Start first prompt
-		const firstPrompt = session.prompt("First message");
-		await new Promise((resolve) => setTimeout(resolve, 10));
-
-		// steer should work while streaming
-		await expect(session.steer("Steering message")).resolves.toBe("queued");
-		expect(session.pendingMessageCount).toBe(1);
-
-		// Cleanup
-		await session.abort();
-		await firstPrompt.catch(() => {});
+		const { firstPrompt } = await startStreamingPrompt();
+		try {
+			expect(session.isStreaming).toBe(true);
+			await expect(session.steer("Steering message")).resolves.toBe("queued");
+			expect(session.pendingMessageCount).toBe(1);
+		} finally {
+			await session.abort();
+			await firstPrompt.catch(() => {});
+		}
 	});
 
 	it("should allow followUp() while streaming", async () => {
-		await createSession();
-
-		// Start first prompt
-		const firstPrompt = session.prompt("First message");
-		await new Promise((resolve) => setTimeout(resolve, 10));
-
-		// followUp should work while streaming
-		await expect(session.followUp("Follow-up message")).resolves.toBe("queued");
-		expect(session.pendingMessageCount).toBe(1);
-
-		// Cleanup
-		await session.abort();
-		await firstPrompt.catch(() => {});
+		// A slow extension must not make this test queue or abort before streaming starts.
+		await createSession(50);
+		const { firstPrompt } = await startStreamingPrompt();
+		try {
+			expect(session.isStreaming).toBe(true);
+			await expect(session.followUp("Follow-up message")).resolves.toBe("queued");
+			expect(session.pendingMessageCount).toBe(1);
+		} finally {
+			await session.abort();
+			await firstPrompt.catch(() => {});
+		}
 	});
 
 	it("should queue extension-origin steering messages while streaming", async () => {
@@ -268,8 +289,7 @@ describe("AgentSession concurrent prompt guard", () => {
 			}
 		});
 
-		const firstPrompt = session.prompt("First message");
-		await new Promise((resolve) => setTimeout(resolve, 10));
+		const { firstPrompt } = await startStreamingPrompt();
 		expect(session.isStreaming).toBe(true);
 
 		const pi = (
