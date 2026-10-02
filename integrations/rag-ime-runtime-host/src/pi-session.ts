@@ -2,7 +2,7 @@ import { createHash, randomUUID } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { readdir } from "node:fs/promises";
 import { resolve } from "node:path";
-import { type Api, getSupportedThinkingLevels, type Model } from "@earendil-works/pi-ai";
+import { type Api, getSupportedThinkingLevels, type Model, type ModelsClassifierOptions } from "@earendil-works/pi-ai";
 import {
 	type AgentSession,
 	type AgentSessionEvent,
@@ -70,6 +70,7 @@ import {
 	TURN_SETTLEMENT_CUSTOM_TYPE,
 	TurnSettlementTracker,
 } from "./turn-settlement.ts";
+import { MANAGED_CLASSIFIER } from "./classification.ts";
 import { createWorkflowControlExtension } from "./workflow-control.ts";
 
 export interface PiSessionOpenOptions {
@@ -87,6 +88,7 @@ export interface PiSessionOpenOptions {
 	piSkillsEnabled?: boolean;
 	codexSkillsEnabled?: boolean;
 	modelRuntime: ModelRuntime;
+	classifierOptions?: ModelsClassifierOptions;
 	provider?: string;
 	modelId?: string;
 	thinkingLevel?: NonNullable<CreateAgentSessionOptions["thinkingLevel"]>;
@@ -880,7 +882,7 @@ export class PiProductSession implements PooledSession {
 				{
 					name: "builtin:codemode",
 					builtin: true,
-					factory: createCodemodeExtension({ get mode() { return codemodeState.mode === "only" ? "only" : "on"; }, models: false }),
+					factory: createCodemodeExtension({ get mode() { return codemodeState.mode === "only" ? "only" : "on"; }, models: {allowed: [MANAGED_CLASSIFIER]}, classifierOptions: options.classifierOptions }),
 				},
 				...(roomBound
 					? []

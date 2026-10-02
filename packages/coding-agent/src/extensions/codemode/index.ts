@@ -6,9 +6,10 @@
  * `setActiveTools()`; the MCP extension activates it when MCP tools are only reachable from scripts.
  */
 
+import type { ModelsClassifierOptions } from "@earendil-works/pi-ai";
 import type { ExtensionAPI, ExtensionFactory } from "../../core/extensions/types.ts";
 import type { CodemodeMode } from "../../core/settings-manager.ts";
-import { createCodemodeToolDefinition } from "./tool.ts";
+import { type CodemodeModelPolicy, createCodemodeToolDefinition } from "./tool.ts";
 
 export interface CodemodeExtensionOptions {
 	/** Overrides the `codemode.mode` setting. */
@@ -16,7 +17,9 @@ export interface CodemodeExtensionOptions {
 	/** Overrides the `codemode.inlineBudget` setting. */
 	inlineBudget?: number;
 	/** Expose the model catalog and classifiers to scripts as `models`. Default: `true`. */
-	models?: boolean;
+	models?: CodemodeModelPolicy;
+	/** Private options supplied by the embedding host, not scripts. */
+	classifierOptions?: ModelsClassifierOptions;
 }
 
 function readMode(pi: ExtensionAPI): CodemodeMode {
@@ -33,7 +36,10 @@ export function createCodemodeExtension(options: CodemodeExtensionOptions = {}):
 		pi.registerTool({
 			...createCodemodeToolDefinition({
 				appendEntry: (customType, data) => pi.appendEntry(customType, data),
-				models: options.models ?? true,
+				get models() {
+					return options.models ?? true;
+				},
+				classifierOptions: options.classifierOptions,
 				getToolNamespace: (name) => pi.getAllTools().find((tool) => tool.name === name)?.namespace,
 				getMode: () => options.mode ?? readMode(pi),
 				getInlineBudget: () => options.inlineBudget ?? readInlineBudget(pi),

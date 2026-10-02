@@ -395,7 +395,29 @@ export async function executeCodemode(
 		globals: [
 			...createDiscoveryGlobals(callable, samples, options),
 			...(options.models && ctx
-				? createModelGlobals(ctx.modelRegistry, toolCallId, calls, publish, addModelUsage, addGeneratedImages)
+				? createModelGlobals(
+						ctx.modelRegistry,
+						toolCallId,
+						calls,
+						publish,
+						addModelUsage,
+						addGeneratedImages,
+						options,
+					).map((global) => ({
+						...global,
+						execute: (
+							args: Parameters<CodemodeTool["execute"]>[0],
+							context: Parameters<CodemodeTool["execute"]>[1],
+						) => {
+							const promise = Promise.resolve().then(() => global.execute(args, context));
+							pendingToolCalls.add(promise);
+							void promise.then(
+								() => pendingToolCalls.delete(promise),
+								() => pendingToolCalls.delete(promise),
+							);
+							return promise;
+						},
+					}))
 				: []),
 		],
 		timeoutMs: sourceOptions.timeoutMs ?? Number.POSITIVE_INFINITY,
@@ -558,9 +580,30 @@ function createModelGlobals(
 	publish: () => void,
 	addUsage: (usage: Usage) => void,
 	addGeneratedImages: (count: number) => void,
+	options: CodemodeToolOptions,
 ): CodemodeTool[] {
 	const limit = createLimiter(MAX_CONCURRENT_MODEL_CALLS);
 	let callCount = 0;
+	const allowed = (type: ModelType, provider: string, id: string) =>
+		options.models === true ||
+		(typeof options.models === "object" &&
+			options.models.allowed.some((ref) => ref.type === type && ref.provider === provider && ref.id === id));
+	const visible = (model: AnyModel) => allowed(model.type ?? "chat", model.provider, model.id);
+	const info = (model: AnyModel): Record<string, unknown> =>
+		options.models === true
+			? toModelInfo(model)
+			: {
+					type: model.type ?? "chat",
+					provider: model.provider,
+					id: model.id,
+					name: model.name,
+					api: model.api,
+					input: model.input,
+					cost: model.cost,
+				};
+	const requireAllowed = (type: ModelType, provider: string, id: string) => {
+		if (!allowed(type, provider, id)) throw new Error("Model reference is not allowed by the host policy");
+	};
 
 	/**
 	 * Resolve the script's model by provider and id only, check the context, then run the call as a
@@ -570,6 +613,7 @@ function createModelGlobals(
 		name: string,
 		type: TType,
 		[model, context]: unknown[],
+		signal: AbortSignal,
 		checkContext: (context: unknown) => TContext,
 		run: (resolved: ModelTypeMap[TType], context: TContext) => Promise<TResult>,
 	): Promise<TResult> => {
@@ -585,6 +629,7 @@ function createModelGlobals(
 			);
 		}
 		const { provider, id } = model;
+		requireAllowed(type, provider, id);
 		const ref = `${provider}/${id}`;
 		const resolved = models.getModelOfType(type, provider, id);
 		if (!resolved) {
@@ -608,26 +653,45 @@ function createModelGlobals(
 		calls.push(record);
 		publish();
 		const startedAt = performance.now();
-		const result = await limit(() => run(resolved, checked));
-		record.durationMs = performance.now() - startedAt;
-		record.status = result.stopReason === "stop" ? "ok" : result.stopReason === "aborted" ? "cancelled" : "error";
-		if (result.errorMessage) record.error = truncateText(result.errorMessage, ERROR_PREVIEW_CHARS);
-		if (result.usage) {
-			record.cost = result.usage.cost.total;
-			addUsage(result.usage);
+		try {
+			const result = await limit(() => {
+				requireAllowed(type, provider, id);
+				signal.throwIfAborted();
+				return run(resolved, checked);
+			});
+			const safe =
+				options.models === true || !result.errorMessage
+					? result
+					: {
+							...result,
+							errorMessage:
+								result.stopReason === "aborted" ? "Model call was aborted" : "Native model call failed",
+						};
+			record.status = safe.stopReason === "stop" ? "ok" : safe.stopReason === "aborted" ? "cancelled" : "error";
+			if (safe.errorMessage) record.error = truncateText(safe.errorMessage, ERROR_PREVIEW_CHARS);
+			if (safe.usage) {
+				record.cost = safe.usage.cost.total;
+				addUsage(safe.usage);
+			}
+			return safe;
+		} catch (error) {
+			record.status = signal.aborted ? "cancelled" : "error";
+			record.error = "Native model call did not complete";
+			throw error;
+		} finally {
+			record.durationMs = performance.now() - startedAt;
+			publish();
 		}
-		publish();
-		return result;
 	};
 	const implementations: Record<string, CodemodeTool["execute"]> = {
 		"models.getModelsOfType": (args) => {
 			const [type, provider] = args as unknown[];
-			return models.getModelsOfType(toModelType(type), toProvider(provider)).map(toModelInfo);
+			return models.getModelsOfType(toModelType(type), toProvider(provider)).filter(visible).map(info);
 		},
 		"models.getAvailableOfType": async (args, { signal }) => {
 			const [type, provider] = args as unknown[];
 			const available = await models.getAvailableOfType(toModelType(type), toProvider(provider), { signal });
-			return available.map(toModelInfo);
+			return available.filter(visible).map(info);
 		},
 		"models.getModelOfType": (args) => {
 			const [type, provider, id] = args as unknown[];
@@ -637,17 +701,23 @@ function createModelGlobals(
 				);
 			}
 			const model = models.getModelOfType(toModelType(type), provider, id);
-			return model === undefined ? undefined : toModelInfo(model);
+			return model === undefined || !visible(model) ? undefined : info(model);
 		},
 		"models.classify": (args, { signal }) =>
-			runModelCall("models.classify", "classifier", args as unknown[], checkClassifierContext, (resolved, context) =>
-				models.classify(resolved, context, { signal }),
+			runModelCall(
+				"models.classify",
+				"classifier",
+				args as unknown[],
+				signal,
+				checkClassifierContext,
+				(resolved, context) => models.classify(resolved, context, { ...options.classifierOptions, signal }),
 			),
 		"models.generateImages": (args, { signal }) =>
 			runModelCall(
 				"models.generateImages",
 				"image",
 				args as unknown[],
+				signal,
 				checkImagesContext,
 				async (resolved, context) => {
 					const result = await models.generateImages(resolved, context, { signal });
@@ -656,5 +726,10 @@ function createModelGlobals(
 				},
 			),
 	};
+	if (options.models !== true) {
+		const types = new Set(typeof options.models === "object" ? options.models.allowed.map((ref) => ref.type) : []);
+		if (!types.has("classifier")) delete implementations["models.classify"];
+		if (!types.has("image")) delete implementations["models.generateImages"];
+	}
 	return Object.entries(implementations).map(([name, execute]) => ({ name, spread: true, execute }));
 }

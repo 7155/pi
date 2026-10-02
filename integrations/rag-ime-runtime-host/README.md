@@ -90,12 +90,62 @@ actual mode only while idle and returns the effective `codemodeMode`.
 Snapshots and fork profiles preserve that state. The sandbox calls the same
 registered tools through the original product Gateway; nested calls keep
 `parentToolCallId` and Pi persists their exact arguments in
-`ToolResultMessage.nestedCalls`. The extension's optional model helpers are
-disabled so they cannot bypass the product's model and Room routing.
+`ToolResultMessage.nestedCalls`. Managed Sessions expose the native `models`
+namespace with one typed allowed reference: classifier `typesafe/jev-latest`.
+Catalog getters filter all other references and omit connection headers/URLs;
+classification checks the current policy again after the native four-call
+limiter. Image generation is not exposed. Existing SDK `models: true` and
+`models: false` behavior remains compatible for other embeddings.
+
+Classifier calls use Pi's existing `ModelRuntime.classify`, cancellation signal,
+and nested usage/cost rows. Script-supplied connection/auth fields never select
+the transport. Managed Host options supply a direct, caller-owned HTTP fetch
+without changing other Providers' proxy dispatcher. The optional owned
+`RAG_IME_PI_TYPESAFE_ENDPOINT` environment value is a trusted **complete** HTTP(S)
+endpoint, not a base URL or model argument. `TYPESAFE_API_KEY` uses Pi's native
+read-only environment auth. CodeMode observes key/endpoint configuration at Host
+startup; changes require the next Host startup, without automatic restart or
+credential-file writes.
 
 The relocated Runtime payload must include the native codemode worker and
 QuickJS WASM. The explicit test-only `codemode` scenario exercises these
 assets through normal Session RPC; it is not a live model or Room acceptance.
+
+## Stateless native classification
+
+Protocol 2 additively advertises `statelessClassification`. `classification.once`
+accepts an opaque bounded `requestId`, optional opaque `dispatchId`, JSON `state`
+object, a non-empty native Choice/Score `questions` map, and `timeoutMs` between
+1 and 300000. A private per-request `apiKey` and trusted complete `endpoint` may
+be supplied by the product adapter; neither belongs in model context, events,
+transcripts, or public status. Each call uses fresh supplied auth, Pi's canonical
+`typesafe/jev-latest` classifier, and `maxRetries: 0`. It creates no Agent Session
+and does not consume a Session-pool slot.
+
+The result preserves `requestId`, optional `dispatchId`, `provider`, `model`,
+`stopReason` (`stop`, `error`, or `aborted`), native `answers`, and available
+`usage`. Provider errors return safe generic messages; no native error, timeout,
+abort, or uncertain response is converted to successful empty answers or retried
+through a legacy client. Product-specific probability/route validation remains
+with the existing product adapter. An unsupported older Host can be detected
+before sending; this capability alone does not install or activate a new payload.
+
+`classification.abort` signals only the exact active classification ID. Supplying
+`dispatchId` also compares the original dispatch and rejects a replacement with
+`CLASSIFICATION_TARGET_MISMATCH`. Active duplicates reject with
+`CLASSIFICATION_ALREADY_ACTIVE`; IDs may be reused after settlement. Legacy
+callers without `dispatchId` retain request-ID-only behavior. The abort result's
+`aborted` means signal requested, `active` means the target was found, and
+`drained` proves the native operation exited within the bounded wait. Unknown IDs
+return all three values false. A non-cooperative request stays active after an
+undrained cancellation; it cannot be replayed while its outcome is unknown.
+
+Only after its provider operation exits and original RunScope settles does the
+Host emit `runtime.notice` with `payload.type: classification_settled`, original
+request/dispatch IDs, and `stopReason`. Paired clients bind this notice to the
+original Host connection and dispatch, so a lost RPC reply can settle without
+releasing a newer call. Classification, stateless completion, and Session Stop
+have separate identity maps and never cancel one another.
 
 ## Stable prompt prefix and discovery
 
@@ -215,4 +265,4 @@ npm run test:rag-ime-runtime-host
 
 The focused test command covers protocol framing, Session lifecycle, context
 refresh, tool and Skill discovery, plugins, workflow control, lifecycle outbox,
-stateless completions, and concurrency behavior.
+stateless completions/classification, bounded native CodeMode models, and concurrency behavior.

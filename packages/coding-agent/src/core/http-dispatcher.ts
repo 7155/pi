@@ -78,6 +78,27 @@ function createUndiciOriginDispatcher(origin: string | URL, options: object): un
 	);
 }
 
+/** A caller-owned direct transport; does not change the process proxy dispatcher. */
+export function createDirectHttpFetch(): { fetch: typeof globalThis.fetch; close(): Promise<void> } {
+	const dispatcher = withUndiciErrorListener(
+		new undici.Agent({
+			allowH2: false,
+			bodyTimeout: DEFAULT_HTTP_IDLE_TIMEOUT_MS,
+			headersTimeout: DEFAULT_HTTP_IDLE_TIMEOUT_MS,
+			connect: { autoSelectFamilyAttemptTimeout: DEFAULT_AUTO_SELECT_FAMILY_ATTEMPT_TIMEOUT_MS },
+			factory: createUndiciOriginDispatcher,
+		}),
+	);
+	return {
+		fetch: ((input, init) =>
+			undici.fetch(
+				input as Parameters<typeof undici.fetch>[0],
+				{ ...init, dispatcher } as Parameters<typeof undici.fetch>[1],
+			)) as typeof globalThis.fetch,
+		close: () => dispatcher.close(),
+	};
+}
+
 export function configureHttpDispatcher(timeoutMs: number = DEFAULT_HTTP_IDLE_TIMEOUT_MS): void {
 	const normalizedTimeoutMs = parseHttpIdleTimeoutMs(timeoutMs);
 	if (normalizedTimeoutMs === undefined) {

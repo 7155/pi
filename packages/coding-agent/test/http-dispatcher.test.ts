@@ -3,7 +3,7 @@ import net from "node:net";
 import tls from "node:tls";
 import * as undici from "undici";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { applyHttpProxySettings, configureHttpDispatcher } from "../src/core/http-dispatcher.ts";
+import { applyHttpProxySettings, configureHttpDispatcher, createDirectHttpFetch } from "../src/core/http-dispatcher.ts";
 
 const PROXY_ENV_KEYS = ["HTTP_PROXY", "HTTPS_PROXY"] as const;
 const DISPATCHER_PROXY_ENV_KEYS = [...PROXY_ENV_KEYS, "http_proxy", "https_proxy", "NO_PROXY", "no_proxy"] as const;
@@ -143,6 +143,39 @@ describe("http dispatcher", () => {
 			await Promise.all([
 				new Promise<void>((resolve) => proxy.close(() => resolve())),
 				new Promise<void>((resolve) => origin.close(() => resolve())),
+			]);
+		}
+	});
+
+	it("uses a caller-owned direct fetch without changing other providers' proxy dispatcher", async () => {
+		const origin = http.createServer((_request, response) => response.end("native classifier"));
+		await new Promise<void>((resolve) => origin.listen(0, "127.0.0.1", resolve));
+		const address = origin.address();
+		if (!address || typeof address === "string") throw new Error("Origin did not bind");
+		const proxyConnections: net.Socket[] = [];
+		const proxy = net.createServer((client) => {
+			proxyConnections.push(client);
+			client.end();
+		});
+		await new Promise<void>((resolve) => proxy.listen(0, "127.0.0.1", resolve));
+		const proxyAddress = proxy.address();
+		if (!proxyAddress || typeof proxyAddress === "string") throw new Error("Proxy did not bind");
+		process.env.HTTP_PROXY = `http://127.0.0.1:${proxyAddress.port}`;
+		configureHttpDispatcher();
+		const proxyDispatcher = undici.getGlobalDispatcher();
+		const transport = createDirectHttpFetch();
+		try {
+			const response = await transport.fetch(`http://127.0.0.1:${address.port}/trusted/full-endpoint`);
+			expect(await response.text()).toBe("native classifier");
+			expect(proxyConnections).toHaveLength(0);
+			expect(undici.getGlobalDispatcher()).toBe(proxyDispatcher);
+		} finally {
+			await transport.close();
+			for (const client of proxyConnections) client.destroy();
+			origin.closeAllConnections();
+			await Promise.all([
+				new Promise<void>((resolve) => origin.close(() => resolve())),
+				new Promise<void>((resolve) => proxy.close(() => resolve())),
 			]);
 		}
 	});

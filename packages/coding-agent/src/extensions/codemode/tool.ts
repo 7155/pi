@@ -23,6 +23,7 @@
 
 import { join } from "node:path";
 import type { AgentTool } from "@earendil-works/pi-agent-core";
+import type { ModelsClassifierOptions, ModelType } from "@earendil-works/pi-ai";
 import type { CodemodeJsonSchema, CodemodeTool } from "@earendil-works/pi-codemode";
 import {
 	MCP_TYPESCRIPT_PREAMBLE,
@@ -63,6 +64,13 @@ export type CodemodeModelRuntime = Pick<
 	"getModelsOfType" | "getAvailableOfType" | "getModelOfType" | "classify" | "generateImages"
 >;
 
+/** Boolean policies retain native SDK behavior; allowed references bound catalog and execution. */
+export type CodemodeModelPolicy =
+	| boolean
+	| {
+			readonly allowed: readonly { readonly type: ModelType; readonly provider: string; readonly id: string }[];
+	  };
+
 export interface CodemodeToolOptions {
 	/** Namespace of a tool, for `searchTools()` ranking and its `namespace` filter. */
 	getToolNamespace?: (toolName: string) => ToolNamespace | undefined;
@@ -70,7 +78,9 @@ export interface CodemodeToolOptions {
 	 * Expose the `models` namespace to scripts, backed by the session's model registry
 	 * (`ctx.modelRegistry`). Without it, `models` is not declared.
 	 */
-	models?: boolean;
+	models?: CodemodeModelPolicy;
+	/** Trusted host options, never script arguments or catalog data. */
+	classifierOptions?: ModelsClassifierOptions;
 	/**
 	 * Persists `store()` writes as a session custom entry. Without it, writes last only for the
 	 * current script; `load()` still reads entries already on the branch.
@@ -137,7 +147,7 @@ const DESCRIPTION_INTRO = `Run JavaScript that calls other tools. The input is r
 - Optional first line: \`// @options: {"max_output_tokens": 10000, "timeout_ms": 60000}\``;
 
 /** One line per global. The details live in {@link CODEMODE_DOCS_PATH}. */
-function describeGlobals(models: boolean): string {
+function describeGlobals(models: CodemodeModelPolicy | undefined): string {
 	const lines = [
 		"Globals:",
 		"- `text(value)`, `image(dataUrlOrImageBlock)`, `console.log(...)`, and top-level `return` add output; `exit()` ends the script.",
@@ -145,7 +155,21 @@ function describeGlobals(models: boolean): string {
 		"- `ALL_TOOLS`, `searchTools(query, { limit?, namespace? })`, `describeTool(name)`, `describeNamespace(name)`: find unlisted tools, such as MCP tools.",
 	];
 	if (models) {
-		lines.push(`- \`models\`: classifiers and image generation. Read ${CODEMODE_DOCS_PATH} first.`);
+		const capabilities =
+			models === true
+				? "classifiers and image generation"
+				: [
+						...new Set(
+							models.allowed.map((ref) =>
+								ref.type === "classifier"
+									? "classifiers"
+									: ref.type === "image"
+										? "image generation"
+										: "chat catalog",
+							),
+						),
+					].join(", ");
+		lines.push(`- \`models\`: ${capabilities || "no allowed models"}. Read ${CODEMODE_DOCS_PATH} first.`);
 	}
 	return lines.join("\n");
 }
@@ -172,7 +196,7 @@ export function getCodemodeCallableTools(tools: readonly AgentTool<any>[]): Agen
 
 export interface CodemodeDescriptionOptions {
 	/** Declare the `models` namespace; only for tools created with model access. */
-	models?: boolean;
+	models?: CodemodeModelPolicy;
 	/** Namespace of each tool, by tool name. Tools of one namespace are listed under one heading. */
 	namespaces?: ReadonlyMap<string, ToolNamespace>;
 	/** Tools that are callable but never listed with their declaration (`deferred` exposure). */
@@ -255,7 +279,7 @@ export function createCodemodeDescription(
 	);
 	const shown = selectCatalog(ordered, options.inlineBudget);
 
-	const sections = [DESCRIPTION_INTRO, describeGlobals(options.models === true)];
+	const sections = [DESCRIPTION_INTRO, describeGlobals(options.models)];
 	if (
 		declarations.some(
 			(declaration) =>
@@ -345,7 +369,7 @@ function prepareCodemodeLoadout(loadout: ToolLoadout, options: CodemodeToolOptio
 		}),
 	);
 	descriptions[CODEMODE_TOOL_NAME] = createCodemodeDescription(listed, {
-		models: options.models === true,
+		models: options.models,
 		namespaces,
 		deferred: new Set(
 			listed.filter((tool) => loadout.getExposure(tool.name) === "deferred").map((tool) => tool.name),
@@ -369,7 +393,7 @@ export function createCodemodeToolDefinition(
 		name: CODEMODE_TOOL_NAME,
 		label: CODEMODE_TOOL_NAME,
 		// Replaced with the declarations of the callable tools when the tool is activated.
-		description: createCodemodeDescription([], { models: options.models === true }),
+		description: createCodemodeDescription([], { models: options.models }),
 		promptSnippet: codemodeToolSystemPromptContribution.snippet,
 		promptGuidelines: [...codemodeToolSystemPromptContribution.guidelines],
 		parameters: codemodeSchema,
@@ -396,7 +420,7 @@ export function createCodemodeTool(
 	const definition = createCodemodeToolDefinition(options);
 	const tool = wrapToolDefinition(definition);
 	Object.assign(tool, {
-		description: createCodemodeDescription(tools, { models: options.models === true }),
+		description: createCodemodeDescription(tools, { models: options.models }),
 		promptSnippet: definition.promptSnippet,
 		promptGuidelines: definition.promptGuidelines,
 	});

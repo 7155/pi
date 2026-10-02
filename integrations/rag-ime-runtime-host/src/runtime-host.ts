@@ -6,11 +6,13 @@ import {
 	type Api,
 	type AssistantMessage,
 	type Context,
+	type ClassifierResult,
 	getSupportedThinkingLevels,
 	type Model,
 	type ModelThinkingLevel,
 } from "@earendil-works/pi-ai";
-import { configureHttpDispatcher, ModelRuntime } from "@earendil-works/pi-coding-agent";
+import { configureHttpDispatcher, createDirectHttpFetch, ModelRuntime } from "@earendil-works/pi-coding-agent";
+import { classificationDispatch, classificationId, classificationParams, MANAGED_CLASSIFIER, publicClassificationResult, trustedClassificationEndpoint } from "./classification.ts";
 import { pendingRoomCancellationSurfaces, roomCancellationSurfaces } from "./cancellation-receipts.ts";
 import { listBundledPiPackages } from "./bundled-package-catalog.ts";
 import { NativePiPackageManager } from "./native-package-manager.ts";
@@ -84,6 +86,9 @@ export interface RuntimeHostOptions {
 	pluginApprovalToken?: string;
 	allowedWorkspaceRoots?: string[];
 	modelRuntime?: ModelRuntime;
+	/** Private native transport injection for offline tests. */
+	classificationFetch?: typeof globalThis.fetch;
+	classificationEndpoint?: string;
 	emitEvent(event: RuntimeEventEnvelope): void;
 }
 
@@ -317,6 +322,14 @@ export class RagImeRuntimeHost {
 	private readonly options: RuntimeHostOptions;
 	private readonly allowedWorkspaceRoots: string[];
 	private readonly completions = new Map<string, RunScope>();
+ private readonly classifications = new Map<string, {scope: RunScope; dispatchId?: string}>();
+ private directClassificationTransport?: ReturnType<typeof createDirectHttpFetch>;
+ private classificationFetch(endpoint?: string): typeof globalThis.fetch {
+  const fetch = this.options.classificationFetch ?? (this.directClassificationTransport ??= createDirectHttpFetch()).fetch;
+  const target = trustedClassificationEndpoint(endpoint ?? this.options.classificationEndpoint);
+  return (input, init) => fetch(target ?? input, init);
+ }
+
 	private readonly roomReceipts = new Map<string, Record<string, unknown>>();
 	private readonly roomCancelOperations = new Map<string, RoomCancelOperation>();
 	private readonly roomCancelFences = new Map<string, RoomCancelParams>();
@@ -373,6 +386,10 @@ export class RagImeRuntimeHost {
 	}
 
 	async dispose(): Promise<void> {
+  await Promise.allSettled([...this.classifications.values()].map(async ({scope}) => {
+   await scope.cancel("runtime_host_disposed");
+   await scope.awaitDrained(1000);
+  }));
 		await Promise.all(
 			[...this.completions.values()].map(async (scope) => {
 				await scope.cancel("runtime_host_disposed");
@@ -383,6 +400,7 @@ export class RagImeRuntimeHost {
 		this.roomCancelOperations.clear();
 		this.roomCancelFences.clear();
 		await this.sessions.dispose();
+		await this.directClassificationTransport?.close();
 	}
 
 	private clearRoomStateForSession(sessionId: string): void {
@@ -553,6 +571,7 @@ export class RagImeRuntimeHost {
 						conversationRewrite: true,
 						activeTurnMessaging: true,
 						statelessCompletion: true,
+						statelessClassification: true,
 						codemode: { available: true, modes: ["on", "only", "off"], defaultMode: "on" },
 						nativeMcpExecutionPolicy: true,
 						transientContext: true,
@@ -586,6 +605,44 @@ export class RagImeRuntimeHost {
 				models.sort((left, right) => `${left.provider}/${left.id}`.localeCompare(`${right.provider}/${right.id}`));
 				return { models: models.map(publicModel), error: this.modelRuntime.getError() ?? "" };
 			}
+   case "classification.once": {
+    const {requestId, dispatchId, context, timeoutMs, apiKey, endpoint} = classificationParams(params);
+    if (this.classifications.has(requestId)) throw new RuntimeProtocolError("CLASSIFICATION_ALREADY_ACTIVE", "Classification request is already active");
+    const model = this.modelRuntime.getModelOfType("classifier", MANAGED_CLASSIFIER.provider, MANAGED_CLASSIFIER.id);
+    if (!model) throw new RuntimeProtocolError("CLASSIFIER_NOT_FOUND", "Managed native classifier is unavailable");
+    const scope = new RunScope({scopeId: `classification:${requestId}`, sessionId: `stateless-classification:${requestId}`,
+     runId: `classification:${requestId}`, kind: "provider"});
+    const release = scope.register({operationId: `classification-provider:${requestId}`, kind: "provider", cancel: () => undefined});
+    const active = {scope, dispatchId};
+    this.classifications.set(requestId, active);
+    let stopReason: ClassifierResult["stopReason"] = "error";
+    try {
+     const result = await this.modelRuntime.classify(model, context, {apiKey, timeoutMs, maxRetries: 0,
+      signal: scope.signal, fetch: this.classificationFetch(endpoint)});
+     const receipt = publicClassificationResult(requestId, result, scope.signal.aborted, dispatchId);
+     stopReason = receipt.stopReason;
+     return receipt;
+    } catch {
+     stopReason = scope.signal.aborted ? "aborted" : "error";
+     return {requestId, ...(dispatchId === undefined ? {} : {dispatchId}), provider: MANAGED_CLASSIFIER.provider, model: MANAGED_CLASSIFIER.id, stopReason, answers: {},
+      errorCode: stopReason === "aborted" ? "CLASSIFICATION_ABORTED" : "CLASSIFICATION_FAILED", errorMessage: "Native classification did not complete"};
+    } finally {
+     release(); scope.settle();
+     if (this.classifications.get(requestId) === active) this.classifications.delete(requestId);
+     this.options.emitEvent({protocolVersion: PROTOCOL_VERSION, event: "runtime.notice", sessionId: `stateless-classification:${requestId}`, sequence: 1, payload: {type: "classification_settled", requestId, ...(dispatchId === undefined ? {} : {dispatchId}), stopReason}});
+    }
+   }
+   case "classification.abort": {
+    const requestId = classificationId(params);
+    const dispatchId = classificationDispatch(params);
+    const active = this.classifications.get(requestId);
+    const identity = {requestId, ...(dispatchId === undefined ? {} : {dispatchId})};
+    if (!active) return {...identity, aborted: false, active: false, drained: false};
+    if (dispatchId !== undefined && active.dispatchId !== dispatchId) throw new RuntimeProtocolError("CLASSIFICATION_TARGET_MISMATCH", "Classification dispatch is no longer active");
+    const {scope} = active;
+    await scope.cancel("classification_aborted");
+    return {...identity, aborted: true, active: true, drained: await scope.awaitDrained(1000)};
+   }
 			case "completion.once": {
 				const requestId = completionIdParam(params);
 				const provider = requiredString(params, "provider", 80);
@@ -829,6 +886,7 @@ export class RagImeRuntimeHost {
 						piSkillsEnabled: optionalBoolean(params, "piSkillsEnabled"),
 						codexSkillsEnabled: optionalBoolean(params, "codexSkillsEnabled"),
 						modelRuntime: this.modelRuntime,
+						classifierOptions: {maxRetries: 0, fetch: this.classificationFetch()},
 						provider,
 						modelId,
 						thinkingLevel: thinking as ModelThinkingLevel | undefined,
@@ -917,6 +975,7 @@ export class RagImeRuntimeHost {
 							piSkillsEnabled: profile.piSkillsEnabled,
 							codexSkillsEnabled: profile.codexSkillsEnabled,
 							modelRuntime: this.modelRuntime,
+						classifierOptions: {maxRetries: 0, fetch: this.classificationFetch()},
 							provider: profile.provider,
 							modelId: profile.modelId,
 							thinkingLevel: profile.thinkingLevel,
@@ -1397,6 +1456,7 @@ export function runtimeHostOptionsFromEnvironment(
 		toolGatewayToken: process.env.RAG_IME_TOOL_GATEWAY_TOKEN,
 		pluginApprovalToken: process.env.RAG_IME_PLUGIN_APPROVAL_TOKEN,
 		allowedWorkspaceRoots: roots,
+		classificationEndpoint: process.env.RAG_IME_PI_TYPESAFE_ENDPOINT,
 		emitEvent,
 	};
 }
