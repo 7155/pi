@@ -101,8 +101,11 @@ and cancellation operations have joined.
 Opening or reading history is passive. Unfinished native input is reported as
 `paused`, `recoverable` and an exact `activeTurn`. `session.resume` takes the
 original turn/client IDs, never resubmits a prompt, and returns saved settlement
-for terminal input. Lost admission responses reuse the same request; changed
-arguments conflict before native deduplication. Public full history paginates
+for terminal input. Empty or completed Sessions instead report `isIdle: true`,
+`paused: false`, `recoverable: false` and no `activeTurn`, even though passive
+open leaves the native scheduler paused. They accept a new input without a
+resume request or replaying completed work. Lost admission responses reuse the
+same request; changed arguments conflict before native deduplication. Public full history paginates
 native entries independently of the compacted model-context head. Recent views
 remain bounded and preserve original message and Tool identities.
 

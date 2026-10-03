@@ -488,11 +488,14 @@ export class DurableProductSession implements PooledSession {
 
 	private metadata(): Record<string, unknown> {
 		const request = this.currentRequest();
+		// Passive open leaves native scheduling paused even when no work remains.
+		// Product pause describes unfinished work, not whether the scheduler has started.
+		const paused = this.scheduling === "paused" && !this.isIdle;
 		const model = this.agent.model ? this.options.modelRuntime.getModel(this.agent.model.provider, this.agent.model.modelId) : undefined;
 		return { sessionId: this.externalSessionId, runtimeEngine: "durable", piSessionId: this.state.runtimeSessionId,
 			durableStoreRef: this.durableStoreRef, durableConversationId: String(this.conversation.id), cwd: this.options.cwd,
-			engineCapabilities: DURABLE_ENGINE_CAPABILITIES, paused: this.scheduling === "paused",
-			recoverable: this.scheduling === "paused" && !!request, isIdle: this.isIdle, isCompacting: !!this.live.compactions?.length,
+			engineCapabilities: DURABLE_ENGINE_CAPABILITIES, paused,
+			recoverable: paused && !!request, isIdle: this.isIdle, isCompacting: !!this.live.compactions?.length,
 			activeTurn: request ? identity(request) : undefined, sequence: this.sequence, codemodeMode: "off", thinkingLevel: this.agent.thinkingLevel ?? "off",
 			model: model ? { provider: model.provider, id: model.id, name: model.name, api: model.api, reasoning: model.reasoning,
 				input: [...model.input], contextWindow: model.contextWindow, maxTokens: model.maxTokens, thinkingLevels: getSupportedThinkingLevels(model) } : null,
