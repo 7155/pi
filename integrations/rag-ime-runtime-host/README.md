@@ -139,6 +139,17 @@ recovery, exact generation cancellation, delayed drain, projection gaps and
 history after compaction. It establishes controlled native behavior, not
 configured Provider or installed foreground acceptance.
 
+Durable generation and compaction retries read Pi's existing `retry` settings
+through `SettingsManager`, using the same managed agent directory and trusted
+project-setting precedence as Classic. Explicit `retry.enabled: false` prevents
+new outer retry attempts; enabled `maxRetries: 1` permits one retry after the
+initial attempt. Missing settings retain native defaults. Reading the settings
+does not write configuration, and each passive reopen reloads them without
+starting work. It does not rewrite existing native retry checkpoints or change
+the separate provider/transport retry settings. PAW's preparation fills missing
+retry fields only, so its environment defaults do not replace explicit values
+already present in `settings.json`.
+
 ### Standalone Durable compaction recovery
 
 `hello.capabilities.sessionCompactionRecovery` and Durable

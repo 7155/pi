@@ -895,6 +895,7 @@ export class RagImeRuntimeHost {
 					if (canonical !== join(managedRoot, "durable", sessionId)) throw new RuntimeProtocolError("SESSION_PATH_DENIED", "Durable storage symlink binding is not allowed");
 					const opened = await this.sessions.open(sessionId, () => DurableProductSession.create({
 						externalSessionId: sessionId, cwd, durableStoreRef: canonical, modelRuntime: this.modelRuntime,
+						agentDir: this.options.agentDir,
 						provider, modelId, thinkingLevel: thinking as ModelThinkingLevel | undefined,
 						toolManifest: params.toolManifest ?? [], toolGatewayUrl: this.options.toolGatewayUrl, toolGatewayToken: this.options.toolGatewayToken,
 						systemPrompt: optionalString(params, "systemPrompt", 64_000), sessionContext: optionalString(params, "sessionContext", 256_000),

@@ -3,7 +3,7 @@ import { mkdir, realpath } from "node:fs/promises";
 import { join, resolve } from "node:path";
 import { BACKGROUND_CONTEXT } from "@earendil-works/chord/context";
 import { type AssistantMessage, clampThinkingLevel, getSupportedThinkingLevels, type ModelThinkingLevel, Type } from "@earendil-works/pi-ai";
-import type { ModelRuntime, PromptOptions } from "@earendil-works/pi-coding-agent";
+import { type ModelRuntime, type PromptOptions, SettingsManager } from "@earendil-works/pi-coding-agent";
 import {
 	AgentDoc, type AgentEvent, type AgentEventStream, type AgentState, type CommitPublication, CompactionTask, type Conversation,
 	createRegistry, defineDoc, defineExtension, defineTool, type EntryRecord, Harness, type InboxState,
@@ -71,6 +71,7 @@ const ProductDoc = defineDoc<ProductState>({
 export interface DurableSessionOpenOptions {
 	externalSessionId: string;
 	cwd: string;
+	agentDir: string;
 	durableStoreRef: string;
 	modelRuntime: ModelRuntime;
 	provider?: string;
@@ -175,12 +176,14 @@ export class DurableProductSession implements PooledSession {
 		let harness: Harness | undefined;
 		try {
 			const registry = createRegistry();
+			const settings = SettingsManager.create(options.cwd, options.agentDir, { projectTrusted: true });
 			const tools = new BackendToolRegistry();
 			tools.sync(options.toolManifest);
 			let product: DurableProductSession | undefined;
 			// The registry is empty until the one product adapter attaches. Opening never executes tools.
 			harness = await Harness.open(await openNodeSqliteStorage(join(directory, "session.sqlite")), {
 				models: options.modelRuntime, registry,
+				settings: { retry: settings.getRetrySettings() },
 				onReport: error => product?.notice(error),
 			}, context);
 			let state = await harness.snapshot(ProductDoc, context);
