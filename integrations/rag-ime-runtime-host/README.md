@@ -145,8 +145,14 @@ project-setting precedence as Classic. Explicit `retry.enabled: false` prevents
 new outer retry attempts; enabled `maxRetries: 1` permits one retry after the
 initial attempt. Missing settings retain native defaults. Reading the settings
 does not write configuration, and each passive reopen reloads them without
-starting work. It does not rewrite existing native retry checkpoints or change
-the separate provider/transport retry settings. PAW's preparation fills missing
+starting work. It does not rewrite existing native retry checkpoints. The
+separate `transport` and `retry.provider` settings (`timeoutMs`, `maxRetries`,
+`maxRetryDelayMs`) are forwarded through native Harness stream settings to both
+generation and compaction requests. Explicit `transport: "sse"` and
+`retry.provider.maxRetries: 0` disable automatic transport selection and
+provider-internal retries. Missing fields retain provider defaults. Already
+prepared native requests retain their checkpointed stream settings.
+PAW's preparation fills missing
 retry fields only, so its environment defaults do not replace explicit values
 already present in `settings.json`.
 

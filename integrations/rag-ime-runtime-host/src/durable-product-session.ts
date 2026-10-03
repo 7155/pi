@@ -183,7 +183,10 @@ export class DurableProductSession implements PooledSession {
 			// The registry is empty until the one product adapter attaches. Opening never executes tools.
 			harness = await Harness.open(await openNodeSqliteStorage(join(directory, "session.sqlite")), {
 				models: options.modelRuntime, registry,
-				settings: { retry: settings.getRetrySettings() },
+				settings: {
+					retry: settings.getRetrySettings(),
+					stream: { transport: settings.getTransport(), ...settings.getProviderRetrySettings() },
+				},
 				onReport: error => product?.notice(error),
 			}, context);
 			let state = await harness.snapshot(ProductDoc, context);

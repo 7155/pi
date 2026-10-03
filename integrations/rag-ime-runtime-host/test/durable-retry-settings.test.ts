@@ -1,14 +1,15 @@
 import { mkdir, mkdtemp, readFile, realpath, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { createFauxCore, fauxAssistantMessage } from "@earendil-works/pi-ai";
+import { createFauxCore, fauxAssistantMessage, type Transport } from "@earendil-works/pi-ai";
 import { ModelRuntime } from "@earendil-works/pi-coding-agent";
 import { DEFAULT_RETRY_POLICY, Harness } from "@earendil-works/pi-durable";
 import { describe, expect, it, vi } from "vitest";
 import type { RuntimeMethod } from "../src/protocol.ts";
 import { RagImeRuntimeHost } from "../src/runtime-host.ts";
 
-type RetrySettings = { enabled?: boolean; maxRetries?: number; baseDelayMs?: number; maxAgentDelayMs?: number };
+type RetrySettings = { enabled?: boolean; maxRetries?: number; baseDelayMs?: number; maxAgentDelayMs?: number;
+	provider?: { timeoutMs?: number; maxRetries?: number; maxRetryDelayMs?: number } };
 
 function record(value: unknown): Record<string, unknown> {
 	return (value ?? {}) as Record<string, unknown>;
@@ -18,21 +19,22 @@ function transientError() {
 	return fauxAssistantMessage("", { stopReason: "error", errorMessage: "503 service unavailable" });
 }
 
-async function fixture(retry?: RetrySettings) {
+async function fixture(retry?: RetrySettings, transport?: Transport) {
 	const directory = await realpath(await mkdtemp(join(tmpdir(), "pi-host-durable-retry-")));
 	const agentDir = join(directory, "agent");
 	const settingsPath = join(agentDir, "settings.json");
 	const writeSettings = async (value: RetrySettings) => {
 		await mkdir(agentDir, { recursive: true });
-		await writeFile(settingsPath, JSON.stringify({ retry: value }));
+		await writeFile(settingsPath, JSON.stringify({ retry: value, transport }));
 	};
 	if (retry) await writeSettings(retry);
 	const modelRuntime = await ModelRuntime.create({ authPath: join(directory, "test-auth.json"), modelsPath: null, allowModelNetwork: false });
 	const faux = createFauxCore({ api: "faux:durable-retry", provider: "durable-retry", models: [{ id: "local" }] });
 	const model = faux.getModel();
+	const providerStream = vi.fn(faux.streamSimple);
 	modelRuntime.registerProvider(model.provider, {
 		name: "offline retry fixture", baseUrl: "http://localhost.invalid", api: model.api,
-		apiKey: "test-only", streamSimple: faux.streamSimple,
+		apiKey: "test-only", streamSimple: providerStream,
 		models: [{ id: model.id, name: model.name, api: model.api, reasoning: model.reasoning,
 			input: model.input, cost: model.cost, contextWindow: model.contextWindow, maxTokens: model.maxTokens }],
 	});
@@ -56,11 +58,42 @@ async function fixture(retry?: RetrySettings) {
 		const ack = await invoke("session.prompt", { message, clientMessageId }, target);
 		return invoke("session.await_settled", { turnId: ack.turnId, clientMessageId, timeoutMs: 10_000 }, target);
 	};
-	return { directory, settingsPath, writeSettings, host, createHost, faux, invoke, open, turn,
+	return { directory, settingsPath, writeSettings, host, createHost, faux, providerStream, invoke, open, turn,
 		close: async () => { await Promise.all(hosts.map(item => item.dispose())); await rm(directory, { recursive: true, force: true }); } };
 }
 
 describe("Durable existing native retry settings", () => {
+	it("forwards explicit stream settings to generation and compaction without calling the provider during open", async () => {
+		const expected = { transport: "sse", timeoutMs: 4321, maxRetries: 0, maxRetryDelayMs: 1234 };
+		const f = await fixture({ enabled: false, provider: { timeoutMs: 4321, maxRetries: 0, maxRetryDelayMs: 1234 } }, "sse");
+		try {
+			const before = await readFile(f.settingsPath, "utf8");
+			f.faux.setResponses([fauxAssistantMessage("first"), fauxAssistantMessage("second"), fauxAssistantMessage("summary")]);
+			await f.open();
+			expect(f.providerStream).not.toHaveBeenCalled();
+			await f.turn("history:first", "old durable context ".repeat(5_000));
+			await f.turn("history:second", "recent durable context ".repeat(5_000));
+			const compact = await f.invoke("session.compact", { instructions: "retain facts" });
+			expect(compact).toMatchObject({ outcome: { status: "completed" }, state: { isIdle: true } });
+			expect(f.providerStream).toHaveBeenCalledTimes(3);
+			for (const call of f.providerStream.mock.calls) expect(call[2]).toMatchObject(expected);
+			expect(await readFile(f.settingsPath, "utf8")).toBe(before);
+		} finally { await f.close(); }
+	});
+
+	it("uses existing trusted project overrides for stream settings", async () => {
+		const f = await fixture({ enabled: false, provider: { timeoutMs: 4321, maxRetries: 2 } }, "auto");
+		try {
+			await mkdir(join(f.directory, ".pi"));
+			await writeFile(join(f.directory, ".pi", "settings.json"), JSON.stringify({ transport: "sse", retry: { provider: { maxRetries: 0 } } }));
+			f.faux.setResponses([fauxAssistantMessage("project settings applied")]);
+			await f.open();
+			expect(f.providerStream).not.toHaveBeenCalled();
+			await f.turn();
+			expect(f.providerStream.mock.calls[0][2]).toMatchObject({ transport: "sse", timeoutMs: 4321, maxRetries: 0 });
+		} finally { await f.close(); }
+	});
+
 	it("honors explicit retry.enabled=false with one generation attempt and no settings writes", async () => {
 		const f = await fixture({ enabled: false, maxRetries: 1, baseDelayMs: 1 });
 		try {
@@ -105,6 +138,7 @@ describe("Durable existing native retry settings", () => {
 			await f.open();
 			expect(open).toHaveBeenCalledTimes(1);
 			expect({ ...DEFAULT_RETRY_POLICY, ...open.mock.calls[0][1].settings?.retry }).toEqual(DEFAULT_RETRY_POLICY);
+			expect(open.mock.calls[0][1].settings?.stream).toEqual({ transport: "auto", timeoutMs: undefined, maxRetries: undefined, maxRetryDelayMs: 60_000 });
 			expect(f.faux.state.callCount).toBe(0);
 			await expect(readFile(f.settingsPath, "utf8")).rejects.toMatchObject({ code: "ENOENT" });
 		} finally { open.mockRestore(); await f.close(); }
