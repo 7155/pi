@@ -146,6 +146,14 @@ class ConversationImpl<Tool extends ToolRegistration> implements Conversation {
 		return this.#host.tasks.abortConversation(this.id, options?.background === true, context);
 	}
 
+	abortRun(
+		expectedSubmissionId: SubmissionId,
+		context: Context,
+		options?: ConversationAbortOptions,
+	): Promise<"aborted" | "not_running"> {
+		return abortRun(this.id, expectedSubmissionId, this.#host.tasks, context, options);
+	}
+
 	waitForIdle(context: Context): Promise<void> {
 		this.#host.tasks.resume();
 		return this.#host.tasks.waitForIdle(this.id, context);
@@ -397,8 +405,34 @@ function boundConversation(
 			binding.check();
 			return tasks.abortConversation(id, options?.background === true, bind(context));
 		},
+		abortRun: async (expectedSubmissionId, context, options) => {
+			binding.check();
+			return abortRun(id, expectedSubmissionId, tasks, bind(context), options);
+		},
 		waitForIdle: bound((callContext) => tasks.waitForIdle(id, callContext)),
 	};
+}
+
+/** The Harness supplies the run predicate; the scheduler keeps its generic ownership and drain rules. */
+async function abortRun(
+	conversationId: ConversationId,
+	expectedSubmissionId: SubmissionId,
+	tasks: TaskScheduler,
+	context: Context,
+	options?: ConversationAbortOptions,
+): Promise<"aborted" | "not_running"> {
+	const matched = await tasks.abortConversationIf(
+		conversationId,
+		options?.background === true,
+		async (tx) => {
+			const run = (await tx.doc(LiveDoc, conversationId)).run;
+			if (run === undefined || !run.inputs.includes(expectedSubmissionId)) return false;
+			const task = await tx.task(run.taskId);
+			return task !== undefined && task.state.status !== "terminal" && !task.abortRequested;
+		},
+		context,
+	);
+	return matched ? "aborted" : "not_running";
 }
 
 /** Durable agent harness over one Session. */

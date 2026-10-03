@@ -324,7 +324,34 @@ export class TaskScheduler {
 	 * crosses background boundaries, and the wait also covers every task it reached.
 	 */
 	async abortConversation(conversationId: ConversationId, background: boolean, context: Context): Promise<void> {
-		const reached = await this.#session.commitWith(async (tx) => {
+		const reached = (await this.#markConversationAbort(conversationId, background, context))!;
+		if (background) for (const id of reached) await this.waitForTask(id, context);
+		await this.waitForIdle(conversationId, context);
+	}
+
+	/** Atomically guard the existing abort scope, then join only the tasks that this admission reached. */
+	async abortConversationIf(
+		conversationId: ConversationId,
+		background: boolean,
+		matches: (tx: Transaction) => boolean | Promise<boolean>,
+		context: Context,
+	): Promise<boolean> {
+		const reached = await this.#markConversationAbort(conversationId, background, context, matches);
+		if (reached === undefined) return false;
+		this.resume();
+		for (const id of reached) await this.waitForTask(id, context);
+		return true;
+	}
+
+	/** Compare, capture owned work, withdraw queued inputs, and write abort marks on the same Session line. */
+	#markConversationAbort(
+		conversationId: ConversationId,
+		background: boolean,
+		context: Context,
+		matches?: (tx: Transaction) => boolean | Promise<boolean>,
+	): Promise<TaskId[] | undefined> {
+		return this.#session.commitWith(async (tx) => {
+			if (matches !== undefined && !(await matches(tx))) return undefined;
 			const queued = await this.#loadScopes(true);
 			const scope = { conversation: conversationId };
 			const reached: TaskId[] = [];
@@ -339,8 +366,6 @@ export class TaskScheduler {
 			}
 			return reached;
 		}, context);
-		if (background) for (const id of reached) await this.waitForTask(id, context);
-		await this.waitForIdle(conversationId, context);
 	}
 
 	// ─── Scheduling ────────────────────────────────────────────────────────

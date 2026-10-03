@@ -122,6 +122,12 @@ export interface ConversationHandle {
 	submit(submission: InputSubmissionDraft, context: Context): Promise<Submission>;
 	/** `Conversation.abort()`: withdraw queued inputs, abort the ordinary ownership scope, and wait until it is idle. */
 	abort(context: Context, options?: ConversationAbortOptions): Promise<void>;
+	/** `Conversation.abortRun()`: abort only when this input still belongs to the current unmarked run. */
+	abortRun(
+		expectedSubmissionId: SubmissionId,
+		context: Context,
+		options?: ConversationAbortOptions,
+	): Promise<"aborted" | "not_running">;
 	/** Resolve when the conversation's ordinary ownership scope has no live non-background task. */
 	waitForIdle(context: Context): Promise<void>;
 }
@@ -521,6 +527,16 @@ export interface Conversation {
 	 * signal them, and resolve once the scope is idle. Background subtrees survive unless `background` is set.
 	 */
 	abort(context: Context, options?: ConversationAbortOptions): Promise<void>;
+	/**
+	 * Apply conversation abort only when `expectedSubmissionId` belongs to the current run and that run is not already
+	 * abort-marked. Match and marks are one commit. Withdraw only the inputs queued at admission and await only the
+	 * captured tasks, never a later input. A missing, replaced, or already-marked run returns `not_running` unchanged.
+	 */
+	abortRun(
+		expectedSubmissionId: SubmissionId,
+		context: Context,
+		options?: ConversationAbortOptions,
+	): Promise<"aborted" | "not_running">;
 	/**
 	 * Resolve when the ordinary ownership scope has no live non-background task: this conversation and the conversations
 	 * owned, transitively, by its non-background tasks.

@@ -398,6 +398,14 @@ A fork sees its parent's entries up to `entryId` and continues independently. It
 
 `await root.abort(context)` stops a conversation: queued inputs are withdrawn (queued writes stay), every task of its current work is aborted, and the call resolves once the conversation is idle.
 
+For a Stop tied to one admitted input, use its original submission ID:
+
+```typescript
+const result = await root.abortRun(submission.id, context); // "aborted" or "not_running"
+```
+
+The input is compared with the current run in the same commit that marks its work for abort, even after tool rounds hand the run to another generation task. A finished, replaced, or already abort-marked run returns `not_running` without withdrawing inputs or marking work. A match withdraws the inputs queued at that admission (queued writes stay) and returns `aborted` once the captured work drains. Inputs submitted afterwards are neither cancelled nor awaited. `{ background: true }` crosses background boundaries for that same capture, as with `abort()`. After the abort marks commit, cancelling the caller's context cancels only its wait; the abort remains durable. To withdraw an input that is still queued, use `submission.abort(context)` instead.
+
 A conversation can be **owned** by a task. A subagent tool creates its child inside `api.commit()` with `ownership: { kind: "task", taskId: api.taskId }`, then drives it through `api.conversation(id)`:
 
 ```typescript
