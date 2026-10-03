@@ -5,13 +5,14 @@ import { BACKGROUND_CONTEXT } from "@earendil-works/chord/context";
 import { type AssistantMessage, clampThinkingLevel, getSupportedThinkingLevels, type ModelThinkingLevel, Type } from "@earendil-works/pi-ai";
 import type { ModelRuntime, PromptOptions } from "@earendil-works/pi-coding-agent";
 import {
-	AgentDoc, type AgentEvent, type AgentEventStream, type AgentState, type CommitPublication, type Conversation,
+	AgentDoc, type AgentEvent, type AgentEventStream, type AgentState, type CommitPublication, CompactionTask, type Conversation,
 	createRegistry, defineDoc, defineExtension, defineTool, type EntryRecord, Harness, type InboxState,
 	InboxDoc, type JsonObject, LiveDoc, type LiveState, type SubmissionId, type SubmissionRecord,
-	type TaskId, type ToolRegistration, type Tx, watchEvents,
+	type TaskId, type TaskInspection, type ToolRegistration, type Tx, watchEvents,
 } from "@earendil-works/pi-durable";
 import { openNodeSqliteStorage } from "@earendil-works/pi-durable/storage/sqlite/node";
 import lockfile from "proper-lockfile";
+import type { CompactionTarget } from "./compaction-target.ts";
 import { loadBackendTools, searchBackendTools } from "./discovery-tools.ts";
 import type { ActiveTurn, PiExactTurnCancelReceipt, PiPromptReceipt, PiSessionAbortReceipt } from "./pi-session.ts";
 import { PROTOCOL_VERSION, type RuntimeEventEnvelope, RuntimeProtocolError } from "./protocol.ts";
@@ -32,7 +33,7 @@ const EXTENSION_NAME = "rag-ime.durable-product";
 const RECENT_ENTRIES = 100;
 
 export const DURABLE_ENGINE_CAPABILITIES = Object.freeze({
-	gatewayTools: true, compaction: true, resume: true, exactAbort: true,
+	gatewayTools: true, compaction: true, compactionRecovery: true, resume: true, exactAbort: true,
 	nativeMcp: false, codemode: false, managedPlugins: false, conversationFork: false,
 	conversationRewrite: false, commandCatalog: false, images: false,
 });
@@ -123,6 +124,9 @@ export class DurableProductSession implements PooledSession {
 	private scheduling: "paused" | "running" | "closing" = "paused";
 	private readonly generationInputs = new Map<number, readonly SubmissionId[]>();
 	private readonly submissionRecords = new Map<number, SubmissionRecord>();
+	private readonly nativeTasks = new Map<number, TaskInspection["record"]>();
+	private readonly unsettledSubmissions = new Set<number>();
+	private readonly compactionSettlements = new Map<string, CompactionTarget>();
 	private eventStream?: AgentEventStream;
 	private eventDelivery: Promise<void> = Promise.resolve();
 	private unsubscribeCommits?: () => void;
@@ -216,6 +220,7 @@ export class DurableProductSession implements PooledSession {
 			}, context);
 			product.unsubscribeCommits = harness.subscribeCommits(publication => product?.observeCommit(publication));
 			await product.reconcile();
+			await product.inspect();
 			product.eventStream = await watchEvents(harness, root.id, context);
 			product.eventStream.start(events => {
 				const delivery = (async () => { for (const event of events) await product?.projectEvent(event); })();
@@ -303,7 +308,7 @@ export class DurableProductSession implements PooledSession {
 	}
 
 	get isIdle(): boolean {
-		return !this.disposePromise && this.admitting === 0 && !this.live.run && !this.live.compactions?.length &&
+		return !this.disposePromise && this.admitting === 0 && this.nativeTasks.size === 0 && this.unsettledSubmissions.size === 0 && !this.live.run && !this.live.compactions?.length &&
 			!Object.values(this.state.requests).some(request => request.submissionId !== undefined && !request.settlement);
 	}
 
@@ -316,7 +321,15 @@ export class DurableProductSession implements PooledSession {
 				if (change.record.kind === InboxDoc.definition.kind) this.inbox = (change.value ?? { items: [] }) as InboxState;
 				if (change.record.kind === "pi.agent") this.agent = (change.value ?? {}) as AgentState;
 			}
-			if (change.type === "submission") this.submissionRecords.set(change.value.id, change.value);
+			if (change.type === "submission") {
+				this.submissionRecords.set(change.value.id, change.value);
+				if (terminal(change.value)) this.unsettledSubmissions.delete(change.value.id);
+				else this.unsettledSubmissions.add(change.value.id);
+			}
+			if (change.type === "task") {
+				if (change.value.state.status === "terminal") this.nativeTasks.delete(change.value.id);
+				else this.nativeTasks.set(change.value.id, change.value);
+			}
 		}
 		if (previous) this.generationInputs.set(previous.taskId, previous.inputs);
 		if (this.live.run) this.generationInputs.set(this.live.run.taskId, this.live.run.inputs);
@@ -380,6 +393,15 @@ export class DurableProductSession implements PooledSession {
 			if (final) this.emitMessageEnd(final, receipt);
 			this.emit({ type: "agent_settled", receipt: receipt.receipt }, receipt);
 		}
+		for (const [key, target] of this.compactionSettlements) {
+			const tasks = await Promise.all(target.taskIds.map(id => this.harness.getTask(Number(id.slice("durable:task:".length)) as TaskId, context)));
+			if (tasks.some(task => task?.state.status !== "terminal")) continue;
+			await this.inspect();
+			if (!this.compactionSettlements.delete(key)) continue;
+			// Native compaction_end only reports LiveDoc removal and can precede owned-child drain.
+			this.emit({ type: "compaction_settled", compactionTarget: target,
+				state: { schemaVersion: "rag-ime.pi-session-control-state.v1", projectionCurrent: true, ...this.metadata() } });
+		}
 	}
 
 	private async createSettlement(tx: Tx, request: RequestBinding, submission: SubmissionRecord, answer?: EntryRecord): Promise<PiTurnSettlementReceipt> {
@@ -431,6 +453,7 @@ export class DurableProductSession implements PooledSession {
 		const key = requestKey(clientMessageId);
 		const fingerprint = hash({ message: options.message, delivery, sessionContext: options.sessionContext ?? null, transientContext: options.transientContext ?? "" });
 		await this.flushProjection();
+		await this.inspect();
 		let request = this.state.requests[key];
 		if (request && request.fingerprint !== fingerprint) throw new RuntimeProtocolError("PROMPT_IDENTITY_MISMATCH", "clientMessageId was already admitted with different arguments");
 		if (request?.submissionId !== undefined) return { ...identity(request), disposition: request.delivery === "prompt" ? "started" : "queued", settlement: persistedTurnSettlement(request.settlement) };
@@ -483,11 +506,126 @@ export class DurableProductSession implements PooledSession {
 	}
 
 	private async inspect(): Promise<void> {
-		this.scheduling = (await this.harness.inspect(context)).scheduling;
+		const inspected = await this.harness.inspect(context);
+		this.scheduling = inspected.scheduling;
+		this.nativeTasks.clear();
+		for (const { record } of inspected.tasks) this.nativeTasks.set(record.id, record);
+		this.unsettledSubmissions.clear();
+		for (const submission of inspected.submissions) {
+			this.unsettledSubmissions.add(submission.id);
+			this.submissionRecords.set(submission.id, submission);
+		}
+	}
+
+	private ownCompaction(task: Pick<TaskInspection["record"], "kind" | "version" | "conversationId" | "owner">): boolean {
+		return task.kind === CompactionTask.definition.name && task.version === CompactionTask.definition.version &&
+			task.conversationId === this.conversation.id && task.owner === undefined;
+	}
+
+	private compactionTarget(): CompactionTarget | undefined {
+		// Native resume and waitForTask enable the whole Session, so no unrelated work may ride this target.
+		if (this.currentRequest() || this.live.run || this.unsettledSubmissions.size > 0) return undefined;
+		return this.targetForTasks(this.nativeTasks);
+	}
+
+	private targetForTasks(tasks: ReadonlyMap<number, TaskInspection["record"]>): CompactionTarget | undefined {
+		const roots = [...tasks.values()].filter(task => this.ownCompaction(task));
+		if (roots.length === 0) return undefined;
+		const rootIds = new Set(roots.map(task => Number(task.id)));
+		for (const task of tasks.values()) {
+			let current = task;
+			const visited = new Set<number>();
+			while (!rootIds.has(current.id)) {
+				if (visited.has(current.id) || current.background || current.owner === undefined) return undefined;
+				visited.add(current.id);
+				const owner = tasks.get(current.owner);
+				if (!owner) return undefined;
+				current = owner;
+			}
+		}
+		return { kind: "compaction", runtimeSessionId: this.state.runtimeSessionId,
+			taskIds: roots.map(task => `durable:task:${task.id}`).sort() };
+	}
+
+	private async validateCompaction(target: CompactionTarget): Promise<TaskInspection["record"][]> {
+		if (this.disposePromise) throw new RuntimeProtocolError("SESSION_CLOSED", "Durable Session is closing");
+		if (target.runtimeSessionId !== this.state.runtimeSessionId) throw new RuntimeProtocolError("COMPACTION_TARGET_MISMATCH", "Compaction belongs to another runtime Session");
+		await this.flushProjection();
+		await this.inspect();
+		return this.harness.commit(async tx => {
+			const records = await Promise.all(target.taskIds.map(id => tx.task(Number(id.slice("durable:task:".length)) as TaskId)));
+			if (records.some(task => !task || !this.ownCompaction(task))) throw new RuntimeProtocolError("COMPACTION_TARGET_MISMATCH", "Target is not an owned standalone native compaction");
+			const tasks = records as TaskInspection["record"][];
+			// Terminal receipts are immutable: a late retry must not activate or cancel newer work.
+			if (tasks.every(task => task.state.status === "terminal")) return tasks;
+			const active = new Map<number, TaskInspection["record"]>();
+			for (const status of ["pending", "running", "waiting", "completing"] as const) {
+				let cursor;
+				do {
+					const page = await tx.scanTasks({ status }, 256, cursor);
+					for (const task of page.items) active.set(task.id, task);
+					cursor = page.next;
+				} while (cursor);
+			}
+			const current = this.targetForTasks(active);
+			if (this.currentRequest() || (await tx.doc(LiveDoc, this.conversation.id)).run || this.unsettledSubmissions.size > 0 ||
+				!current || current.taskIds.some(id => !target.taskIds.includes(id)) ||
+				tasks.some(task => task.state.status !== "terminal" && !current.taskIds.includes(`durable:task:${task.id}`))) {
+				throw new RuntimeProtocolError("COMPACTION_TARGET_MISMATCH", "Compaction target is not the complete current standalone task set");
+			}
+			return tasks;
+		}, context);
+	}
+
+	async resumeCompaction(target: CompactionTarget): Promise<Record<string, unknown>> {
+		return this.serial(async () => {
+			const tasks = await this.validateCompaction(target);
+			const resumed = tasks.some(task => task.state.status !== "terminal");
+			if (resumed) {
+				this.compactionSettlements.set(JSON.stringify(target.taskIds), structuredClone(target));
+				this.harness.resume(); this.scheduling = "running";
+			}
+			return { schemaVersion: "rag-ime.pi-compaction-resume.v1", accepted: true, runtimeEngine: "durable",
+				compactionTarget: target, resumed, state: await this.controlState() };
+		});
+	}
+
+	abortCompaction(target: CompactionTarget): Promise<Record<string, unknown>> {
+		return this.trackCancellation(this.abortCompactionInternal(target));
+	}
+
+	private async abortCompactionInternal(target: CompactionTarget): Promise<Record<string, unknown>> {
+		const admitted = await this.serial(async () => {
+			const tasks = await this.validateCompaction(target);
+			if (tasks.every(task => task.state.status === "terminal")) return { tasks, joins: [] };
+			this.compactionSettlements.set(JSON.stringify(target.taskIds), structuredClone(target));
+			// abortTask commits its mark before joining its invocation. Start every exact mark before the
+			// passive read barrier; neither waitForTask nor global resume may run ahead of those marks.
+			const joins = tasks.filter(task => task.state.status !== "terminal").map(task => this.harness.abortTask(task.id, context));
+			for (const join of joins) void join.catch(() => undefined);
+			const marked = await Promise.all(tasks.map(task => this.harness.getTask(task.id, context)));
+			if (marked.some(task => !task || (task.state.status !== "terminal" && !task.abortRequested))) {
+				throw new RuntimeProtocolError("COMPACTION_TARGET_MISMATCH", "Native compaction abort marks were not admitted");
+			}
+			this.harness.resume(); this.scheduling = "running";
+			return { tasks, joins };
+		});
+		// Joining native invocations and terminal task receipts must not hold the admission lane.
+		await Promise.all(admitted.joins);
+		const terminalTasks = await Promise.all(admitted.tasks.map(task => task.state.status === "terminal"
+			? task : this.harness.waitForTask(task.id, context)));
+		const outcomes = terminalTasks.map(task => {
+			if (task.state.status !== "terminal") throw new Error("Native compaction has not drained");
+			const status = task.state.outcome.status;
+			return { taskId: `durable:task:${task.id}`, status: status === "completed" || status === "aborted" ? status : "failed" };
+		});
+		return { schemaVersion: "rag-ime.pi-compaction-abort.v1", accepted: true, runtimeEngine: "durable",
+			compactionTarget: target, drained: true, outcomes, state: await this.controlState() };
 	}
 
 	private metadata(): Record<string, unknown> {
 		const request = this.currentRequest();
+		const compactionTarget = this.compactionTarget();
 		// Passive open leaves native scheduling paused even when no work remains.
 		// Product pause describes unfinished work, not whether the scheduler has started.
 		const paused = this.scheduling === "paused" && !this.isIdle;
@@ -495,7 +633,8 @@ export class DurableProductSession implements PooledSession {
 		return { sessionId: this.externalSessionId, runtimeEngine: "durable", piSessionId: this.state.runtimeSessionId,
 			durableStoreRef: this.durableStoreRef, durableConversationId: String(this.conversation.id), cwd: this.options.cwd,
 			engineCapabilities: DURABLE_ENGINE_CAPABILITIES, paused,
-			recoverable: paused && !!request, isIdle: this.isIdle, isCompacting: !!this.live.compactions?.length,
+			recoverable: paused && (!!request || !!compactionTarget), isIdle: this.isIdle, isCompacting: !!this.live.compactions?.length || [...this.nativeTasks.values()].some(task => task.kind === CompactionTask.definition.name),
+			...(compactionTarget ? { compactionTarget } : {}),
 			activeTurn: request ? identity(request) : undefined, sequence: this.sequence, codemodeMode: "off", thinkingLevel: this.agent.thinkingLevel ?? "off",
 			model: model ? { provider: model.provider, id: model.id, name: model.name, api: model.api, reasoning: model.reasoning,
 				input: [...model.input], contextWindow: model.contextWindow, maxTokens: model.maxTokens, thinkingLevels: getSupportedThinkingLevels(model) } : null,
@@ -578,6 +717,13 @@ export class DurableProductSession implements PooledSession {
 
 	private async projectEvent(event: AgentEvent): Promise<void> {
 		if (event.type === "submission") { await this.flushProjection(); return; }
+		if (event.type === "compaction_start" || event.type === "compaction_end") {
+			const task = await this.harness.getTask(event.taskId, context);
+			const owner = task?.owner === undefined ? undefined : this.requestForGeneration(task.owner);
+			// Standalone compaction must not inherit the last completed input's presentation fence.
+			this.emit({ ...event }, owner ? identity(owner) : undefined);
+			return;
+		}
 		if (event.type === "run_start") this.projectedInputs = event.inputs;
 		const request = this.presentationRequest();
 		const turn = request ? identity(request) : undefined;
@@ -737,8 +883,19 @@ export class DurableProductSession implements PooledSession {
 	}
 
 	async compact(instructions?: string): Promise<Record<string, unknown>> {
-		const id = await this.conversation.compact(instructions, context);
-		this.scheduling = "running";
+		const id = await this.serial(async () => {
+			if (this.disposePromise) throw new RuntimeProtocolError("SESSION_CLOSED", "Durable Session is closing");
+			await this.flushProjection(); await this.inspect();
+			if (this.live.compactions?.length || [...this.nativeTasks.values()].some(task => task.kind === CompactionTask.definition.name) ||
+				(this.scheduling !== "running" && !this.isIdle)) {
+				throw new RuntimeProtocolError("SESSION_BUSY", "Recover existing paused work or finish the current compaction before starting another");
+			}
+			const admitted = await this.conversation.compact(instructions, context);
+			const target: CompactionTarget = { kind: "compaction", runtimeSessionId: this.state.runtimeSessionId, taskIds: [`durable:task:${admitted}`] };
+			this.compactionSettlements.set(JSON.stringify(target.taskIds), target);
+			this.scheduling = "running";
+			return admitted;
+		});
 		const task = await this.harness.waitForTask(id, context);
 		await this.flushProjection();
 		return { taskId: `durable:task:${id}`, outcome: task.state.outcome, state: await this.controlState() };
