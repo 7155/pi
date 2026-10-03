@@ -53,7 +53,7 @@ it.each(["success","failure","cancel"] as const)("runs native managed CodeMode c
   expect(active).toBe(0);expect(maxActive).toBe(4);expect(settled.receipt.pendingOperations).toBe(0);
   expect(calls).toHaveLength(scenario==="cancel"?4:6);
   expect(calls.every(call=>call.url===endpoint && call.body.model==="jev-latest")).toBe(true);
-  const messages=session.snapshot().messages as {role:string;toolCallId?:string;content?:{type:string;text?:string}[];usage?:{totalTokens:number};details?:unknown}[];
+  const messages=(await session.snapshot()).messages as {role:string;toolCallId?:string;content?:{type:string;text?:string}[];usage?:{totalTokens:number};details?:unknown}[];
   const result=messages.find(m=>m.role==="toolResult" && m.toolCallId==="native-code-parent");
   expect(JSON.stringify(result)).not.toContain("offline-env-only-key");
   expect(JSON.stringify(result)).not.toContain("private provider detail");

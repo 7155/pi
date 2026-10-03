@@ -15,6 +15,7 @@ import { configureHttpDispatcher, createDirectHttpFetch, ModelRuntime } from "@e
 import { classificationDispatch, classificationId, classificationParams, MANAGED_CLASSIFIER, publicClassificationResult, trustedClassificationEndpoint } from "./classification.ts";
 import { pendingRoomCancellationSurfaces, roomCancellationSurfaces } from "./cancellation-receipts.ts";
 import { listBundledPiPackages } from "./bundled-package-catalog.ts";
+import { DurableProductSession } from "./durable-product-session.ts";
 import { NativePiPackageManager } from "./native-package-manager.ts";
 import { PiProductSession, type PiSessionAbortReceipt } from "./pi-session.ts";
 import { ManagedPluginManager } from "./plugin-manager.ts";
@@ -316,7 +317,7 @@ function publicModel(model: ReturnType<ModelRuntime["getModels"]>[number]): Reco
 
 export class RagImeRuntimeHost {
 	readonly modelRuntime: ModelRuntime;
-	readonly sessions: BoundedSessionPool<PiProductSession>;
+	readonly sessions: BoundedSessionPool<PiProductSession | DurableProductSession>;
 	readonly plugins: ManagedPluginManager;
 	readonly nativePackages: NativePiPackageManager;
 	private readonly options: RuntimeHostOptions;
@@ -430,10 +431,18 @@ export class RagImeRuntimeHost {
 		});
 	}
 
-	private session(params: Record<string, unknown>): PiProductSession {
+	private session(params: Record<string, unknown>): PiProductSession | DurableProductSession {
 		const sessionId = requiredSessionId(params);
 		const session = this.sessions.get(sessionId);
 		if (!session) throw new RuntimeProtocolError("SESSION_NOT_FOUND", `Session is not open: ${sessionId}`);
+		return session;
+	}
+
+	private classicSession(params: Record<string, unknown>): PiProductSession {
+		const session = this.session(params);
+		if (session instanceof DurableProductSession) {
+			throw new RuntimeProtocolError("ENGINE_FEATURE_UNAVAILABLE", "This feature is unavailable for Durable Sessions");
+		}
 		return session;
 	}
 
@@ -539,7 +548,7 @@ export class RagImeRuntimeHost {
 	}
 
 	private async reloadPlugins(): Promise<void> {
-		await Promise.allSettled(this.sessions.list().map(async (session) => session.reloadPlugins()));
+		await Promise.allSettled(this.sessions.list().filter((session): session is PiProductSession => !(session instanceof DurableProductSession)).map(async (session) => session.reloadPlugins()));
 	}
 
 	async handle(request: RuntimeRequest): Promise<unknown> {
@@ -552,6 +561,7 @@ export class RagImeRuntimeHost {
 					hostVersion: HOST_VERSION,
 					piVersion: PI_RUNTIME_BASELINE,
 					capabilities: {
+						sessionEngines: { classic: { available: true }, durable: { available: true, experimental: true, version: "1" } },
 						multiSession: true,
 						maxSessions: this.sessions.maxSessions,
 						concurrentControlPlane: true,
@@ -854,6 +864,10 @@ export class RagImeRuntimeHost {
 			case "session.open": {
 				const sessionId = requiredSessionId(params);
 				const cwd = await this.workspace(params.cwd);
+				const engine = optionalString(params, "runtimeEngine", 20) ?? "classic";
+				if (engine !== "classic" && engine !== "durable") throw new RuntimeProtocolError("INVALID_PARAMS", "runtimeEngine must be classic or durable");
+				const existing = this.sessions.get(sessionId);
+				if (existing && (existing instanceof DurableProductSession) !== (engine === "durable")) throw new RuntimeProtocolError("ENGINE_BINDING_MISMATCH", "An open Session cannot change runtimeEngine");
 				const provider = optionalString(params, "provider", 80);
 				const modelId = optionalString(params, "modelId", 200);
 				const thinking = optionalString(params, "thinkingLevel", 20);
@@ -864,6 +878,31 @@ export class RagImeRuntimeHost {
 				if (thinking && !THINKING_LEVELS.has(thinking as ModelThinkingLevel)) {
 					throw new RuntimeProtocolError("INVALID_PARAMS", `Unsupported thinkingLevel: ${thinking}`);
 				}
+				if (engine === "durable") {
+					if (params.sessionFile !== undefined || params.roomCapability !== undefined || params.roomContext !== undefined ||
+						params.roomProviderContext !== undefined || params.roomRecoveryContext !== undefined ||
+						optionalBoolean(params, "nativeMcpExecutionAllowed") || (params.codemodeMode !== undefined && codemodeMode !== "off")) {
+						throw new RuntimeProtocolError("ENGINE_FEATURE_UNAVAILABLE", "Durable standalone Sessions do not accept classic storage, Room, Code Mode or native MCP bindings");
+					}
+					const requested = requiredString(params, "durableStoreRef", 4096);
+					const managedRoot = await realpath(resolve(this.options.sessionDir));
+					const expected = join(managedRoot, "durable", sessionId);
+					if (resolve(requested) !== expected) throw new RuntimeProtocolError("SESSION_PATH_DENIED", "durableStoreRef must be the exact owned Session directory");
+					await mkdir(expected, { recursive: true, mode: 0o700 });
+					const canonical = await realpath(expected);
+					if (canonical !== join(managedRoot, "durable", sessionId)) throw new RuntimeProtocolError("SESSION_PATH_DENIED", "Durable storage symlink binding is not allowed");
+					const opened = await this.sessions.open(sessionId, () => DurableProductSession.create({
+						externalSessionId: sessionId, cwd, durableStoreRef: canonical, modelRuntime: this.modelRuntime,
+						provider, modelId, thinkingLevel: thinking as ModelThinkingLevel | undefined,
+						toolManifest: params.toolManifest ?? [], toolGatewayUrl: this.options.toolGatewayUrl, toolGatewayToken: this.options.toolGatewayToken,
+						systemPrompt: optionalString(params, "systemPrompt", 64_000), sessionContext: optionalString(params, "sessionContext", 256_000),
+						emitEvent: this.options.emitEvent,
+					}));
+					if (!(opened.session instanceof DurableProductSession) || opened.session.durableStoreRef !== canonical) throw new RuntimeProtocolError("ENGINE_BINDING_MISMATCH", "Session storage/engine binding changed during open");
+					if (opened.evictedSessionId) this.clearRoomStateForSession(opened.evictedSessionId);
+					return { snapshot: await opened.session.openSnapshot(), evictedSessionId: opened.evictedSessionId };
+				}
+				if (params.durableStoreRef !== undefined) throw new RuntimeProtocolError("ENGINE_BINDING_MISMATCH", "Classic Sessions do not accept Durable storage bindings");
 				const sessionFile = optionalString(params, "sessionFile", 4096);
 				if (sessionFile && !isInside(resolve(this.options.sessionDir), resolve(sessionFile))) {
 					throw new RuntimeProtocolError(
@@ -913,9 +952,9 @@ export class RagImeRuntimeHost {
 					// Opening a long-lived Session must never serialize its full
 					// transcript onto the shared JSONL control lane. Explicit
 					// session.snapshot remains available to history consumers.
-					snapshot: opened.session.openSnapshot(),
+					snapshot: { ...await opened.session.openSnapshot(), runtimeEngine: "classic" },
 					evictedSessionId: opened.evictedSessionId,
-					roomSkillLoad: opened.session.roomSkillLoadReceipt(),
+					roomSkillLoad: this.classicSession(params).roomSkillLoadReceipt(),
 				};
 			}
 			case "session.control_state":
@@ -933,26 +972,28 @@ export class RagImeRuntimeHost {
 					timeoutMs: params.timeoutMs === undefined ? undefined : requiredNonNegativeInteger(params, "timeoutMs"),
 					expectedClientMessageId: optionalString(params, "clientMessageId", 128),
 				});
-			case "session.snapshot":
-				return this.session(params).snapshot();
+			case "session.snapshot": {
+				const session = this.session(params);
+				return session instanceof DurableProductSession ? session.snapshot(optionalString(params, "view", 20)) : session.snapshot();
+			}
 			case "session.debug.context":
-				return this.session(params).debugContext(optionalString(params, "turnId", 240));
+				return this.classicSession(params).debugContext(optionalString(params, "turnId", 240));
 			case "session.commands":
 				return {
-					commands: this.session(params).listCommands(),
-					diagnostics: this.session(params).resourceDiagnostics(),
+					commands: this.classicSession(params).listCommands(),
+					diagnostics: this.classicSession(params).resourceDiagnostics(),
 				};
 			case "session.command.invoke":
-				return await this.session(params).invokeCommand(requiredString(params, "command", 20_000));
+				return await this.classicSession(params).invokeCommand(requiredString(params, "command", 20_000));
 			case "session.fork.candidates":
-				return { items: this.session(params).forkCandidates() };
+				return { items: this.classicSession(params).forkCandidates() };
 			case "session.fork": {
 				const sourceSessionId = requiredSessionId(params);
 				const targetSessionId = sessionIdParam(params, "targetSessionId");
 				if (sourceSessionId === targetSessionId) {
 					throw new RuntimeProtocolError("INVALID_PARAMS", "Conversation fork target must differ from its source");
 				}
-				const source = this.session(params);
+				const source = this.classicSession(params);
 				if (this.sessions.get(targetSessionId)) {
 					throw new RuntimeProtocolError("SESSION_ALREADY_OPEN", `Session is already open: ${targetSessionId}`);
 				}
@@ -1002,7 +1043,7 @@ export class RagImeRuntimeHost {
 						entryId: prepared.entryId,
 						selectedText: prepared.selectedText,
 						branchAnchor: prepared.branchAnchor,
-						snapshot: opened.session.snapshot(),
+						snapshot: await opened.session.snapshot(),
 						evictedSessionId: opened.evictedSessionId,
 					};
 				} catch (error) {
@@ -1012,7 +1053,12 @@ export class RagImeRuntimeHost {
 				}
 			}
 			case "session.rewind":
-				return this.session(params).rewind(requiredString(params, "entryId", 240));
+				return this.classicSession(params).rewind(requiredString(params, "entryId", 240));
+			case "session.resume": {
+				const session = this.session(params);
+				if (!(session instanceof DurableProductSession)) throw new RuntimeProtocolError("ENGINE_FEATURE_UNAVAILABLE", "Explicit native resume requires a Durable Session");
+				return session.resume(requiredString(params, "turnId", 240), requiredString(params, "clientMessageId", 128));
+			}
 			case "session.prompt": {
 				const prompt = decodeRuntimePrompt(requiredString(params, "message", 1_000_000));
 				return this.session(params).prompt({
@@ -1070,7 +1116,7 @@ export class RagImeRuntimeHost {
 				if (mode !== "on" && mode !== "only" && mode !== "off") {
 					throw new RuntimeProtocolError("INVALID_PARAMS", `Unsupported codemode mode: ${mode}`);
 				}
-				return this.session(params).setCodemodeMode(mode);
+				return this.classicSession(params).setCodemodeMode(mode);
 			}
 			case "session.thinking.set": {
 				const level = requiredString(params, "level", 20);
@@ -1105,7 +1151,7 @@ export class RagImeRuntimeHost {
 							: "A cancelled Room Dispatch cannot be resumed; create a new Dispatch identity",
 					);
 				}
-				const accepted = await this.session(params).dispatchRoom({
+				const accepted = await this.classicSession(params).dispatchRoom({
 					message: requiredString(params, "message", 1_000_000),
 					dispatchId,
 					rootId,
@@ -1167,7 +1213,7 @@ export class RagImeRuntimeHost {
 						"Room cancellation does not match an active Room dispatch receipt",
 					);
 				}
-				const target = this.session(params);
+				const target = this.classicSession(params);
 				const operation = existingOperation ?? { lineage: structuredClone(lineage) };
 				if (!existingOperation) {
 					this.roomCancelOperations.set(lineage.cancelId, operation);

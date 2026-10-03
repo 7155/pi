@@ -4,6 +4,7 @@ export * from "./debug-context.ts";
 export * from "./bundled-package-catalog.ts";
 export * from "./context-provider.ts";
 export * from "./discovery-tools.ts";
+export * from "./durable-product-session.ts";
 export * from "./jsonl-framing.ts";
 export * from "./lifecycle-hooks.ts";
 export * from "./plugin-manager.ts";

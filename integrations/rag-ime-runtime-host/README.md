@@ -1,7 +1,7 @@
 # Pi RAG IME Runtime Host
 
-This private integration hosts Pi Coding Agent SDK sessions for the Wisdom
-Weasel product. It is deliberately kept outside upstream Pi's `packages/*`
+This private integration hosts Pi Sessions for Personal Agent Workbench.
+It is deliberately kept outside upstream Pi's `packages/*`
 workspace so product policy and protocol code do not alter upstream package or
 lockfile ownership.
 
@@ -12,7 +12,8 @@ writes and recovery; product-side history readers are read-only projections.
 
 ## Ownership boundary
 
-- The host owns Pi model calls, `AgentSession` lifecycle, compaction, snapshots,
+- The host owns Pi model calls, Classic `AgentSession` or native Durable
+  `Harness` lifecycle, compaction, snapshots,
   dynamic tool registration, and the final `agent_settled` turn boundary.
 - The product gateway owns Persona, memory and graph state, Rooms, approval
   policy, the authoritative tool catalog, and Web-facing product events.
@@ -81,9 +82,63 @@ again. Older clients without this additive binding retain receipt deduplication,
 but do not acquire exact-turn cancellation protection. Rebuild the paired Host
 payload to enable that protection.
 
+## Experimental native Durable engine
+
+`hello.capabilities.sessionEngines.durable` advertises explicit opt-in support.
+New standalone Sessions send `runtimeEngine: durable` and the canonical owned
+`durableStoreRef` on `session.open`; Classic remains the default. An existing
+Session cannot change its engine, native Conversation or storage binding.
+Managed-root aliases are canonicalized before comparing the requested path;
+Durable subtree/Session symlinks and outside paths remain denied.
+
+`DurableProductSession` implements the existing pool interface with one native
+Harness/Conversation and its SQLite journal. A product extension document
+links the immutable client message and argument fingerprint to native
+submission/generation IDs and saved settlements. It owns no additional model
+or Tool loop. An exclusive store lease is released only after owned callbacks
+and cancellation operations have joined.
+
+Opening or reading history is passive. Unfinished native input is reported as
+`paused`, `recoverable` and an exact `activeTurn`. `session.resume` takes the
+original turn/client IDs, never resubmits a prompt, and returns saved settlement
+for terminal input. Lost admission responses reuse the same request; changed
+arguments conflict before native deduplication. Public full history paginates
+native entries independently of the compacted model-context head. Recent views
+remain bounded and preserve original message and Tool identities.
+
+Cancellation uses native `Conversation.abortRun` for the original submission.
+Terminal input alone does not prove physical drain: captured generation/child
+tasks must also finish. Exact `cancelId` intent is saved before waiting;
+lookup repairs its state only from original native cancellation evidence.
+Withdrawing a never-placed queued input records its queryable settlement and
+queue update without publishing an execution terminal for a different active
+input. `SESSION_ABORTING` rejects new admission while Stop is draining.
+
+Gateway tools capture their immutable native ToolTask owner and original input
+before awaiting capacity or HTTP. Product Gateway idempotency and receipts
+remain authoritative; these tools are registered unsafe for native replay.
+An interrupted effect is not automatically repeated. Native Tool discovery is
+safe to replay under its recorded/current policy. This does not promise
+exactly-once arbitrary external effects.
+
+Durable supports text, configured models/thinking levels, Gateway tools,
+compaction, exact Stop and explicit resume. Native MCP, Code Mode, managed
+plugins/Skills, images, conversation fork/rewrite and command catalogs are
+unavailable. `model.set` with a `maxTokens` override is also rejected: native
+Conversation streaming does not carry that override. Engine capabilities are
+explicit; unsupported controls do not fall back to Classic. Product Session
+and transient context use the existing prompt envelope and native extension
+sections bound to the admitted generation.
+
+`test/durable-product-session.test.ts` exercises the public Host with native
+Harness/SQLite and a faux ModelRuntime, including restart, unsafe-effect
+recovery, exact generation cancellation, delayed drain, projection gaps and
+history after compaction. It establishes controlled native behavior, not
+configured Provider or installed foreground acceptance.
+
 ## Native programmatic tool calling
 
-Product Sessions load Pi's built-in `codemode` extension. `session.open`
+Classic product Sessions load Pi's built-in `codemode` extension. `session.open`
 accepts `codemodeMode`: `on` (default, normal tools plus code), `only` (code
 exposes the callable catalog), or `off`. `session.codemode.set` changes the
 actual mode only while idle and returns the effective `codemodeMode`.
@@ -167,7 +222,7 @@ reloads native registrations; execution and transport creation recheck the
 current policy, so stale direct, deferred, and codemode references cannot
 restore a revoked grant. Plugin reloads preserve the effective policy.
 
-Each Session starts with one deterministic model-facing prefix:
+Each Classic Session starts with one deterministic model-facing prefix:
 
 - the product Persona/System Prompt;
 - a concise, name-sorted product Skill Catalog whose entries contain `name`,
@@ -228,7 +283,7 @@ follow the same revision-and-delta contract.
 
 ## Context and compaction
 
-Session memory and one-turn retrieval context remain product-owned. They are
+Classic Session memory and one-turn retrieval context remain product-owned. They are
 injected through `before_agent_start` and are not stored as fake user messages.
 After compaction, the integration refreshes the product Session context but does
 not mutate Pi's authoritative `session_compact` settlement. The refreshed
@@ -236,7 +291,7 @@ context is composed during the next normal provider start. Compaction failures
 and aborts are reported through Pi's `session_compact_failed` lifecycle
 event and enter the same durable product outbox.
 
-Conversation branches use `session.fork.candidates` and `session.fork`. The
+Classic conversation branches use `session.fork.candidates` and `session.fork`. The
 candidate ids come from Pi's session tree. A fork creates a distinct native Pi
 transcript at the selected user-message anchor and opens it under a new product
 `sessionId`; the source transcript and source binding are never rewritten.

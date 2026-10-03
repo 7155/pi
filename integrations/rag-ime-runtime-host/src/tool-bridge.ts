@@ -525,7 +525,7 @@ export function modelVisibleBackendToolParameters(tool: BackendToolManifest): Re
 	return schema;
 }
 
-function canonicalJson(value: unknown): unknown {
+export function canonicalJson(value: unknown): unknown {
 	if (Array.isArray(value)) {
 		return value.map(canonicalJson);
 	}
@@ -859,7 +859,7 @@ export async function rebindGovernedToolReceipts(
 	return rebound;
 }
 
-async function executeGatewayTool(
+export async function executeGatewayTool(
 	options: BackendToolBridgeOptions,
 	tool: BackendToolManifest,
 	toolCallId: string,

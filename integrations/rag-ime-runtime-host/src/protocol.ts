@@ -23,6 +23,7 @@ export type RuntimeMethod =
 	| "session.fork"
 	| "session.rewind"
 	| "session.prompt"
+	| "session.resume"
 	| "session.steer"
 	| "session.follow_up"
 	| "session.abort"
@@ -219,6 +220,7 @@ const RUNTIME_METHODS = new Set<RuntimeMethod>([
 	"session.fork",
 	"session.rewind",
 	"session.prompt",
+	"session.resume",
 	"session.steer",
 	"session.follow_up",
 	"session.abort",

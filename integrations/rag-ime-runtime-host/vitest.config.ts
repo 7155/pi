@@ -31,6 +31,7 @@ export default defineConfig({
 		},
 	},
 	resolve: {
+		conditions: ["source"],
 		alias: [
 			{ find: /^@earendil-works\/pi-telemetry$/, replacement: telemetrySrcIndex },
 			{ find: /^@earendil-works\/pi-ai$/, replacement: aiSrcIndex },
@@ -49,4 +50,5 @@ export default defineConfig({
 			{ find: /^@mariozechner\/pi-tui$/, replacement: tuiSrcIndex },
 		],
 	},
+	ssr: { resolve: { conditions: ["source"] } },
 });
