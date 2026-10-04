@@ -228,7 +228,7 @@ export class NativePiPackageManager {
 	private readonly prepared = new Map<string, PreparedPackage>();
 	private readonly previews = new Map<string, NativeInstallPreviewRecord>();
 	private readonly mutationTails = new Map<string, Promise<void>>();
-	private enabledCapabilities = new Set<string>();
+	private enabledCapabilityOwners = new Map<string, Set<string>>();
 
 	constructor(options: NativePackageManagerOptions) {
 		this.agentDir = resolve(options.agentDir);
@@ -256,13 +256,26 @@ export class NativePiPackageManager {
 	}
 
 	private refreshEnabledCapabilities(state: NativePackageStateFile): void {
-		this.enabledCapabilities = new Set(
-			state.packages.flatMap((entry) => (entry.enabled ? (entry.active.capabilities ?? []) : [])),
-		);
+		const owners = new Map<string, Set<string>>();
+		for (const entry of state.packages) {
+			if (!entry.enabled) continue;
+			for (const capability of entry.active.capabilities ?? []) {
+				const packageIds = owners.get(capability) ?? new Set<string>();
+				packageIds.add(entry.id);
+				owners.set(capability, packageIds);
+			}
+		}
+		this.enabledCapabilityOwners = owners;
 	}
 
-	hasEnabledCapability(capability: string): boolean {
-		return this.enabledCapabilities.has(capability);
+	hasEnabledCapability(capability: string, excludedPackageIds?: ReadonlySet<string>): boolean {
+		const owners = this.enabledCapabilityOwners.get(capability);
+		if (!owners) return false;
+		if (!excludedPackageIds?.size) return true;
+		for (const packageId of owners) {
+			if (!excludedPackageIds.has(packageId)) return true;
+		}
+		return false;
 	}
 
 	private requireApproval(token: string | undefined): void {

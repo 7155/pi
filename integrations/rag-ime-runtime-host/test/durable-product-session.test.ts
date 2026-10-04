@@ -85,7 +85,7 @@ describe("public RuntimeHost Durable engine", () => {
 			await symlink(sessionDir, alias);
 			const host = await f.createHost({ sessionDir: alias });
 			const opened = await f.open(host);
-			expect(opened).toMatchObject({ durableStoreRef: f.openParams.durableStoreRef, paused: true });
+			expect(opened).toMatchObject({ durableStoreRef: f.openParams.durableStoreRef, paused: false });
 			const foreign = join(f.directory, "foreign-storage");
 			await mkdir(foreign);
 			const denied = join(sessionDir, "durable", "agent:symlink-denied");
@@ -120,7 +120,7 @@ describe("public RuntimeHost Durable engine", () => {
 		try {
 			const opened = await f.open();
 			expect(opened).toMatchObject({ runtimeEngine: "durable", durableStoreRef: f.openParams.durableStoreRef,
-				paused: true, recoverable: false, isIdle: true, engineCapabilities: { gatewayTools: true, nativeMcp: false, codemode: false, resume: true } });
+				paused: false, recoverable: false, isIdle: true, engineCapabilities: { gatewayTools: true, nativeMcp: false, codemode: false, resume: true } });
 			expect(opened.sessionFile).toBeUndefined();
 			expect(opened.piSessionId).toMatch(/^[0-9a-f-]{36}$/u);
 			expect(f.calls()).toBe(0);
@@ -147,13 +147,49 @@ describe("public RuntimeHost Durable engine", () => {
 			await f.host.dispose();
 			const reopenedHost = await f.createHost();
 			const reopened = await f.open(reopenedHost);
-			expect(reopened).toMatchObject({ paused: true, recoverable: false });
+			expect(reopened).toMatchObject({ paused: false, recoverable: false });
 			const replay = await f.turn("hello", "client:one", reopenedHost);
 			expect(replay).toMatchObject({ turnId: original.turnId, clientMessageId: original.clientMessageId });
 			expect(f.calls()).toBe(1);
 			await expect(f.turn("changed", "client:one", reopenedHost)).rejects.toMatchObject({ code: "PROMPT_IDENTITY_MISMATCH" });
 			expect(f.calls()).toBe(1);
 			expect(record(await f.settled(original, reopenedHost)).receipt).toEqual(originalReceipt.receipt);
+		} finally { await f.close(); }
+	});
+
+	it("reopens a completed Session idle and accepts a new input without resuming or replaying the old one", async () => {
+		const f = await fixture();
+		f.faux.setResponses([fauxAssistantMessage("first completed reply"), fauxAssistantMessage("new input reply")]);
+		try {
+			const first = await f.open();
+			const original = await f.turn();
+			const originalReceipt = await f.settled(original);
+			await f.host.dispose();
+			const host = await f.createHost();
+			const opened = await f.open(host);
+			expect(opened).toMatchObject({ piSessionId: first.piSessionId, paused: false, recoverable: false, isIdle: true });
+			expect(opened.activeTurn).toBeUndefined();
+			const session = host.sessions.get(f.openParams.sessionId);
+			if (!(session instanceof DurableProductSession)) throw new Error("Expected the actual Durable engine");
+			for (const method of ["session.snapshot", "session.control_state"] as const) {
+				const state = await f.invoke(method, { sessionId: f.openParams.sessionId, view: "recent" }, host);
+				expect(state).toMatchObject({ paused: false, recoverable: false, isIdle: true });
+				expect(state.activeTurn).toBeUndefined();
+			}
+			// Product idleness does not resume native scheduling or execute anything during passive reads.
+			expect((await session.harness.inspect(BACKGROUND_CONTEXT)).scheduling).toBe("paused");
+			expect(f.faux.state.callCount).toBe(1);
+			const next = await f.turn("a different question", "client:two", host);
+			expect(next).toMatchObject({ clientMessageId: "client:two", disposition: "started" });
+			expect(next.turnId).not.toBe(original.turnId);
+			expect(record((await f.settled(next, host)).receipt)).toMatchObject({ disposition: "completed" });
+			expect(f.faux.state.callCount).toBe(2);
+			expect(record((await f.settled(original, host)).receipt)).toEqual(originalReceipt.receipt);
+			const snapshot = await f.invoke("session.snapshot", { sessionId: f.openParams.sessionId }, host);
+			expect(snapshot).toMatchObject({ paused: false, recoverable: false, isIdle: true });
+			expect((snapshot.messages as Record<string, unknown>[]).filter(message => message.role === "user"))
+				.toEqual([expect.objectContaining({ content: "hello", clientMessageId: "client:one", _ragImeTurnId: original.turnId }),
+					expect.objectContaining({ content: "a different question", clientMessageId: "client:two", _ragImeTurnId: next.turnId })]);
 		} finally { await f.close(); }
 	});
 
@@ -168,7 +204,7 @@ describe("public RuntimeHost Durable engine", () => {
 			}
 			await f.invoke("session.close", { sessionId: f.openParams.sessionId });
 			const opened = await f.open(contender);
-			expect(opened).toMatchObject({ runtimeEngine: "durable", paused: true });
+			expect(opened).toMatchObject({ runtimeEngine: "durable", paused: false });
 			await setImmediate();
 			expect(f.calls()).toBe(0);
 		} finally { await f.close(); }
@@ -195,6 +231,7 @@ describe("public RuntimeHost Durable engine", () => {
 			}
 			await setImmediate();
 			expect(f.faux.state.callCount).toBe(1);
+			await expect(f.turn("cannot replace unfinished input", "client:replacement", host)).rejects.toMatchObject({ code: "SESSION_BUSY" });
 			await expect(f.invoke("session.resume", { sessionId: f.openParams.sessionId, turnId: "wrong", clientMessageId: ack.clientMessageId }, host)).rejects.toMatchObject({ code: "RESUME_TARGET_MISMATCH" });
 			const resume = await f.invoke("session.resume", { sessionId: f.openParams.sessionId, turnId: ack.turnId, clientMessageId: ack.clientMessageId }, host);
 			expect(resume).toMatchObject({ schemaVersion: "rag-ime.pi-session-resume.v1", accepted: true, resumed: true,
@@ -361,7 +398,7 @@ describe("public RuntimeHost Durable engine", () => {
 				}, BACKGROUND_CONTEXT);
 			} finally { await native.close(BACKGROUND_CONTEXT); }
 			const reopened = await f.createHost();
-			expect(await f.open(reopened)).toMatchObject({ paused: true, recoverable: false, isIdle: true });
+			expect(await f.open(reopened)).toMatchObject({ paused: false, recoverable: false, isIdle: true });
 			expect(record((await f.settled(ack, reopened)).receipt)).toMatchObject({ disposition: "aborted", pendingOperations: 0 });
 			expect(f.faux.state.callCount).toBe(1);
 		} finally { reply.release(); await f.close(); }

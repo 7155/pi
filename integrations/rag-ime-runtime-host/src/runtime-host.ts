@@ -16,6 +16,7 @@ import { classificationDispatch, classificationId, classificationParams, MANAGED
 import { pendingRoomCancellationSurfaces, roomCancellationSurfaces } from "./cancellation-receipts.ts";
 import { listBundledPiPackages } from "./bundled-package-catalog.ts";
 import { DurableProductSession } from "./durable-product-session.ts";
+import { parseCompactionTarget } from "./compaction-target.ts";
 import { NativePiPackageManager } from "./native-package-manager.ts";
 import { PiProductSession, type PiSessionAbortReceipt } from "./pi-session.ts";
 import { ManagedPluginManager } from "./plugin-manager.ts";
@@ -568,6 +569,7 @@ export class RagImeRuntimeHost {
 						settledEvents: true,
 						dynamicTools: true,
 						sessionControlState: true,
+						sessionCompactionRecovery: true,
 						sessionBoundAbort: true,
 						sessionSnapshot: true,
 						conversationFork: true,
@@ -893,6 +895,7 @@ export class RagImeRuntimeHost {
 					if (canonical !== join(managedRoot, "durable", sessionId)) throw new RuntimeProtocolError("SESSION_PATH_DENIED", "Durable storage symlink binding is not allowed");
 					const opened = await this.sessions.open(sessionId, () => DurableProductSession.create({
 						externalSessionId: sessionId, cwd, durableStoreRef: canonical, modelRuntime: this.modelRuntime,
+						agentDir: this.options.agentDir,
 						provider, modelId, thinkingLevel: thinking as ModelThinkingLevel | undefined,
 						toolManifest: params.toolManifest ?? [], toolGatewayUrl: this.options.toolGatewayUrl, toolGatewayToken: this.options.toolGatewayToken,
 						systemPrompt: optionalString(params, "systemPrompt", 64_000), sessionContext: optionalString(params, "sessionContext", 256_000),
@@ -1057,6 +1060,12 @@ export class RagImeRuntimeHost {
 			case "session.resume": {
 				const session = this.session(params);
 				if (!(session instanceof DurableProductSession)) throw new RuntimeProtocolError("ENGINE_FEATURE_UNAVAILABLE", "Explicit native resume requires a Durable Session");
+				if (params.compactionTarget !== undefined) {
+					if (["turnId", "clientMessageId", "expectedTurnId", "expectedClientMessageId", "cancelId", "lookupOnly", "recoverRetiredOnly", "recoverInterruptedOnly"].some(key => params[key] !== undefined)) {
+						throw new RuntimeProtocolError("INVALID_PARAMS", "Compaction recovery cannot include input or cancellation identities");
+					}
+					return session.resumeCompaction(parseCompactionTarget(params.compactionTarget));
+				}
 				return session.resume(requiredString(params, "turnId", 240), requiredString(params, "clientMessageId", 128));
 			}
 			case "session.prompt": {
@@ -1084,6 +1093,14 @@ export class RagImeRuntimeHost {
 					images: Array.isArray(params.images) ? (params.images as never) : undefined,
 				});
 			case "session.abort":
+				if (params.compactionTarget !== undefined) {
+					if (["turnId", "clientMessageId", "expectedTurnId", "expectedClientMessageId", "cancelId", "lookupOnly", "recoverRetiredOnly", "recoverInterruptedOnly"].some(key => params[key] !== undefined)) {
+						throw new RuntimeProtocolError("INVALID_PARAMS", "Compaction Stop cannot include input or cancellation identities");
+					}
+					const session = this.session(params);
+					if (!(session instanceof DurableProductSession)) throw new RuntimeProtocolError("ENGINE_FEATURE_UNAVAILABLE", "Compaction recovery requires a Durable Session");
+					return session.abortCompaction(parseCompactionTarget(params.compactionTarget));
+				}
 				if (params.cancelId !== undefined || params.lookupOnly !== undefined || params.recoverRetiredOnly !== undefined || params.recoverInterruptedOnly !== undefined) {
 					return this.session(params).abortExact({
 						turnId: requiredString(params, "expectedTurnId", 240),

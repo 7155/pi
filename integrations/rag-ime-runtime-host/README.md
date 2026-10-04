@@ -101,8 +101,11 @@ and cancellation operations have joined.
 Opening or reading history is passive. Unfinished native input is reported as
 `paused`, `recoverable` and an exact `activeTurn`. `session.resume` takes the
 original turn/client IDs, never resubmits a prompt, and returns saved settlement
-for terminal input. Lost admission responses reuse the same request; changed
-arguments conflict before native deduplication. Public full history paginates
+for terminal input. Empty or completed Sessions instead report `isIdle: true`,
+`paused: false`, `recoverable: false` and no `activeTurn`, even though passive
+open leaves the native scheduler paused. They accept a new input without a
+resume request or replaying completed work. Lost admission responses reuse the
+same request; changed arguments conflict before native deduplication. Public full history paginates
 native entries independently of the compacted model-context head. Recent views
 remain bounded and preserve original message and Tool identities.
 
@@ -135,6 +138,68 @@ Harness/SQLite and a faux ModelRuntime, including restart, unsafe-effect
 recovery, exact generation cancellation, delayed drain, projection gaps and
 history after compaction. It establishes controlled native behavior, not
 configured Provider or installed foreground acceptance.
+
+Durable generation and compaction retries read Pi's existing `retry` settings
+through `SettingsManager`, using the same managed agent directory and trusted
+project-setting precedence as Classic. Explicit `retry.enabled: false` prevents
+new outer retry attempts; enabled `maxRetries: 1` permits one retry after the
+initial attempt. Missing settings retain native defaults. Reading the settings
+does not write configuration, and each passive reopen reloads them without
+starting work. It does not rewrite existing native retry checkpoints. The
+separate `transport` and `retry.provider` settings (`timeoutMs`, `maxRetries`,
+`maxRetryDelayMs`) are forwarded through native Harness stream settings to both
+generation and compaction requests. Explicit `transport: "sse"` and
+`retry.provider.maxRetries: 0` disable automatic transport selection and
+provider-internal retries. Missing fields retain provider defaults. Already
+prepared native requests retain their checkpointed stream settings.
+PAW's preparation fills missing
+retry fields only, so its environment defaults do not replace explicit values
+already present in `settings.json`.
+
+### Standalone Durable compaction recovery
+
+`hello.capabilities.sessionCompactionRecovery` and Durable
+`engineCapabilities.compactionRecovery` advertise exact compaction recovery.
+When unfinished standalone native compactions are the only remaining work,
+open, snapshot and control-state metadata expose `compactionTarget`:
+`{ kind: "compaction", runtimeSessionId: piSessionId, taskIds: ["durable:task:N"] }`.
+The list is the complete surviving task set, with nonempty unique positive
+safe-integer IDs in string-lexicographic order (`10` before `2`), within the
+existing request-size limit. It is never truncated. Owned ordinary children remain part of the native drain boundary;
+unrelated native work prevents advertising or activating a compaction-only
+target. There is no fabricated `activeTurn` for a compaction. A passive reopen
+reports `paused: true`, `recoverable: true`, and `isIdle: false` until its native
+tasks are terminal, even if `LiveDoc` has already removed its compaction status.
+
+`session.resume({ sessionId, compactionTarget })` resumes original checkpoints
+without creating another compaction. Its `rag-ime.pi-compaction-resume.v1`
+response includes `accepted`, `runtimeEngine`, the exact target, `resumed`, and
+current `state`. Terminal repeats return `resumed: false` without enabling
+scheduling. `session.abort({ sessionId, compactionTarget })` marks all exact
+targets before enabling scheduling, then joins outside the admission lane.
+Its `rag-ime.pi-compaction-abort.v1` response includes `accepted`, `runtimeEngine`,
+the exact target, `drained: true`, native `outcomes` (`completed`, `aborted`, or
+`failed` for each task ID), and current `state`. It cannot return drain proof
+while any named task or its ordinary owned work is unfinished. Repeats read the
+original immutable outcomes and cannot stop a newer input or compaction.
+
+Compaction targets are mutually exclusive with turn/client identities and
+exact-cancel options. Malformed or mixed forms return `INVALID_PARAMS`;
+wrong Session, task kind, ownership, missing tasks, partial current sets, or
+unrelated work return `COMPACTION_TARGET_MISMATCH`. Duplicate manual compaction
+admission returns `SESSION_BUSY`. Manual compaction during an already-running
+input remains supported; it cannot implicitly restart paused unfinished work.
+Native resume enables the whole Harness, so
+validation checks the entire surviving work set, not merely one task ID.
+
+`agent.event` payload `compaction_settled` carries the original target and
+authoritative current control `state` only after all its native tasks are
+terminal. Consumers use this to refresh controls after natural completion.
+The earlier native `compaction_end` event is presentation only: it can precede
+ordinary owned-child drain and must not clear recovery state. Tests in
+`test/durable-compaction-recovery.test.ts` cover passive restart, complete-set
+resume/Stop, malformed and stale identities, newer work, concurrent requests,
+provider drain, and compaction completion held by an owned child.
 
 ## Native programmatic tool calling
 
