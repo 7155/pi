@@ -121,6 +121,63 @@ describe("native Pi Package lifecycle", () => {
 		});
 	});
 
+	it("queries current capability owners while preserving each session's excluded packages", async () => {
+		const root = await mkdtemp(join(tmpdir(), "rag-ime-native-package-capabilities-"));
+		roots.push(root);
+		const manager = await createManager(root);
+		const installed = [];
+		for (const name of ["allowed-workflow", "excluded-workflow"]) {
+			const draft = await manager.createDraft({
+				draftId: name,
+				packageJson: { ...packageJson("1.0.0"), name },
+				files: { "skills/context-helper/SKILL.md": skill("1.0.0") },
+			});
+			installed.push(await installReviewed(manager, await manager.prepare(draft.sourcePath), true));
+		}
+		const allowed = installed[0]!;
+		const excluded = new Set([installed[1]!.id]);
+		// Retain the same callback across lifecycle changes, as an open Session does.
+		const available = () => manager.hasEnabledCapability("session-workflow", excluded);
+		expect(available()).toBe(true);
+		expect(manager.hasEnabledCapability("session-workflow")).toBe(true);
+		expect(manager.hasEnabledCapability("session-workflow", new Set())).toBe(true);
+		expect(manager.hasEnabledCapability("session-workflow", new Set(installed.map((item) => item.id)))).toBe(false);
+		expect(manager.hasEnabledCapability("missing-capability", excluded)).toBe(false);
+
+		await manager.setEnabled({
+			packageId: allowed.id,
+			enabled: false,
+			expectedActiveDigest: allowed.digest,
+			expectedEnabled: true,
+			approvalToken: "approved-by-product",
+		});
+		// The excluded provider keeps the global capability enabled, but cannot
+		// preserve access for this Session after its allowed provider is disabled.
+		expect(manager.hasEnabledCapability("session-workflow")).toBe(true);
+		expect(available()).toBe(false);
+		const reopened = await createManager(root);
+		expect(reopened.hasEnabledCapability("session-workflow")).toBe(true);
+		expect(reopened.hasEnabledCapability("session-workflow", excluded)).toBe(false);
+
+		await manager.setEnabled({
+			packageId: allowed.id,
+			enabled: true,
+			expectedActiveDigest: allowed.digest,
+			expectedEnabled: false,
+			approvalToken: "approved-by-product",
+		});
+		expect(available()).toBe(true);
+		await manager.uninstall({
+			packageId: allowed.id,
+			expectedActiveDigest: allowed.digest,
+			expectedEnabled: true,
+			approvalToken: "approved-by-product",
+		});
+		expect(manager.hasEnabledCapability("session-workflow")).toBe(true);
+		expect(available()).toBe(false);
+		expect([...excluded]).toEqual([installed[1]!.id]);
+	});
+
 	it("requires a one-time reviewed install and preserves a verified rollback", async () => {
 		const root = await mkdtemp(join(tmpdir(), "rag-ime-native-package-review-"));
 		roots.push(root);
@@ -135,7 +192,7 @@ describe("native Pi Package lifecycle", () => {
 
 		const secondDraft = await manager.createDraft({
 			draftId: "context-helper-v2",
-			packageJson: packageJson("2.0.0"),
+			packageJson: { ...packageJson("2.0.0"), paw: { capabilities: ["replacement-workflow"] } },
 			files: { "skills/context-helper/SKILL.md": skill("2.0.0") },
 		});
 		const second = await manager.prepare(secondDraft.sourcePath);
@@ -155,6 +212,8 @@ describe("native Pi Package lifecycle", () => {
 		};
 		const installed = await manager.install(request);
 		expect(installed.rollbackTarget).toMatchObject({ version: "1.0.0", digest: first.digest });
+		expect(manager.hasEnabledCapability("session-workflow")).toBe(false);
+		expect(manager.hasEnabledCapability("replacement-workflow")).toBe(true);
 		await expect(manager.install(request)).rejects.toMatchObject({ code: "PLUGIN_PREPARE_REQUIRED" });
 
 		const rolledBack = await manager.rollback({
@@ -165,5 +224,8 @@ describe("native Pi Package lifecycle", () => {
 		});
 		expect(rolledBack).toMatchObject({ version: "1.0.0", digest: first.digest, enabled: true });
 		expect(rolledBack.rollbackTarget).toBeUndefined();
+		expect(manager.hasEnabledCapability("replacement-workflow")).toBe(false);
+		expect(manager.hasEnabledCapability("session-workflow")).toBe(true);
+		expect(manager.hasEnabledCapability("session-workflow", new Set([rolledBack.id]))).toBe(false);
 	});
 });
