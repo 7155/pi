@@ -49,6 +49,52 @@ function skill(options: {
 }
 
 describe("runtime discovery tools", () => {
+
+	it.each(["agent_goal", "+agent_goal", "+AGENT_GOAL"])("finds the exact product goal for %s and preserves the query receipt", (query) => {
+		const registry = new BackendToolRegistry();
+		registry.sync([{ name: "agent_goal", description: "Settle the audited product goal.", parameters: { type: "object", properties: {} } }]);
+		const result = searchBackendTools(registry.catalog(), { query, limit: 1 }, registry.catalogRevision(), []);
+		expect(result).toMatchObject({ query, items: [{ name: "agent_goal" }], activeDirectCalls: [] });
+		expect(registry.disclosed()).toEqual([]);
+	});
+
+	it("reports a loaded prefixed goal as an active direct call rather than a missing or reloadable tool", () => {
+		const registry = new BackendToolRegistry();
+		registry.sync([{ name: "agent_goal", description: "Settle the audited product goal.", parameters: { type: "object", properties: {} } }]);
+		registry.disclose("agent_goal");
+		const result = searchBackendTools(registry.catalog(), { query: "+agent_goal" }, registry.catalogRevision(), ["agent_goal"]);
+		expect(result).toMatchObject({ query: "+agent_goal", items: [], activeDirectCalls: ["agent_goal"] });
+		expect(registry.disclosed().map((tool) => tool.name)).toEqual(["agent_goal"]);
+	});
+
+	it("does not reveal or load a hidden product tool through a prefixed query", () => {
+		const registry = new BackendToolRegistry();
+		registry.sync([{ name: "agent_goal", modelVisible: false, description: "Hidden authority.", parameters: { type: "object", properties: {} } }]);
+		expect(searchBackendTools(registry.catalog(), { query: "+agent_goal" }, registry.catalogRevision(), []))
+			.toMatchObject({ query: "+agent_goal", items: [], activeDirectCalls: [] });
+		expect(() => loadBackendTool(registry, { name: "agent_goal" })).toThrow();
+		expect(registry.disclosed()).toEqual([]);
+	});
+
+	it("keeps notFor vetoes when normalizing prefixed query terms", () => {
+		const tools: BackendToolManifest[] = [{ name: "agent_plan", description: "Maintain an execution plan.",
+			parameters: { type: "object", properties: {} }, when: ["execution plan"], notFor: ["daily plan"] }];
+		expect(searchBackendTools(tools, { query: "+daily +plan" }, "revision"))
+			.toMatchObject({ query: "+daily +plan", items: [] });
+	});
+
+	it("preserves internal plus signs and does not invent tools for unmatched prefixed names", () => {
+		const tools: BackendToolManifest[] = [
+			{ name: "cpp_inspect", description: "Inspect declarations.", when: ["C++"], notFor: [],
+				parameters: { type: "object", properties: {} } },
+			{ name: "c", description: "C declarations.", when: ["C"], notFor: [],
+				parameters: { type: "object", properties: {} } },
+		];
+		expect(searchBackendTools(tools, { query: "C++", limit: 1 }, "revision"))
+			.toMatchObject({ query: "C++", items: [{ name: "cpp_inspect" }] });
+		expect(searchBackendTools(tools, { query: "+unavailable_goal" }, "revision"))
+			.toMatchObject({ query: "+unavailable_goal", items: [] });
+	});
 	it("searches a stable public Skill catalog without exposing hidden skills or paths", () => {
 		const skills = [
 			skill({ name: "memory-review", description: "Review long-term memory." }),

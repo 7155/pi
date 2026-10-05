@@ -468,6 +468,10 @@ export function searchBackendTools(
 	activeNames?: readonly string[],
 ): Record<string, unknown> {
 	const query = typeof args.query === "string" ? args.query.trim() : "";
+	// Native MCP search ignores a leading + on name terms. Apply the same
+	// narrow normalization to product matching, while preserving query in receipts.
+	// Internal plus signs (for example C++) and other operators stay untouched.
+	const matchingQuery = query.replace(/(^|\s)\+(?=[\p{L}\p{N}_])/gu, "$1");
 	const limit = normalizedLimit(args.limit);
 	const active = new Set(activeNames ?? []);
 	const items = tools
@@ -477,7 +481,7 @@ export function searchBackendTools(
 			return {
 				tool,
 				score: routingSearchScore(
-					query,
+					matchingQuery,
 					tool.name,
 					entry.when,
 					entry.notFor,
@@ -506,7 +510,7 @@ export function searchBackendTools(
 				const entry = backendToolRouteEntry(tool);
 				return (
 					routingSearchScore(
-						query,
+						matchingQuery,
 						tool.name,
 						entry.when,
 						entry.notFor,
