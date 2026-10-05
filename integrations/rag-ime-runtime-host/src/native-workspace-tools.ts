@@ -364,12 +364,20 @@ export function createNativeWorkspaceToolsExtension(
 	const definitions: ToolDefinition<any, any, any>[] = [];
 	const read = projectionTarget(options.registry, READ_TOOL_NAME);
 	if (read) {
+		const readDefinition = createReadToolDefinition(options.cwd);
+		readDefinition.description = [
+			readDefinition.description,
+			"Governed file reads return display text, not a raw file body: optional [evidence ref: ...], [resourceRevision: ...] and [readPage: {...}] headers surround the unchanged body with a continuation note on nonterminal pages.",
+			"In codemode, tools.read(args) resolves to this string, not a content/details object. Do not JSON.parse the entire response.",
+			"For JSON files, inspect readPage and follow nextLineOffset while incomplete. Remove only adapter headers and the declared trailing [Showing lines ... Continue with offset=... ] notice from each page before assembling and parsing the complete body. Missing paging metadata or a spilled-result summary does not prove a complete file; follow any supplied continuation or evidence handle.",
+			"Reuse successful read results rather than repeat successful calls after a later script or parsing failure. For small results, store them and catch parsing errors so the script ends successfully; store writes from a failed script are discarded.",
+		].join("\n");
 		definitions.push(
 			withEvidenceRead(
 				options,
 				projected(
 					options,
-					createReadToolDefinition(options.cwd),
+					readDefinition,
 					read,
 					(input) => ({
 						path: input.path,
