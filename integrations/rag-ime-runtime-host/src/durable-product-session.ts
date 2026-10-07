@@ -5,10 +5,10 @@ import { BACKGROUND_CONTEXT } from "@earendil-works/chord/context";
 import { type AssistantMessage, clampThinkingLevel, getSupportedThinkingLevels, type ModelThinkingLevel, Type } from "@earendil-works/pi-ai";
 import { type ModelRuntime, type PromptOptions, SettingsManager } from "@earendil-works/pi-coding-agent";
 import {
-	AgentDoc, type AgentEvent, type AgentEventStream, type AgentState, type CommitPublication, CompactionTask, type Conversation,
-	createRegistry, defineDoc, defineExtension, defineTool, type EntryRecord, Harness, type InboxState,
-	InboxDoc, type JsonObject, LiveDoc, type LiveState, type SubmissionId, type SubmissionRecord,
-	type TaskId, type TaskInspection, type ToolRegistration, type Tx, watchEvents,
+	AgentDoc, type AgentEvent, type AgentEventStream, type AgentState, AssistantEntry, type CommitPublication, CompactionTask, type Conversation,
+	createRegistry, defineDoc, defineExtension, defineTool, type EntryId, type EntryRecord, Harness, type InboxState,
+	GenerationTask, InboxDoc, type JsonObject, LiveDoc, type LiveState, type SubmissionId, type SubmissionRecord,
+	type TaskId, type TaskInspection, type ToolRegistration, ToolResultEntry, ToolTask, type Tx, watchEvents,
 } from "@earendil-works/pi-durable";
 import { openNodeSqliteStorage } from "@earendil-works/pi-durable/storage/sqlite/node";
 import lockfile from "proper-lockfile";
@@ -62,6 +62,22 @@ type ProductState = {
 	requests: Record<string, RequestBinding>;
 	cancels: Record<string, JsonObject>;
 };
+
+/** Native cancellation outcome for one original tool; it is not physical-drain proof. */
+export interface DurableToolOutcome {
+	schemaVersion: "rag-ime.pi-durable-tool-outcome.v1";
+	sessionId: string;
+	runtimeSessionId: string;
+	turnId: string;
+	clientMessageId: string;
+	toolCallId: string;
+	toolName: string;
+	entryId: string;
+	taskId: string;
+	assistantEntryId: string;
+	generationTaskId: string;
+	status: "aborted";
+}
 
 const ProductDoc = defineDoc<ProductState>({
 	kind: "rag-ime.durable-product", version: 1, scope: "session",
@@ -705,7 +721,47 @@ export class DurableProductSession implements PooledSession {
 
 	private async projectEntry(entry: EntryRecord): Promise<Record<string, unknown>[]> {
 		const request = await this.requestForEntry(entry);
-		return (entry.model ?? []).map((message, index) => this.projectMessage(entry, message, index, request));
+		const outcome = await this.toolOutcome(entry, request);
+		return (entry.model ?? []).map((message, index) => {
+			const projected = this.projectMessage(entry, message, index, request);
+			// This envelope is reserved for verified native lineage, never supplied by message content.
+			delete projected.durableToolOutcome;
+			if (outcome && message.role === "toolResult" && message.toolCallId === outcome.toolCallId && message.toolName === outcome.toolName) {
+				projected.durableToolOutcome = outcome;
+			}
+			return projected;
+		});
+	}
+
+	private async toolOutcome(entry: EntryRecord, request?: RequestBinding): Promise<DurableToolOutcome | undefined> {
+		if (!request || entry.conversationId !== this.conversation.id || !ToolResultEntry.is(entry) || entry.byTaskId === undefined) return;
+		// Read existing native lineage atomically. Tool content and diagnostics are not cancellation authority.
+		return this.harness.commit(async tx => {
+			const task = await tx.task(entry.byTaskId!);
+			if (!task || task.kind !== ToolTask.definition.name || task.version !== ToolTask.definition.version ||
+				task.conversationId !== this.conversation.id || task.owner === undefined || task.background ||
+				(task.state.status !== "terminal" && task.state.status !== "completing") || task.state.outcome.status !== "aborted" ||
+				!request.generationIds.includes(task.owner)) return;
+			const result = task.state.outcome.result;
+			if (!result || typeof result !== "object" || Array.isArray(result) || result.entryId !== entry.id) return;
+			const input = task.input;
+			if (!input || typeof input !== "object" || Array.isArray(input) || typeof input.assistant !== "number" ||
+				!Number.isSafeInteger(input.assistant) || input.assistant <= 0 || typeof input.callId !== "string") return;
+			const generation = await tx.task(task.owner);
+			if (!generation || generation.kind !== GenerationTask.definition.name || generation.version !== GenerationTask.definition.version ||
+				generation.conversationId !== this.conversation.id) return;
+			const bound = this.requestForGeneration(task.owner);
+			if (!bound || bound.turnId !== request.turnId || bound.clientMessageId !== request.clientMessageId) return;
+			const assistant = await tx.entry(input.assistant as EntryId);
+			if (!AssistantEntry.is(assistant) || assistant.conversationId !== this.conversation.id || assistant.byTaskId !== task.owner) return;
+			const message = entry.model?.find(item => item.role === "toolResult" && item.toolCallId === input.callId);
+			if (!message || message.role !== "toolResult" || !assistant.model?.some(item => item.role === "assistant" &&
+				item.content.some(block => block.type === "toolCall" && block.id === input.callId && block.name === message.toolName))) return;
+			return { schemaVersion: "rag-ime.pi-durable-tool-outcome.v1", sessionId: this.externalSessionId,
+				runtimeSessionId: this.state.runtimeSessionId, ...identity(request), toolCallId: message.toolCallId, toolName: message.toolName,
+				entryId: `durable:${entry.id}`, taskId: `durable:task:${task.id}`, assistantEntryId: `durable:${assistant.id}`,
+				generationTaskId: `durable:task:${task.owner}`, status: "aborted" };
+		}, context);
 	}
 
 	private presentationRequest(): RequestBinding | undefined {
@@ -734,10 +790,12 @@ export class DurableProductSession implements PooledSession {
 		const request = this.presentationRequest();
 		const turn = request ? identity(request) : undefined;
 		switch (event.type) {
-			case "message_end":
-				for (const message of await this.projectEntry(event.entry)) this.emitMessageEnd(message, turn ?? await this.requestForEntry(event.entry));
+			case "message_end": {
+				const original = await this.requestForEntry(event.entry);
+				for (const message of await this.projectEntry(event.entry)) this.emitMessageEnd(message, original ?? turn);
 				this.partialMessage = undefined;
 				break;
+			}
 			case "turn_start": {
 				const ids = [...this.generationInputs].filter(([, inputs]) => inputs[0] === this.projectedInputs[0]).map(([id]) => id).sort((a, b) => a - b);
 				this.projectedGenerationId = ids.find(id => !this.projectedGenerations.has(id)) ?? this.projectedGenerationId;
@@ -772,8 +830,12 @@ export class DurableProductSession implements PooledSession {
 			}
 			case "tool_execution_end": {
 				const message = event.entry?.model?.find(item => item.role === "toolResult");
+				const original = event.entry ? await this.requestForEntry(event.entry) : undefined;
+				const outcome = event.entry ? await this.toolOutcome(event.entry, original) : undefined;
 				this.emit({ type: event.type, toolCallId: event.toolCallId, toolName: event.toolName,
-					result: message ? { content: message.content, details: message.details } : undefined, isError: message?.isError ?? true }, turn); break;
+					result: message ? { content: message.content, details: message.details } : undefined, isError: message?.isError ?? true,
+					...(outcome && outcome.toolCallId === event.toolCallId && outcome.toolName === event.toolName ? { durableToolOutcome: outcome } : {}) },
+					original ? identity(original) : turn); break;
 			}
 			case "tool_execution_update": this.emit({ type: event.type, toolCallId: event.toolCallId, toolName: event.toolName,
 				partialResult: { content: [{ type: "text", text: event.output && "set" in event.output ? event.output.set : event.output && "append" in event.output ? event.output.append ?? "" : "" }], details: event.details } }, turn); break;

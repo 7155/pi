@@ -614,6 +614,40 @@ export interface BackendToolBridgeOptions {
 	): Promise<boolean>;
 }
 
+/** A governed proposal is data for a later R1 apply, not a maintenance Run. */
+function isGovernedMemoryPreview(
+	toolName: string,
+	args: unknown,
+	sessionId: string,
+	result: Record<string, unknown>,
+): boolean {
+	if (toolName !== "memory" || typeof args !== "object" || args === null || Array.isArray(args)) return false;
+	const operation = (args as Record<string, unknown>).op;
+	const applyOperations: Record<string, string> = {
+		remember_preview: "remember_apply",
+		correct_preview: "correct_apply",
+		forget_preview: "forget_apply",
+	};
+	if (typeof operation !== "string" || !Object.hasOwn(applyOperations, operation)) return false;
+	const audit = result.audit;
+	const writes = result.writes;
+	if (typeof audit !== "object" || audit === null || Array.isArray(audit)
+		|| typeof writes !== "object" || writes === null || Array.isArray(writes)) return false;
+	const binding = audit as Record<string, unknown>;
+	const effects = writes as Record<string, unknown>;
+	return result.schemaVersion === "rag-ime.memory-governance-preview.v1"
+		&& result.operation === operation && result.applyOperation === applyOperations[operation]
+		&& result.sessionId === sessionId && binding.sessionId === sessionId
+		&& typeof result.proposalId === "string" && /^[A-Za-z0-9._:-]{1,240}$/u.test(result.proposalId)
+		&& result.previewId === result.proposalId
+		&& binding.recordKind === "memory_governance_proposal"
+		&& typeof binding.payloadSha256 === "string" && /^[0-9a-f]{64}$/u.test(binding.payloadSha256)
+		&& result.reviewRequired === true && result.mutationApplied === false
+		&& effects.proposalStored === true && effects.memoryAtoms === false
+		&& effects.memoryBooks === false && effects.retrievalVectors === false
+		&& result.approvalRequired !== true && result.runId === undefined && result.run === undefined;
+}
+
 function boundedGatewaySignal(
 	signal: AbortSignal | undefined,
 	timeoutMs: number,
@@ -902,7 +936,7 @@ export async function executeGatewayTool(
 		...(payload.roomInvocationReceipt ? { roomInvocationReceipt: payload.roomInvocationReceipt } : {}),
 		...(payload.roomExecutionReceipt ? { roomExecutionReceipt: payload.roomExecutionReceipt } : {}),
 	};
-	if (result.reviewRequired === true) {
+	if (result.reviewRequired === true && !isGovernedMemoryPreview(tool.name, prepared.arguments, options.sessionId, result)) {
 		const run = typeof result.run === "object" && result.run !== null ? (result.run as Record<string, unknown>) : {};
 		const runId = String(run.runId ?? result.runId ?? "");
 		if (!runId || !options.waitForDecision) throw new Error("Product review bridge is unavailable");

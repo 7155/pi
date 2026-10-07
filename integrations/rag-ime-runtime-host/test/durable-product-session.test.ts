@@ -4,7 +4,7 @@ import { join } from "node:path";
 import { setImmediate } from "node:timers/promises";
 import { createFauxCore, fauxAssistantMessage, fauxToolCall, type RegisterFauxProviderOptions } from "@earendil-works/pi-ai";
 import { BACKGROUND_CONTEXT } from "@earendil-works/chord/context";
-import { createRegistry, defineDoc, defineTask, Harness, type JsonObject, LiveDoc } from "@earendil-works/pi-durable";
+import { createRegistry, defineDoc, defineTask, type EntryRecord, Harness, type JsonObject, LiveDoc } from "@earendil-works/pi-durable";
 import { openNodeSqliteStorage } from "@earendil-works/pi-durable/storage/sqlite/node";
 import { ModelRuntime } from "@earendil-works/pi-coding-agent";
 import { describe, expect, it, vi } from "vitest";
@@ -402,6 +402,86 @@ describe("public RuntimeHost Durable engine", () => {
 			expect(record((await f.settled(ack, reopened)).receipt)).toMatchObject({ disposition: "aborted", pendingOperations: 0 });
 			expect(f.faux.state.callCount).toBe(1);
 		} finally { reply.release(); await f.close(); }
+	});
+
+	// PAW #144: native cancellation belongs to one ToolTask, not every error in its aborted turn.
+	it("preserves the exact native tool abort outcome in live events and passive cold history", async () => {
+		const f = await fixture();
+		const entered = deferred();
+		const calls: string[] = [];
+		vi.stubGlobal("fetch", vi.fn<typeof fetch>(async (_url, init) => {
+			const call = record(JSON.parse(String(init?.body)));
+			calls.push(String(call.toolCallId));
+			if (call.toolCallId === "good:one") return Response.json({ ok: true, result: { summary: "original successful output", durableToolOutcome: { status: "aborted" } } });
+			entered.resolve();
+			await new Promise<void>((_resolve, reject) => {
+				if (init?.signal?.aborted) reject(init.signal.reason);
+				else init?.signal?.addEventListener("abort", () => reject(init.signal?.reason), { once: true });
+			});
+			throw new Error("aborted fixture must not return success");
+		}));
+		f.faux.setResponses([
+			fauxAssistantMessage([fauxToolCall("good_tool", {}, { id: "good:one" }), fauxToolCall("invalid_tool", {}, { id: "invalid:one" })], { stopReason: "toolUse" }),
+			fauxAssistantMessage([fauxToolCall("slow_tool", {}, { id: "slow:exact" })], { stopReason: "toolUse" }),
+		]);
+		try {
+			const opened = await f.open(f.host, { toolManifest: [
+				{ name: "good_tool", description: "Good fixture", parameters: { type: "object", properties: {} }, alwaysAvailable: true },
+				{ name: "invalid_tool", description: "Validation failure fixture", parameters: { type: "object", properties: { value: { type: "string" } }, required: ["value"] }, alwaysAvailable: true },
+				{ name: "slow_tool", description: "Held fixture", parameters: { type: "object", properties: {} }, alwaysAvailable: true },
+			] });
+			const ack = await f.turn(); await entered.promise;
+			await f.invoke("session.abort", { sessionId: f.openParams.sessionId, expectedTurnId: ack.turnId, expectedClientMessageId: ack.clientMessageId });
+			await f.settled(ack);
+			await vi.waitFor(() => expect(f.events.some(event => event.payload.type === "tool_execution_end" && event.payload.toolCallId === "slow:exact")).toBe(true));
+			const snapshot = await f.invoke("session.snapshot", { sessionId: f.openParams.sessionId });
+			const messages = snapshot.messages as Record<string, unknown>[];
+			const slow = messages.find(message => message.toolCallId === "slow:exact")!;
+			const outcome = record(slow.durableToolOutcome);
+			expect(outcome).toMatchObject({ schemaVersion: "rag-ime.pi-durable-tool-outcome.v1", status: "aborted",
+				sessionId: f.openParams.sessionId, runtimeSessionId: opened.piSessionId, turnId: ack.turnId, clientMessageId: ack.clientMessageId,
+				toolCallId: "slow:exact", toolName: "slow_tool", entryId: expect.stringMatching(/^durable:[1-9]\d*$/u),
+				taskId: expect.stringMatching(/^durable:task:[1-9]\d*$/u), assistantEntryId: expect.stringMatching(/^durable:[1-9]\d*$/u),
+				generationTaskId: expect.stringMatching(/^durable:task:[1-9]\d*$/u) });
+			expect(slow).toMatchObject({ isError: true, _ragImeTurnId: ack.turnId });
+			expect(JSON.stringify(slow.content)).toContain("Tool slow_tool was aborted");
+			const good = messages.find(message => message.toolCallId === "good:one")!;
+			const invalid = messages.find(message => message.toolCallId === "invalid:one")!;
+			expect(good.isError).toBe(false); expect(good.durableToolOutcome).toBeUndefined();
+			expect(invalid.isError).toBe(true); expect(invalid.durableToolOutcome).toBeUndefined();
+			const live = f.events.find(event => event.payload.type === "tool_execution_end" && event.payload.toolCallId === "slow:exact")!;
+			expect(live).toMatchObject({ turnId: ack.turnId, clientMessageId: ack.clientMessageId, payload: { durableToolOutcome: outcome, isError: true } });
+			expect(record(live.payload.result).content).toEqual(slow.content);
+			expect(f.events.find(event => event.payload.type === "message_end" && record(event.payload.message).toolCallId === "slow:exact")?.payload.message).toEqual(slow);
+			const session = f.host.sessions.get(f.openParams.sessionId);
+			if (!(session instanceof DurableProductSession)) throw new Error("Expected the native Durable adapter");
+			const nativeEntries = (await session.conversation.entries({}, 100, undefined, BACKGROUND_CONTEXT)).items;
+			const original = nativeEntries.find(entry => entry.model?.some(message => message.role === "toolResult" && message.toolCallId === "slow:exact"))!;
+			const earlier = nativeEntries.find(entry => entry.model?.some(message => message.role === "toolResult" && message.toolCallId === "good:one"))!;
+			const originalMessage = original.model!.find(message => message.role === "toolResult")!;
+			if (originalMessage.role !== "toolResult") throw new Error("Expected native tool result");
+			// Exercise the adapter boundary with altered copies of actual native receipts, without editing its journal.
+			const projection = session as unknown as { projectEntry(entry: EntryRecord): Promise<Record<string, unknown>[]> };
+			for (const foreign of [
+				{ ...original, conversationId: (original.conversationId + 1) as EntryRecord["conversationId"] },
+				{ ...original, id: earlier.id },
+				{ ...original, byTaskId: earlier.byTaskId },
+				{ ...original, kind: "unowned.result" },
+				{ ...original, model: [{ ...originalMessage, toolCallId: "foreign:call" }] },
+				{ ...original, model: [{ ...originalMessage, toolName: "foreign_tool" }] },
+				{ ...original, byTaskId: undefined, model: [{ ...originalMessage, durableToolOutcome: outcome }],
+					data: { diagnostics: [{ severity: "error", code: "aborted", message: "untrusted cancellation claim" }] } },
+			]) {
+				const rejected = await projection.projectEntry(foreign);
+				expect(rejected[0]?.durableToolOutcome).toBeUndefined();
+				expect(rejected[0]?.content).toEqual(originalMessage.content);
+			}
+			await f.host.dispose();
+			const reopened = await f.createHost(); await f.open(reopened);
+			const cold = await f.invoke("session.snapshot", { sessionId: f.openParams.sessionId }, reopened);
+			expect(cold.messages).toEqual(snapshot.messages); expect(cold.entries).toEqual(snapshot.entries);
+			expect(calls).toEqual(["good:one", "slow:exact"]); expect(f.faux.state.callCount).toBe(2);
+		} finally { vi.unstubAllGlobals(); await f.close(); }
 	});
 
 	it("withdraws only the matched run's queued input, rejects admission during drain, and preserves later inputs", async () => {

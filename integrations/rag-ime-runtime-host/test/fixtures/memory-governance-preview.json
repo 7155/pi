@@ -1,0 +1,35 @@
+{
+  "schemaVersion": "rag-ime.memory-governance-preview.v1",
+  "previewId": "memory-proposal:377cd0a0-56c2-41f4-832e-7f77dbd35bc3",
+  "proposalId": "memory-proposal:377cd0a0-56c2-41f4-832e-7f77dbd35bc3",
+  "operation": "remember_preview",
+  "applyOperation": "remember_apply",
+  "sessionId": "agent:ce61fe2d-8cb8-47a5-8504-9903a0c525c2",
+  "project": "wisdom-weasel-rag-ime",
+  "targetId": "",
+  "memoryKind": "project_state",
+  "proposedText": "演示项目的发布标签是蓝色。",
+  "reason": "",
+  "evidenceIds": [
+    "evidence:36aec98fd0360edcfdf8cb52cfd17bbe"
+  ],
+  "summary": "记住新事实的预览：演示项目的发布标签是蓝色。",
+  "status": "ready",
+  "reviewRequired": true,
+  "applyOperationAvailable": true,
+  "mutationApplied": false,
+  "writes": {
+    "proposalStored": true,
+    "memoryAtoms": false,
+    "memoryBooks": false,
+    "retrievalVectors": false
+  },
+  "audit": {
+    "payloadSha256": "9bf42d33ac6644053896adb7de0ffd624d6df1f1d857f90679d6d6d30e31f670",
+    "recordKind": "memory_governance_proposal",
+    "sessionId": "agent:ce61fe2d-8cb8-47a5-8504-9903a0c525c2",
+    "idempotencyKey": "memory-governance:9bf42d33ac6644053896adb7de0ffd624d6df1f1"
+  },
+  "createdAtMs": 1791406316670,
+  "expiresAtMs": 1791407216670
+}
