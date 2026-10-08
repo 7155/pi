@@ -903,6 +903,81 @@ describe("BackendToolRegistry", () => {
 });
 
 describe("product gateway request bounds", () => {
+	it.each(["complete", "caller_abort", "deadline"] as const)(
+		"keeps a 45 second shell alive at 46 seconds and settles through its owner (%s)",
+		async (settlement) => {
+			vi.useFakeTimers();
+			const caller = new AbortController();
+			let resolveFetch: ((value: Response) => void) | undefined;
+			const fetchMock = vi.fn(
+				(_url: string | URL | Request, init?: RequestInit) =>
+					new Promise<Response>((resolve, reject) => {
+						resolveFetch = resolve;
+						const signal = init?.signal;
+						if (signal?.aborted) reject(signal.reason);
+						else signal?.addEventListener("abort", () => reject(signal.reason), { once: true });
+					}),
+			);
+			vi.stubGlobal("fetch", fetchMock);
+			try {
+				const definition = createBackendToolDefinition(
+					{
+						sessionId: `session-shell-${settlement}`,
+						registry: new BackendToolRegistry(),
+						gatewayUrl: "http://127.0.0.1:8768/api/agent/tool/execute",
+					},
+					tool({ name: "workspace_shell" }),
+				);
+				const outcome = definition
+					.execute(
+						"call-shell",
+						{ command: "owned shell", timeoutSeconds: 45 } as never,
+						caller.signal,
+						undefined,
+						{} as never,
+					)
+					.then(
+						(result) => ({ result }),
+						(error) => ({ error }),
+					);
+				await vi.advanceTimersByTimeAsync(46_000);
+				const gatewaySignal = fetchMock.mock.calls[0]?.[1]?.signal;
+				expect(gatewaySignal?.aborted).toBe(false);
+				expect(JSON.parse(String(fetchMock.mock.calls[0]?.[1]?.body)).args).toEqual({
+					command: "owned shell",
+					timeoutSeconds: 45,
+				});
+				if (settlement === "complete") {
+					resolveFetch?.(
+						new Response(JSON.stringify({ ok: true, result: { exitCode: 0 } }), {
+							status: 200,
+							headers: { "Content-Type": "application/json" },
+						}),
+					);
+					expect(await outcome).toHaveProperty("result");
+					expect(gatewaySignal?.aborted).toBe(false);
+				} else if (settlement === "caller_abort") {
+					const reason = new Error("caller stopped the original shell turn");
+					caller.abort(reason);
+					expect(gatewaySignal?.reason).toBe(reason);
+					expect(await outcome).toEqual({ error: reason });
+				} else {
+					await vi.advanceTimersByTimeAsync(28_999);
+					expect(gatewaySignal?.aborted).toBe(false);
+					await vi.advanceTimersByTimeAsync(1);
+					expect(gatewaySignal?.reason).toEqual(new Error("Tool gateway request timed out after 75000ms"));
+					expect(await outcome).toEqual({ error: gatewaySignal?.reason });
+					expect(caller.signal.aborted).toBe(false);
+				}
+				expect(fetchMock).toHaveBeenCalledTimes(1);
+				expect(vi.getTimerCount()).toBe(0);
+			} finally {
+				vi.useRealTimers();
+				vi.unstubAllGlobals();
+			}
+		},
+	);
+
 	it.each([
 		{ timeoutMs: 110_000, deadline: 140_000 },
 		{ timeoutMs: undefined, deadline: 90_000 },

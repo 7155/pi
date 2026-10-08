@@ -514,6 +514,82 @@ export class PiDebugContextRecorder {
 		return record ? structuredClone(record) : undefined;
 	}
 
+	/** Read-only candidate for a compact Runtime response. The complete reader
+	 * remains get(); callers need a complete-history path before using this view. */
+	getRuntimeProjection(turnId?: string): PiDebugContextRecord | undefined {
+		const record = turnId ? this.records.get(turnId) : [...this.records.values()].at(-1);
+		if (!record) return undefined;
+		let omitted = false;
+		const omit = (value: unknown, path: string): unknown => {
+			if (value === undefined || plainRecord(value)?.omitted === true || (Array.isArray(value) && !value.length))
+				return value;
+			omitted = true;
+			return { omitted: true, reason: "runtime_projection", limitBytes: 0, path, turnId: record.turnId };
+		};
+		const latestCall = record.modelCalls.at(-1);
+		const projection: PiDebugContextRecord = {
+			...record,
+			contextWindows: record.contextWindows.map((window, position) => ({
+				...window,
+				messages: omit(window.messages, `contextWindows.${position}.messages`),
+			})),
+			providerRequests: record.providerRequests.map((request, position) => ({
+				...request,
+				payload: omit(request.payload, `providerRequests.${position}.payload`),
+			})),
+			providerRequestReceipts: record.providerRequestReceipts.map((request, position) => ({
+				...request,
+				payload: omit(request.payload, `providerRequestReceipts.${position}.payload`),
+			})),
+			modelCalls: record.modelCalls.map((call, position) => {
+				if (call.contextDelta.addedMessages.length) omitted = true;
+				return {
+					...call,
+					// These boundaries can differ after Provider transformations. Keep
+					// both latest bodies rather than substitute one as exact evidence.
+					contextMessages:
+						call === latestCall
+							? call.contextMessages
+							: omit(call.contextMessages, `modelCalls.${position}.contextMessages`),
+					providerContext:
+						call === latestCall
+							? call.providerContext
+							: omit(call.providerContext, `modelCalls.${position}.providerContext`),
+					contextDelta: {
+						...call.contextDelta,
+						addedMessages: [],
+						...(call.contextDelta.addedMessages.length ? { omitted: true } : {}),
+					},
+					assistantMessage: omit(call.assistantMessage, `modelCalls.${position}.assistantMessage`),
+					providerExchanges: call.providerExchanges.map((exchange, exchangePosition) => ({
+						...exchange,
+						payload: omit(
+							exchange.payload,
+							`modelCalls.${position}.providerExchanges.${exchangePosition}.payload`,
+						),
+					})),
+				};
+			}),
+			toolExecutions: record.toolExecutions.map((tool, position) => ({
+				...tool,
+				result: omit(tool.result, `toolExecutions.${position}.result`),
+				updates: tool.updates.map((update, updatePosition) => ({
+					...update,
+					partialResult: omit(
+						update.partialResult,
+						`toolExecutions.${position}.updates.${updatePosition}.partialResult`,
+					),
+				})),
+			})),
+		};
+		if (omitted)
+			projection.inspectionOmissions = [
+				...(record.inspectionOmissions ?? []),
+				{ reason: "runtime_projection", limitBytes: 0, turnId: record.turnId },
+			];
+		return structuredClone(projection);
+	}
+
 	beginLifecycle(kind: "compaction", details: { reason?: string } = {}): string {
 		const now = Date.now();
 		const turnId = `lifecycle:${kind}:${now}:${++this.lifecycleSequence}`;

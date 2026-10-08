@@ -1,8 +1,10 @@
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { createHash } from "node:crypto";
+import { mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
 import { PiDebugContextRecorder } from "../src/debug-context.ts";
+import { PiProductSession } from "../src/pi-session.ts";
 
 type DebugHandler = (event: Record<string, unknown>, context?: Record<string, unknown>) => unknown;
 
@@ -440,6 +442,153 @@ describe("PiDebugContextRecorder", () => {
 		expect(captured?.schemaVersion).toBe("rag-ime.context-inspection.v2");
 		expect(captured?.modelCalls).toHaveLength(4);
 		expect(captured?.modelCalls.at(-1)?.contextDelta).toBeDefined();
+	});
+
+	it("projects only the latest body without changing complete records, archive bytes or the existing RPC reader", async () => {
+		const directory = mkdtempSync(join(tmpdir(), "pi-debug-context-projection-"));
+		const activeTurn = { turnId: "turn-projection", clientMessageId: "client-projection" };
+		const recorder = new PiDebugContextRecorder("session-projection", () => activeTurn, {
+			directory,
+			contributionRefs: [{ kind: "source", receiptId: "original-source-receipt" }],
+		});
+		try {
+			await recorder.flush();
+			const handlers = new Map<string, DebugHandler>();
+			recorder.extension()({
+				on: (name: string, handler: DebugHandler) => handlers.set(name, handler),
+				getActiveTools: () => ["read"],
+				getAllTools: () => [{ name: "read", parameters: { type: "object" } }],
+			} as never);
+			handlers.get("before_agent_start")?.(
+				{ prompt: "large", systemPrompt: "system", systemPromptOptions: {} },
+				{ model: { provider: "test", id: "offline-model" } },
+			);
+			expect(recorder.getRuntimeProjection()?.inspectionOmissions).toEqual(recorder.get()?.inspectionOmissions);
+			for (let index = 0; index < 4; index += 1) {
+				const content = `${index}:`.padEnd(800_000, "x");
+				handlers.get("turn_start")?.({ turnIndex: index });
+				handlers.get("context")?.({ messages: [{ role: "user", content, index }] });
+				handlers.get("provider_context_inspection")?.({
+					context: {
+						systemPrompt: `provider-system-${index}`,
+						messages: [{ role: "user", content, index }],
+						tools: [],
+					},
+				});
+				handlers.get("before_provider_request")?.({ payload: { input: `wire-body-${index}` } });
+				handlers.get("after_provider_response")?.({ status: 200, headers: { "x-request-id": `request-${index}` } });
+				handlers.get("message_end")?.({
+					message: { role: "assistant", content: `reply-${index}`, usage: { input: 2, output: 1 } },
+				});
+				handlers.get("tool_execution_start")?.({
+					toolCallId: `tool-${index}`,
+					toolName: "read",
+					args: { path: `source-${index}.ts` },
+				});
+				handlers.get("tool_execution_update")?.({
+					toolCallId: `tool-${index}`,
+					partialResult: { text: `partial-${index}` },
+				});
+				handlers.get("tool_execution_end")?.({
+					toolCallId: `tool-${index}`,
+					toolName: "read",
+					result: { text: `result-${index}` },
+					isError: false,
+				});
+				handlers.get("turn_end")?.({ turnIndex: index });
+			}
+			await recorder.flush();
+			const captured = recorder.get(activeTurn.turnId);
+			expect(Buffer.byteLength(JSON.stringify(captured))).toBeGreaterThan(6_000_000);
+			const storage = recorder.storage();
+			const turns = recorder.list();
+			const sessionDirectory = join(directory, "session-projection");
+			const snapshot = join(sessionDirectory, readdirSync(sessionDirectory)[0]);
+			const archivedSha256 = createHash("sha256").update(readFileSync(snapshot)).digest("hex");
+			const session = Object.assign(Object.create(PiProductSession.prototype), {
+				externalSessionId: "session-projection",
+				debugContextRecorder: recorder,
+				session: { systemPrompt: "system" },
+				providerContextJournal: { snapshot: () => ({ epoch: 1 }) },
+				toolRegistry: { disclosed: () => [] },
+				messageQueue: () => ({ steering: [], followUp: [] }),
+				telemetry: () => ({}),
+			}) as PiProductSession;
+			// No separate complete-record RPC exists yet. Keep the current reader
+			// complete until the product can open bodies omitted by the candidate.
+			expect(session.debugContext(activeTurn.turnId).context).toMatchObject(captured!);
+
+			const projected = recorder.getRuntimeProjection(activeTurn.turnId);
+			expect(Buffer.byteLength(JSON.stringify(projected))).toBeLessThan(2_000_000);
+			expect(projected).toMatchObject({
+				schemaVersion: captured?.schemaVersion,
+				sessionId: captured?.sessionId,
+				turnId: captured?.turnId,
+				clientMessageId: captured?.clientMessageId,
+				contributionRefs: captured?.contributionRefs,
+				cacheEvidence: captured?.cacheEvidence,
+				toolBatches: captured?.toolBatches,
+			});
+			expect(projected?.modelCalls).toHaveLength(4);
+			expect(projected?.contextWindows).toHaveLength(4);
+			expect(projected?.providerRequests).toHaveLength(4);
+			expect(projected?.providerRequestReceipts).toHaveLength(4);
+			expect(projected?.modelCalls.at(-1)?.contextMessages).toEqual(captured?.modelCalls.at(-1)?.contextMessages);
+			expect(projected?.modelCalls.at(-1)?.providerContext).toEqual(captured?.modelCalls.at(-1)?.providerContext);
+			for (const [position, call] of projected!.modelCalls.entries()) {
+				const original = captured!.modelCalls[position];
+				expect(call).toMatchObject({
+					index: original.index,
+					runtimeTurnIndex: original.runtimeTurnIndex,
+					capturedAtMs: original.capturedAtMs,
+					updatedAtMs: original.updatedAtMs,
+					completedAtMs: original.completedAtMs,
+				});
+				expect(call.contextDelta).toEqual({ ...original.contextDelta, addedMessages: [], omitted: true });
+				if (position < 3) {
+					expect(call.contextMessages).toMatchObject({
+						omitted: true,
+						reason: "runtime_projection",
+						turnId: activeTurn.turnId,
+					});
+					expect(call.providerContext).toMatchObject({ omitted: true, reason: "runtime_projection" });
+				}
+				expect(call.providerExchanges[0]).toMatchObject({
+					...original.providerExchanges[0],
+					payload: expect.objectContaining({ omitted: true }),
+				});
+			}
+			for (const [position, tool] of projected!.toolExecutions.entries()) {
+				const original = captured!.toolExecutions[position];
+				expect(tool).toMatchObject({
+					...original,
+					result: expect.objectContaining({ omitted: true }),
+					updates: [
+						{
+							capturedAtMs: original.updates[0].capturedAtMs,
+							partialResult: expect.objectContaining({ omitted: true }),
+						},
+					],
+				});
+			}
+			expect(JSON.stringify(projected)).not.toContain("wire-body-");
+			expect(JSON.stringify(projected)).not.toContain("partial-");
+			expect(projected?.inspectionOmissions).toContainEqual(
+				expect.objectContaining({ reason: "runtime_projection", turnId: activeTurn.turnId }),
+			);
+			expect(recorder.getRuntimeProjection("missing")).toBeUndefined();
+			projected!.modelCalls.pop();
+			projected!.contributionRefs[0].receiptId = "changed-copy";
+			expect(recorder.getRuntimeProjection()?.modelCalls).toHaveLength(4);
+			expect(recorder.get(activeTurn.turnId)).toEqual(captured);
+			expect(recorder.storage()).toEqual(storage);
+			expect(recorder.list()).toEqual(turns);
+			await recorder.flush();
+			expect(createHash("sha256").update(readFileSync(snapshot)).digest("hex")).toBe(archivedSha256);
+		} finally {
+			await recorder.flush();
+			rmSync(directory, { recursive: true, force: true });
+		}
 	});
 
 	it("retains every provider call when an audit raises the bounded per-turn cap", () => {
