@@ -189,7 +189,8 @@ type WithParentToolCallId<E> = E extends {
 
 /** Session-specific events that extend the core AgentEvent */
 export type AgentSessionEvent =
-	| WithParentToolCallId<Exclude<AgentEvent, { type: "agent_end" }>>
+	| WithParentToolCallId<Exclude<AgentEvent, { type: "agent_end" | "message_end" }>>
+	| (Extract<AgentEvent, { type: "message_end" }> & { entryId?: string })
 	| {
 			type: "agent_end";
 			messages: AgentMessage[];
@@ -1114,7 +1115,9 @@ export class AgentSession {
 
 		// Emit to extensions first, then notify public listeners.
 		await this._emitExtensionEvent(event);
-		this._emit(event.type === "agent_end" ? { ...event, willRetry: this._willRetryAfterAgentEnd(event) } : event);
+		if (event.type !== "message_end") {
+			this._emit(event.type === "agent_end" ? { ...event, willRetry: this._willRetryAfterAgentEnd(event) } : event);
+		}
 
 		// Handle session persistence
 		if (event.type === "message_end") {
@@ -1138,6 +1141,9 @@ export class AgentSession {
 				entryId = this.sessionManager.appendMessage(event.message);
 			}
 			if (entryId) this._entryIdsByMessage.set(event.message, entryId);
+			// Public completion carries only the ID actually returned by persistence.
+			// A failed append must not notify a completed message with a made-up identity.
+			this._emit({ ...event, ...(entryId ? { entryId } : {}) });
 			// Other message types (bashExecution, compactionSummary, branchSummary) are persisted elsewhere
 
 			if (event.message.role === "assistant") {
@@ -2368,7 +2374,7 @@ export class AgentSession {
 	}
 
 	private _appendCustomMessage(appMessage: CustomMessage): void {
-		this.sessionManager.appendCustomMessageEntry(
+		const entryId = this.sessionManager.appendCustomMessageEntry(
 			appMessage.customType,
 			appMessage.content,
 			appMessage.display,
@@ -2376,7 +2382,7 @@ export class AgentSession {
 		);
 		this._refreshFinalizedContext();
 		this._emit({ type: "message_start", message: appMessage });
-		this._emit({ type: "message_end", message: appMessage });
+		this._emit({ type: "message_end", message: appMessage, entryId });
 	}
 
 	/**
