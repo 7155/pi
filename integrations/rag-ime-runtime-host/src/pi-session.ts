@@ -1457,6 +1457,7 @@ export class PiProductSession implements PooledSession {
 			sequence: ++this.sequence,
 			payload: {
 				...toSerializableEvent(event),
+				...(event.type === "message_end" && event.entryId ? { nativePiSessionId: this.session.sessionId } : {}),
 				...(settlementReceipt ? { receipt: settlementReceipt } : {}),
 				telemetry: this.telemetry(
 					event.type === "compaction_start" ? true : event.type === "compaction_end" ? false : undefined,

@@ -468,6 +468,23 @@ describe("prompt preflight diagnostics", () => {
 });
 
 describe("per-turn Provider context lifecycle", () => {
+	it("relays the persisted entry ID also carried by the original snapshot entry", () => {
+		const productSession = Object.create(PiProductSession.prototype) as PiProductSession;
+		const emitEvent = vi.fn();
+		const owner = productSession as unknown as { onSessionEvent(event: { type: "message_end"; message: AssistantMessage; entryId: string }): void };
+		const manager = SessionManager.inMemory("/public-fixture");
+		const message = assistant("public receipt", 101);
+		const entryId = manager.appendMessage(message);
+		Object.assign(productSession, { externalSessionId: "agent:public", activeTurn: { turnId: "turn:public", clientMessageId: "client:public" }, sequence: 0, emitEvent, telemetry: () => ({}), openSnapshot: () => ({ sessionId: "agent:public", leafId: manager.getLeafId(), piSessionId: manager.getSessionId() }), session: { sessionId: manager.getSessionId(), messages: [message], sessionManager: manager } });
+		owner.onSessionEvent({ type: "message_end", message, entryId });
+		expect(emitEvent).toHaveBeenCalledTimes(1);
+		expect(emitEvent.mock.calls[0][0]).toMatchObject({ sessionId: "agent:public", turnId: "turn:public", payload: { type: "message_end", entryId, nativePiSessionId: manager.getSessionId(), message } });
+		const snapshot = productSession.snapshot();
+		expect(snapshot.leafId).toBe(entryId);
+		expect(snapshot.piSessionId).toBe(manager.getSessionId());
+		expect(snapshot.entries).toEqual(expect.arrayContaining([expect.objectContaining({ id: entryId, type: "message", message })]));
+	});
+
 	it("tracks every assistant message_start as a distinct factual source loop", () => {
 		const productSession = Object.create(PiProductSession.prototype) as PiProductSession;
 		const mutable = productSession as unknown as Record<string, any>;
