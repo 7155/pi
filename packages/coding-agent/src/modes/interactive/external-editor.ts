@@ -16,7 +16,47 @@ export async function editInExternalEditor(options: ExternalEditorOptions): Prom
 	const filePath = join(directory, "prompt.md");
 	try {
 		writeFileSync(filePath, options.content, "utf-8");
-		const [editor, ...editorArgs] = options.command.split(" ");
+		// Windows retains its existing shell/cmd command contract. POSIX launches a
+		// literal argv: quotes only group arguments, never execute shell syntax.
+		const commandArgs: string[] = [];
+		if (process.platform === "win32") {
+			commandArgs.push(...options.command.split(" "));
+		} else {
+			let current = "";
+			let quote: string | undefined;
+			let started = false;
+			for (let index = 0; index < options.command.length; index++) {
+				const char = options.command[index];
+				if (char === "\\" && quote !== "'") {
+					const next = options.command[index + 1];
+					if (next === undefined) return { status: "failed" };
+					if (next === "\\" || next === '"' || (!quote && (next === "'" || /\s/.test(next)))) {
+						current += next;
+						index++;
+					} else {
+						current += char;
+					}
+					started = true;
+				} else if (quote) {
+					if (char === quote) quote = undefined;
+					else current += char;
+				} else if (char === '"' || char === "'") {
+					quote = char;
+					started = true;
+				} else if (/\s/.test(char)) {
+					if (started) commandArgs.push(current);
+					current = "";
+					started = false;
+				} else {
+					current += char;
+					started = true;
+				}
+			}
+			if (quote) return { status: "failed" };
+			if (started) commandArgs.push(current);
+		}
+		const [editor, ...editorArgs] = commandArgs;
+		if (!editor) return { status: "failed" };
 		process.stdout.write(`Launching external editor: ${options.command}\nPi will resume when the editor exits.\n`);
 
 		// Do not use spawnSync here. On Windows, synchronous child_process calls can keep
