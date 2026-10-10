@@ -2143,6 +2143,165 @@ describe("agentLoopContinue with AgentMessage", () => {
 });
 
 describe("runToolCall", () => {
+	it.each([
+		[true, "abort", true],
+		[false, "abort", false],
+		[true, "ordinary", false],
+		[true, "named-error", false],
+		[true, "returned", false],
+	] as const)("marks only execution AbortError with its aborted signal (%s/%s)", async (aborted, kind, cancelled) => {
+		const controller = new AbortController();
+		const tool: AgentTool = {
+			name: "controlled",
+			label: "Controlled",
+			description: "Public cancellation fixture",
+			parameters: Type.Object({}),
+			async execute(_id, _args, signal) {
+				expect(signal).toBe(controller.signal);
+				if (aborted) controller.abort();
+				if (kind === "returned")
+					return {
+						content: [{ type: "text", text: "This operation was aborted" }],
+						details: { cancelled: true },
+						isError: true,
+					};
+				if (kind === "abort") throw new DOMException("This operation was aborted", "AbortError");
+				if (kind === "named-error") {
+					const error = new Error("This operation was aborted");
+					error.name = "AbortError";
+					throw error;
+				}
+				throw new Error("This operation was aborted");
+			},
+		};
+		const outcome = await runToolCall(
+			{ type: "toolCall", id: "original-call", name: tool.name, arguments: {} },
+			{
+				tools: [tool],
+				context: { messages: [] },
+				assistantMessage: createAssistantMessage([]),
+				signal: controller.signal,
+			},
+		);
+		expect(outcome.isError).toBe(true);
+		expect(outcome.result.content).toEqual([{ type: "text", text: "This operation was aborted" }]);
+		expect((outcome as { cancelled?: true }).cancelled).toBe(cancelled ? true : undefined);
+	});
+
+	it("preserves exact cancellation in the execution event and native transcript without replay", async () => {
+		const controller = new AbortController();
+		let invocations = 0;
+		const tool: AgentTool = {
+			name: "controlled",
+			label: "Controlled",
+			description: "Public fixture",
+			parameters: Type.Object({}),
+			async execute() {
+				invocations++;
+				controller.abort();
+				throw new DOMException("cancelled original execution", "AbortError");
+			},
+		};
+		let streamCalls = 0;
+		const streamFn = () => {
+			const stream = new MockAssistantStream();
+			queueMicrotask(() =>
+				stream.push(
+					streamCalls++ === 0
+						? {
+								type: "done",
+								reason: "toolUse",
+								message: createAssistantMessage(
+									[{ type: "toolCall", id: "original-call", name: tool.name, arguments: {} }],
+									"toolUse",
+								),
+							}
+						: { type: "error", reason: "aborted", error: createAssistantMessage([], "aborted") },
+				),
+			);
+			return stream;
+		};
+		const events: AgentEvent[] = [];
+		const messages = await runAgentLoop(
+			[createUserMessage("public fixture")],
+			{ messages: [], tools: [tool] },
+			{ model: createModel(), convertToLlm: identityConverter },
+			(event) => {
+				events.push(event);
+			},
+			controller.signal,
+			streamFn,
+		);
+		expect(invocations).toBe(1);
+		expect(events.find((e) => e.type === "tool_execution_end")).toMatchObject({
+			toolCallId: "original-call",
+			toolName: tool.name,
+			isError: true,
+			cancelled: true,
+		});
+		expect(messages.find((m) => m.role === "toolResult")).toMatchObject({
+			toolCallId: "original-call",
+			toolName: tool.name,
+			isError: true,
+			cancelled: true,
+		});
+	});
+
+	it("does not hide a failure thrown by the post-execution hook after cancellation", async () => {
+		const controller = new AbortController();
+		const tool: AgentTool = {
+			name: "controlled",
+			label: "Controlled",
+			description: "Public fixture",
+			parameters: Type.Object({}),
+			async execute() {
+				controller.abort();
+				throw new DOMException("cancelled execution", "AbortError");
+			},
+		};
+		const outcome = await runToolCall(
+			{ type: "toolCall", id: "original-call", name: tool.name, arguments: {} },
+			{
+				tools: [tool],
+				context: { messages: [] },
+				assistantMessage: createAssistantMessage([]),
+				signal: controller.signal,
+				afterToolCall: () => {
+					throw new Error("genuine hook failure");
+				},
+			},
+		);
+		expect(outcome.result.content).toEqual([{ type: "text", text: "genuine hook failure" }]);
+		expect(outcome.isError).toBe(true);
+		expect(outcome).not.toHaveProperty("cancelled");
+	});
+
+	it("does not attach execution cancellation to a replacement hook result", async () => {
+		const controller = new AbortController();
+		const tool: AgentTool = {
+			name: "controlled",
+			label: "Controlled",
+			description: "Public fixture",
+			parameters: Type.Object({}),
+			async execute() {
+				controller.abort();
+				throw new DOMException("cancelled execution", "AbortError");
+			},
+		};
+		const outcome = await runToolCall(
+			{ type: "toolCall", id: "original-call", name: tool.name, arguments: {} },
+			{
+				tools: [tool],
+				context: { messages: [] },
+				assistantMessage: createAssistantMessage([]),
+				signal: controller.signal,
+				afterToolCall: async () => ({ isError: true, content: [{ type: "text", text: "replacement failure" }] }),
+			},
+		);
+		expect(outcome.result.content).toEqual([{ type: "text", text: "replacement failure" }]);
+		expect(outcome.isError).toBe(true);
+		expect(outcome).not.toHaveProperty("cancelled");
+	});
 	const echoSchema = Type.Object({ value: Type.String() });
 	const echo: AgentTool<typeof echoSchema> = {
 		name: "echo",

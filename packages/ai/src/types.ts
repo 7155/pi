@@ -609,6 +609,8 @@ export type ToolResultMessage<TDetails = JsonValue> = IsJsonCompatible<TDetails>
 			/** Calls this tool made to other tools. Kept for the session record; not sent to the model. */
 			nestedCalls?: NestedToolCalls;
 			isError: boolean;
+			/** Execution AbortError with the original tool signal aborted; not inferred from output. */
+			cancelled?: true;
 			timestamp: number; // Unix timestamp in milliseconds
 		}
 	: never;

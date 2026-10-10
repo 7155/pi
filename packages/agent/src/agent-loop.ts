@@ -675,6 +675,7 @@ type ImmediateToolCallOutcome = {
 type ExecutedToolCallOutcome = {
 	result: AgentToolResult<any>;
 	isError: boolean;
+	cancelled?: true;
 };
 
 type FinalizedToolCallOutcome = AgentToolCallOutcome;
@@ -844,6 +845,9 @@ async function executePreparedToolCall(
 		return {
 			result: createErrorToolResult(error instanceof Error ? error.message : String(error)),
 			isError: true,
+			...(signal?.aborted === true && error instanceof DOMException && error.name === "AbortError"
+				? { cancelled: true as const }
+				: {}),
 		};
 	} finally {
 		acceptingUpdates = false;
@@ -860,6 +864,7 @@ async function finalizeExecutedToolCall(
 ): Promise<FinalizedToolCallOutcome> {
 	let result = executed.result;
 	let isError = executed.isError;
+	let cancelled = executed.cancelled;
 
 	if (config.afterToolCall) {
 		try {
@@ -875,6 +880,8 @@ async function finalizeExecutedToolCall(
 				signal,
 			);
 			if (afterResult) {
+				// A replacement result is a hook outcome, not the original execution cancellation.
+				cancelled = undefined;
 				// Structured content not replaced along with the content may no longer match it.
 				const structuredContent =
 					afterResult.structuredContent ?? (afterResult.content ? undefined : result.structuredContent);
@@ -892,6 +899,7 @@ async function finalizeExecutedToolCall(
 		} catch (error) {
 			result = createErrorToolResult(error instanceof Error ? error.message : String(error));
 			isError = true;
+			cancelled = undefined;
 		}
 	}
 
@@ -899,6 +907,7 @@ async function finalizeExecutedToolCall(
 		toolCall: prepared.toolCall,
 		result,
 		isError,
+		...(cancelled ? { cancelled } : {}),
 	};
 }
 
@@ -916,6 +925,7 @@ async function emitToolExecutionEnd(finalized: FinalizedToolCallOutcome, emit: A
 		toolName: finalized.toolCall.name,
 		result: finalized.result,
 		isError: finalized.isError,
+		...(finalized.cancelled ? { cancelled: true } : {}),
 	});
 }
 
@@ -930,6 +940,7 @@ function createToolResultMessage(finalized: FinalizedToolCallOutcome): ToolResul
 		details: finalized.result.details,
 		usage: finalized.result.usage,
 		isError: finalized.isError,
+		...(finalized.cancelled ? { cancelled: true } : {}),
 		timestamp: Date.now(),
 	};
 }
